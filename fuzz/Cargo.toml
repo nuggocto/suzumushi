@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "suzumushi-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.95.0"
+license = "Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+suzumushi = { path = "..", version = "=0.1.0" }
+
+[[bin]]
+name = "scanner_path_classification"
+path = "fuzz_targets/scanner_path_classification.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config"
+path = "fuzz_targets/config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "metadata_adapter"
+path = "fuzz_targets/metadata_adapter.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "terminal_safe_display"
+path = "fuzz_targets/terminal_safe_display.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

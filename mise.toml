@@ -1,5 +1,11 @@
 [tools]
-rust = { version = "1.97.1", components = ["rustfmt", "clippy"] }
+rust = [
+  { version = "1.97.1", components = ["rustfmt", "clippy"] },
+  "nightly-2026-07-01",
+]
+"cargo:cargo-audit" = "0.22.2"
+"cargo:cargo-deny" = "0.20.2"
+"cargo:cargo-fuzz" = "0.13.2"
 
 [tasks.fmt]
 description = "Check Rust formatting"
@@ -20,11 +26,40 @@ description = "Verify the supported Rust 1.95.0 baseline"
 env = { RUSTFLAGS = "-D warnings" }
 run = "mise exec rust@1.95.0 -- cargo test --locked --workspace"
 
+[tasks.security]
+description = "Check dependency advisories, licenses, bans, and sources"
+run = [
+  "cargo audit --deny warnings --ignore RUSTSEC-2024-0436",
+  "cargo audit --file fuzz/Cargo.lock --deny warnings --ignore RUSTSEC-2024-0436",
+  "cargo deny check advisories bans licenses sources",
+  "cargo deny --manifest-path fuzz/Cargo.toml check --config fuzz/deny.toml advisories bans licenses sources",
+]
+
+[tasks.fuzz-smoke]
+description = "Run bounded scanner and parser boundary fuzz smoke tests"
+run = [
+  "cargo +nightly-2026-07-01 fuzz run scanner_path_classification -- -max_total_time=5 -timeout=2 -rss_limit_mb=768 -max_len=4096 -verbosity=0",
+  "cargo +nightly-2026-07-01 fuzz run config -- -max_total_time=5 -timeout=2 -rss_limit_mb=768 -max_len=65536 -verbosity=0",
+  "cargo +nightly-2026-07-01 fuzz run metadata_adapter -- -max_total_time=5 -timeout=2 -rss_limit_mb=768 -max_len=1048576 -verbosity=0",
+  "cargo +nightly-2026-07-01 fuzz run terminal_safe_display -- -max_total_time=5 -timeout=2 -rss_limit_mb=768 -max_len=65536 -verbosity=0",
+]
+
+[tasks.fuzz-deep]
+description = "Run the bounded scanner and parser fuzz targets for longer"
+run = [
+  "cargo +nightly-2026-07-01 fuzz run scanner_path_classification -- -max_total_time=60 -timeout=2 -rss_limit_mb=768 -max_len=4096 -verbosity=0",
+  "cargo +nightly-2026-07-01 fuzz run config -- -max_total_time=60 -timeout=2 -rss_limit_mb=768 -max_len=65536 -verbosity=0",
+  "cargo +nightly-2026-07-01 fuzz run metadata_adapter -- -max_total_time=60 -timeout=2 -rss_limit_mb=768 -max_len=1048576 -verbosity=0",
+  "cargo +nightly-2026-07-01 fuzz run terminal_safe_display -- -max_total_time=60 -timeout=2 -rss_limit_mb=768 -max_len=65536 -verbosity=0",
+]
+
 [tasks.ci]
-description = "Run the complete project setup verification"
+description = "Run the complete project verification"
 run = [
   { task = "fmt" },
   { task = "clippy" },
   { task = "test" },
   { task = "msrv" },
+  { task = "security" },
+  { task = "fuzz-smoke" },
 ]

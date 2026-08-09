@@ -896,15 +896,22 @@ implications, and removes rejected spike dependencies. `Cargo.toml` and
 | Project setup/CLI | `clap = 4.6.6` | Pinned with default features disabled and only `std`, `help`, and `usage`; MIT OR Apache-2.0, no native/FFI boundary, and reviewed internal unsafe only in the resolved `clap_lex` and `anstyle` dependencies |
 | Foundation/errors/logging | `thiserror`, `anyhow`, `tracing`, `tracing-subscriber`, `tracing-appender` | Bounded nonblocking delivery into app-owned rotating file logging and only required formatting/registry features when first used |
 | TUI/runtime | `ratatui`, `crossterm`, `tokio`, `unicode-width` | Crossterm event stream; Tokio runtime, macros, sync, time, signal, and fs only when used |
-| Scan/search/model | `rustix`, app-owned natural comparator, `nucleo-matcher`, `serde`, `serde_json`, `toml`, `rand` | Only descriptor-relative filesystem APIs and Serde features exercised by the phase; no pathname walker or sorting dependency |
+| Root/scan/config model | `rustix = 1.1.4`, `lofty = 0.24.0`, `serde = 1.0.229`, `serde_json = 1.0.151`, `toml = 1.1.4`, `thiserror = 2.0.20`, app-owned natural comparator | Exact minimal features in `Cargo.toml`; Lofty has defaults disabled and runs only behind the bounded helper contract in `docs/parser-isolation.md`; no pathname walker or sorting dependency |
+| Later search/queue model | `nucleo-matcher`, `rand` | Select exact versions and minimal features only when search and shuffle behavior arrive |
 | Tags/artwork/desktop | `lofty`, `image`, `ratatui-image`, `souvlaki` or `zbus`, `notify-rust`, `time` | Exact supported formats/protocols/backends selected by their ADRs |
-| Tests | `tempfile`, `insta`, `proptest`, `assert_cmd`, fuzz runner pinned when its first target arrives | Added just in time to the test target that exercises them |
+| Current tests/fuzz | `tempfile = 3.27.0`, `cargo-fuzz = 0.13.2`, `libfuzzer-sys = 0.4.13` | Temporary-root behavior tests plus four bounded untrusted-input targets; later UI/property/CLI helpers remain unselected |
 
 The initial package defines no Cargo application features. The single audio path
 selected during audio playback work is compiled unconditionally, is the default, and is the sole
 v1 release set. Future application features require an ADR with a supported
 feature matrix; CI, QA, and packaging must name and use the exact
 release set rather than opportunistically testing different combinations.
+
+Temporary dependency exception: `RUSTSEC-2024-0436` marks transitive
+`paste 1.0.15` from `lofty 0.24.0` as unmaintained without reporting a
+vulnerability. The maintainer owns the narrow audit/deny exception through
+2026-11-09; remove it earlier when Lofty drops the crate, a maintained parser is
+selected, or a vulnerability is reported. No other advisory warning is allowed.
 
 Use strict lints from the start:
 
@@ -2549,7 +2556,7 @@ Each phase should end with `cargo run -- --root ./suzumushi` or a small CLI comm
 **Phases**
 
 - [x] **Phase 1** - Project Setup
-- [ ] **Phase 2** - Suzumushi Root And Scanner - *milestone: Local root prototype* - *tag 0.1.0*
+- [x] **Phase 2** - Suzumushi Root And Scanner - *milestone: Local root prototype* - *tag 0.1.0*
 - [ ] **Phase 3** - Minimal TUI Shell - *milestone: Terminal prototype* - *tag 0.2.0*
 - [ ] **Phase 4** - Library, Search, Playlist Browser, And Queue
 - [ ] **Phase 5** - Audio Playback Worker
@@ -2652,7 +2659,7 @@ minimal Rust project setup
 
 ### Phase 2 - Suzumushi Root And Scanner
 
-**Status:** `not started`
+**Status:** `done`
 
 **Goal:** Create and scan the app-owned `suzumushi/audio/` folder safely.
 
@@ -2662,51 +2669,55 @@ minimal Rust project setup
 
 #### Build steps
 
-1. [ ] Create `cli.rs` and `errors.rs` with only the `--root`, `init`, and `diagnose` behavior needed here, then implement root discovery from `--root`, `SUZUMUSHI_ROOT`, and `./suzumushi`.
-2. [ ] Implement `suzumushi init <path>` with canonical-root validation and fail-closed behavior for symlinked or non-empty unrelated destinations. Create app-private `state/`, `backups/`, and `logs/` as `0700`, private files as `0600`, and verify existing ownership/modes before use.
-3. [ ] Write default `config.toml`.
-4. [ ] Create `audio/playlists/demo/README.txt` with empty placeholder instructions.
-5. [ ] Create `audio/lyrics/README.txt` with sidecar and shared lyric instructions.
-6. [ ] Create `paths.rs` with root, music, library, playlists, lyrics, state, artwork cache, logs, and backups paths.
-7. [ ] Implement supported audio extension detection.
-8. [ ] Implement one app-owned descriptor-rooted `scan/` traversal of `audio/` using `rustix` directory descriptors and the documented `openat2`/component-wise secure-open policy; do not invoke a pathname walker or a second traversal for library, playlists, lyrics, sidecars, or artwork.
-9. [ ] Classify `audio/library/` recursively without assigning special playback semantics to user folder names.
-10. [ ] Classify child folders of `audio/playlists/` as playlists during the same traversal.
-11. [ ] Treat file symlinks as non-descending entries and support them only through the bounded secure-open adapter after resolving/opening a verified regular target from the pinned parent. External targets are read/play-only; an unsupported kernel/filesystem security primitive returns `unsupported_secure_open` with no path-based fallback.
-12. [ ] Ignore directory symlinks and record every mount-boundary decision under configured counters.
-13. [ ] Pair same-stem `.lrc` sidecars with audio files.
-14. [ ] Index `audio/lyrics/` as a shared lyrics source.
-15. [ ] Detect sidecar artwork candidates such as `cover.jpg`, `cover.png`, `folder.jpg`, and `folder.png`.
-16. [ ] Read lightweight metadata needed for search, including artist, album artist, album, and title.
-17. [ ] Emit filename/path fallback search fields when metadata is missing.
-18. [ ] Add scan bounds for every encountered entry/directory/symlink/special file, file count, depth, playlists, entries per playlist, symlink resolutions, parser attempts, mount boundaries, per-path and aggregate path bytes, metadata fields/total, warning bytes, and one inclusive complete-index budget reserved alongside the old index under the process-wide budget.
-19. [ ] Build separate canonical `MediaAsset` and contextual `TrackEntry` models with defined stable-within-path IDs and scan generation.
-20. [ ] Enforce the exact root precedence `--root`, then `SUZUMUSHI_ROOT`, then existing `./suzumushi`, then error; an invalid selected higher-priority source does not fall through.
-21. [ ] Implement lock primitives and verified stale-lock handling. The per-user global lock uses only the verified current-UID `$XDG_RUNTIME_DIR/suzumushi/` location with no shared-`/tmp` fallback; the root lock stays descriptor-relative beneath the canonical root. Acquire the per-user active-TUI lock and then the canonical-root single-writer lock only when mutable TUI mode starts in Phase 3. Document and test that two concurrent login sessions for the same UID intentionally contend. Phase 2 `diagnose` and later status commands remain bounded read-only readers and acquire neither writer lock. Any future standalone mutating command acquires an explicit root mutation lease without claiming the global MPRIS/TUI identity.
-22. [ ] Before a third-party metadata parser sees media, use the `security` skill to record the concrete parser and filesystem risks in a concise `docs/security.md`. Record the selected parser's bounded in-process contract in `docs/parser-isolation.md`; use a helper process only if the chosen API cannot enforce the required input/work bounds. Add dependency checks to `mise.toml` when these runtime dependencies arrive.
-23. [ ] Return structured scan warnings.
-24. [ ] Add tests with temporary roots, all root-source/conflict/error combinations, invalid higher-priority roots, duplicate assets across playlists, repeated entries, copied files, symlinked files, retargeted/broken/external symlinks, parent-directory rename/substitution during enumeration, magic-link refusal, verified regular-descriptor refusal, no pathname re-open instrumentation, unsupported secure-open behavior, symlinked roots, non-empty init destinations, private-directory ownership/mode refusal, secure runtime-lock location and missing-runtime failure, same-UID concurrent-session lock contention, shared lyrics, artwork candidates, searchable metadata, every counter at limit and limit+1, mount boundaries, one-traversal instrumentation, simultaneous old/new index reservation, and ignored directory symlinks.
-25. [ ] Add phase-owned fuzz targets for scanner path classification, config, lightweight metadata adapter input, and terminal-safe display projection. PR smoke runs use pinned total-time, per-input timeout, input-length, and RSS bounds; helper-backed parsers also fuzz bounded IPC framing and crash/timeout cleanup.
+1. [x] Create `cli.rs` and `errors.rs` with only the `--root`, `init`, and `diagnose` behavior needed here, then implement root discovery from `--root`, `SUZUMUSHI_ROOT`, and `./suzumushi`.
+2. [x] Implement `suzumushi init <path>` with canonical-root validation and fail-closed behavior for symlinked or non-empty unrelated destinations. Create app-private `state/`, `backups/`, and `logs/` as `0700`, private files as `0600`, and verify existing ownership/modes before use.
+3. [x] Write default `config.toml`.
+4. [x] Create `audio/playlists/demo/README.txt` with empty placeholder instructions.
+5. [x] Create `audio/lyrics/README.txt` with sidecar and shared lyric instructions.
+6. [x] Create `paths.rs` with root, audio, library, playlists, lyrics, state, artwork cache, logs, and backups paths.
+7. [x] Implement supported audio extension detection.
+8. [x] Implement one app-owned descriptor-rooted `scan/` traversal of `audio/` using `rustix` directory descriptors and the documented `openat2`/component-wise secure-open policy; do not invoke a pathname walker or a second traversal for library, playlists, lyrics, sidecars, or artwork.
+9. [x] Classify `audio/library/` recursively without assigning special playback semantics to user folder names.
+10. [x] Classify child folders of `audio/playlists/` as playlists during the same traversal.
+11. [x] Treat file symlinks as non-descending entries and support them only through the bounded secure-open adapter after resolving/opening a verified regular target from the pinned parent. External targets are read/play-only; an unsupported kernel/filesystem security primitive returns `unsupported_secure_open` with no path-based fallback.
+12. [x] Ignore directory symlinks and record every mount-boundary decision under configured counters.
+13. [x] Pair same-stem `.lrc` sidecars with audio files.
+14. [x] Index `audio/lyrics/` as a shared lyrics source.
+15. [x] Detect sidecar artwork candidates such as `cover.jpg`, `cover.png`, `folder.jpg`, and `folder.png`.
+16. [x] Read lightweight metadata needed for search, including artist, album artist, album, and title.
+17. [x] Emit filename/path fallback search fields when metadata is missing.
+18. [x] Add scan bounds for every encountered entry/directory/symlink/special file, file count, depth, playlists, entries per playlist, symlink resolutions, parser attempts, mount boundaries, per-path and aggregate path bytes, metadata fields/total, warning bytes, and one inclusive complete-index budget reserved alongside the old index under the process-wide budget.
+19. [x] Build separate canonical `MediaAsset` and contextual `TrackEntry` models with defined stable-within-path IDs and scan generation.
+20. [x] Enforce the exact root precedence `--root`, then `SUZUMUSHI_ROOT`, then existing `./suzumushi`, then error; an invalid selected higher-priority source does not fall through.
+21. [x] Implement lock primitives and verified stale-lock handling. The per-user global lock uses only the verified current-UID `$XDG_RUNTIME_DIR/suzumushi/` location with no shared-`/tmp` fallback; the root lock stays descriptor-relative beneath the canonical root. Acquire the per-user active-TUI lock and then the canonical-root single-writer lock only when mutable TUI mode starts in Phase 3. Document and test that two concurrent login sessions for the same UID intentionally contend. Phase 2 `diagnose` and later status commands remain bounded read-only readers and acquire neither writer lock. Any future standalone mutating command acquires an explicit root mutation lease without claiming the global MPRIS/TUI identity.
+22. [x] Before a third-party metadata parser sees media, use the `security` skill to record the concrete parser and filesystem risks in a concise root `SECURITY.md`. Record the selected parser's bounded in-process contract in `docs/parser-isolation.md`; use a helper process only if the chosen API cannot enforce the required input/work bounds. Add dependency checks to `mise.toml` when these runtime dependencies arrive.
+23. [x] Return structured scan warnings.
+24. [x] Add tests with temporary roots, all root-source/conflict/error combinations, invalid higher-priority roots, duplicate assets across playlists, repeated entries, copied files, symlinked files, retargeted/broken/external symlinks, FIFO media/config/README entries, exact nested initialization error paths, parent-directory rename/substitution during enumeration, magic-link refusal, verified regular-descriptor refusal, no pathname re-open instrumentation, unsupported secure-open behavior, component-wise natural-order fixed vectors, reversible invalid-path-byte display, root-level hidden-directory budget exclusion, symlinked roots, non-empty init destinations, private-directory ownership/mode refusal, secure runtime-lock location and missing-runtime failure, same-UID concurrent-session lock contention, shared lyrics, artwork candidates, searchable metadata, every counter at limit and limit+1, mount boundaries, one-traversal instrumentation, simultaneous old/new index and scanner/parser scratch reservation, and ignored directory symlinks.
+25. [x] Add phase-owned fuzz targets for scanner path classification, config, lightweight metadata adapter input, and terminal-safe display projection. PR smoke runs use pinned total-time, per-input timeout, input-length, and RSS bounds; helper-backed parsers also fuzz bounded IPC framing and crash/timeout cleanup.
 
 #### Done when
 
-- [ ] `suzumushi init ./suzumushi` creates the expected tree.
-- [ ] Demo playlist instructions are created.
-- [ ] Shared lyrics instructions are created.
-- [ ] Scanner finds copied playlist files.
-- [ ] Scanner finds symlinked playlist files.
-- [ ] One canonical asset can retain multiple playlist entries and playlist-local lyric context.
-- [ ] Scanner finds shared `.lrc` files under `audio/lyrics/`.
-- [ ] Scanner finds artwork sidecars without decoding them on the scan hot path.
-- [ ] Scanner emits searchable metadata when tags exist.
-- [ ] Scanner emits filename/path fallback search fields when tags are missing.
-- [ ] Scanner ignores symlinked directories.
-- [ ] Broken symlinks produce warnings.
-- [ ] Instrumentation proves one descriptor-rooted enumeration with no accumulated-path reopen; parent substitution cannot redirect a scan, and unsupported secure symlink opens fail with a bounded warning.
-- [ ] No scan panic occurs from bad paths.
-- [ ] Lock primitive tests prove that two mutation leases cannot own one canonical root; actual mutable TUI acquisition is a Phase 3 acceptance criterion.
-- [ ] Lock primitive tests prove that only one mutable TUI lease can exist for the OS user across different login sessions and roots; Phase 2 diagnostics and read-only status commands remain concurrent and do not claim that lease.
-- [ ] Root precedence is identical for TUI, diagnostics, backups, and status commands.
+- [x] `suzumushi init ./suzumushi` creates the expected tree.
+- [x] Demo playlist instructions are created.
+- [x] Shared lyrics instructions are created.
+- [x] Scanner finds copied playlist files.
+- [x] Scanner finds symlinked playlist files.
+- [x] One canonical asset can retain multiple playlist entries and playlist-local lyric context.
+- [x] Scanner finds shared `.lrc` files under `audio/lyrics/`.
+- [x] Scanner finds artwork sidecars without decoding them on the scan hot path.
+- [x] Scanner emits searchable metadata when tags exist.
+- [x] Scanner emits filename/path fallback search fields when tags are missing.
+- [x] Scanner ignores symlinked directories.
+- [x] Hidden directory subtrees are not traversed when `ignore_hidden_audio` is true, and their descendants cannot consume scan budgets.
+- [x] Broken symlinks produce warnings.
+- [x] FIFO media targets, config files, and expected README entries fail or warn without waiting for another process to open them.
+- [x] Natural ordering compares nested path components independently before the exact raw-path tie-breaker.
+- [x] Invalid Linux filename bytes use reversible terminal-safe escapes that cannot collide with literal escape text.
+- [x] Instrumentation proves one descriptor-rooted enumeration with no accumulated-path reopen; parent substitution cannot redirect a scan, and unsupported secure symlink opens fail with a bounded warning.
+- [x] No scan panic occurs from bad paths.
+- [x] Lock primitive tests prove that two mutation leases cannot own one canonical root; actual mutable TUI acquisition is a Phase 3 acceptance criterion.
+- [x] Lock primitive tests prove that only one mutable TUI lease can exist for the OS user across different login sessions and roots; Phase 2 diagnostics and read-only status commands remain concurrent and do not claim that lease.
+- [x] Root precedence is identical for TUI, diagnostics, backups, and status commands.
 
 #### Do not build yet
 
@@ -3674,7 +3685,7 @@ Threat model:
 - Insecure runtime-lock placement allowing another local user to forge liveness or deny startup
 - Disclosure of personal recordings, paths, lyrics, and tags through backups, journals, logs, or overly permissive app-owned directories
 
-`docs/security.md` is created when the scanner introduces the first media parser
+Root `SECURITY.md` is created when the scanner introduces the first media parser
 and is extended only when a later trust boundary arrives. For each real threat it records assets,
 data flows, trust boundaries, attacker/capabilities, entry points, mitigations,
 owner, verification evidence, residual risk, and review triggers. It is reviewed
@@ -3696,8 +3707,7 @@ Rules:
 - Bound search result count and avoid search work on every render
 - Do not capture microphone or system audio for the visualizer
 - Do not follow symlinked directories in v1
-- Acquire one canonical-root writer lock before mutable TUI work
-- Acquire one per-user global active-TUI lock as well as the canonical-root writer lock; preserve a documented lock order, intentionally refuse another same-UID login session, and allow bounded read-only status commands
+- Acquire the per-user global active-TUI lock before the canonical-root writer lock when mutable TUI work arrives; intentionally refuse another same-UID login session and allow bounded read-only status commands
 - Revalidate symlink and file identity at use time, not only at scan/preview time
 - Show symlink targets before tag edits
 - Show lyric target paths before lyric edits
@@ -3919,11 +3929,11 @@ suzumushi/
 |-- README.md
 |-- LICENSE                          # Apache-2.0
 |-- CHANGELOG.md
+|-- SECURITY.md
 |-- docs/
 |   |-- install.md
 |   |-- audio-architecture.md
 |   |-- codec-compatibility.md
-|   |-- security.md
 |   |-- testing.md
 |   |-- integrations.md
 |   |-- parser-isolation.md

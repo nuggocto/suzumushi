@@ -10,7 +10,7 @@
 
 ## Current Setup State
 
-- A minimal `Cargo.toml`, `Cargo.lock`, and `src/main.rs` exist. `mise.toml`, CI, the library target, and project tests do not exist yet, so do not claim their verification or invent commands before setup adds them.
+- The package, library target, `mise.toml`, CI workflow, root initializer, descriptor-rooted scanner, lock primitives, focused tests, security checks, and bounded fuzz targets exist. Add later modules only when the current roadmap phase first needs their behavior.
 - Keep the root `suzumushi` package as the only package. Do not add helper packages or a `fuzz/` workspace until a current feature needs them.
 - Use Rust 1.97.1 for development/release, Rust 1.95.0 as MSRV, edition 2024, resolver 3, and Apache-2.0. Set `rust-version = "1.95.0"`, commit `Cargo.lock`, forbid application `unsafe`, and add SPDX headers to Rust sources.
 - Add dependencies only when the current phase needs them, pinned to exact versions and minimal features after the relevant ADR/security review. The initial application has no Cargo features.
@@ -21,7 +21,7 @@
 
 - `mise.toml` is the command authority. Normal checks use Rust 1.97.1; only the `msrv` task selects Rust 1.95.0 explicitly.
 - Run focused tests with `mise exec -- cargo test --locked -p suzumushi --test <target> <filter>`, then run the relevant `mise` task.
-- Initial full verification is `mise run ci`, in this order: `fmt`, `clippy`, `test`, `msrv`. Add security, fuzz, fault, QA, and release tasks only when their corresponding dependency or feature exists.
+- Full verification is `mise run ci`, in this order: `fmt`, `clippy`, `test`, `msrv`, `security`, and `fuzz-smoke`. Add fault, release, and packaged QA tasks only when their corresponding feature exists.
 - CI remains one `.github/workflows/ci.yml` that installs pinned `mise` and calls `mise run ci`; add checks to `mise.toml`, not new workflows. Phase 13 adds the only other workflow, `release.yml`.
 
 ## Product Boundaries
@@ -40,6 +40,7 @@
 - Use the `qa` skill only for real-user verification. Exercise the affected supported flow and credible failures; do not turn every change into full release QA.
 - Use the `security` skill for security reviews and changes at actual trust boundaries such as untrusted parsers, filesystem mutation, D-Bus, dependencies, and releases. Keep the review threat-driven and proportional; do not apply generic hardening checklists to unrelated work.
 - Roadmap phase labels and numbers are planning metadata. Keep them in `PROJECT.md` and related planning records only; never put `Phase 2`, `Phase 4`, or similar labels in commit messages, code comments, changelog entries, or user-facing output. Commits describe the change, and comments explain the code's invariant or reason.
+- Apply TigerStyle only to source-code comments and Rust doc comments. Add a comment when it preserves a non-obvious reason, invariant, bound, safety property, or test method; never narrate syntax the code already makes clear. Keep comments short and plain, with a little playfulness allowed when the stakes are low and clarity remains immediate. Keep security, failure, and recovery comments serious. This comment rule does not extend the TigerStyle voice to documentation, commits, identifiers, machine output, or user replies.
 - Load and follow the `vincent` skill for user replies, commit messages, and human-facing prose whenever the format permits it. Keep commit subjects concise and factual. For every non-trivial commit, add a short plain-language body that explains what changed and why; omit the body only when the subject fully explains a truly trivial change. Do not force that voice into code, commands, machine-readable output, legal text, or verbatim quotations.
 - Build only the current phase and choose the smallest correct implementation. Avoid speculative abstractions, helper crates, future-feature scaffolding, and performance tooling without a demonstrated problem.
 
@@ -57,7 +58,7 @@
 - Treat media, tags, lyrics, artwork, filenames, config/state, journals, backups, and D-Bus input as untrusted and bounded before allocation or expensive work. There is no `unlimited` sentinel.
 - Scan exactly once per request from pinned directory descriptors. Use descriptor-relative no-follow traversal; do not replace it with accumulated-path reopen, `std::fs::canonicalize`, or a weaker path fallback.
 - Never follow directory symlinks. File symlinks may be read for discovery/playback, but targets outside the canonical root are read/play-only and can never be mutated by confirmation.
-- Mutable TUI mode takes the canonical-root writer lock and then the secure per-UID active-TUI lock under verified `$XDG_RUNTIME_DIR`; status commands remain concurrent. Do not use `/tmp` or blindly remove stale locks.
+- Mutable TUI mode takes the secure per-UID active-TUI lock under verified `$XDG_RUNTIME_DIR` and then the canonical-root writer lock; status commands remain concurrent. Do not use `/tmp` or blindly remove stale locks.
 - Lyric/tag/restore writes require identity revalidation, checked budgets, durable journals, verified backups where a preimage exists, same-parent descriptor-relative atomic replacement, and post-write verification. Unsupported semantics fail closed; never downgrade to path-based or non-atomic writes.
 - Once a mutation commits, cancellation and the normal shutdown timeout no longer apply: retain locks and await durable completion or a journaled recoverable state. Never detach mutation work or auto-delete recovery evidence/backups.
 - Never render raw control characters or reuse terminal escaping for Waybar/Pango, tmux, `zjstatus`, notifications, or file URIs; sanitize and bound each output for its own formatting language.

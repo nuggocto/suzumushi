@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-fn main() {
-    suzumushi::run();
+fn main() -> std::process::ExitCode {
+    suzumushi::run()
 }
