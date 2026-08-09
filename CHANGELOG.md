@@ -13,10 +13,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Command-line help for the canonical executable.
 - Reproducible formatting, linting, test, and MSRV checks through `mise` and CI.
 - Safe root initialization with strict configuration, private state, logs, and backup storage.
-- Descriptor-rooted local media diagnostics for library files, folder playlists, file symlinks, lyrics, artwork candidates, metadata, and bounded warnings.
+- Descriptor-rooted local media diagnostics for library files, folder playlists, file symlinks, artwork candidates, metadata, and bounded warnings.
 - Per-root mutation and per-user active-TUI lock primitives with verified runtime storage.
 - Dependency security checks and bounded fuzz targets for current untrusted-input boundaries.
 - Root security policy with private reporting guidance and the current trust-boundary register.
+- A keyboard-only terminal interface with four focused panels, a compact help bar, deterministic small-terminal fallback, and clean `q` exit.
+- Bounded private file logging with record truncation, counted queue drops, and retained-size rotation.
+- Bounded terminal image-capability discovery with safe fallback when terminals or multiplexers do not answer.
+
+### Changed
+
+- Kept Now Playing and Art together in the middle column, with Queue using the full-height right panel.
+- Centered panel titles and kept their labels stationary while focus moves.
+- Defined Now Playing as a compact track identity and Art as the persistent cover, album, playback, progress, timer, and visualizer surface.
 
 ### Fixed
 
@@ -28,3 +37,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Removed repeated full asset searches from scanning and large-library diagnostics.
 - Applied deterministic natural ordering to each nested path component before the exact raw-path tie-breaker.
 - Rendered invalid Linux filename bytes with reversible terminal-safe escapes distinct from literal escape text.
+- Kept terminal capability replies out of keyboard input by issuing one query and accepting only a complete response frame.
+- Drained and joined the owned logging worker before reporting background failures, emitted dropped-record warnings outside the lossy queue, and pruned archives above lowered retention settings.
+- Resolved invalid, modified, and double-Space leader sequences to one action without accepting modified chord keys.
+- Bounded both terminal cell buffers before initial allocation and resize, with clean restoration when a reported terminal size exceeds the UI reservation.
+- Required initialization to verify and acquire the root writer lease before repairing an existing root.
+- Reserved the terminal session's five-descriptor startup peak before opening locks or log storage.
+
+### Removed
+
+- Simplified initialized roots, configuration, diagnostics, scanning, the terminal layout, and the roadmap to the smaller v1 scope.

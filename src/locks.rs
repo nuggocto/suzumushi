@@ -7,13 +7,13 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use rustix::fd::OwnedFd;
+use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::{FlockOperation, Mode, OFlags};
 use rustix::process::getuid;
 
 use crate::errors::{AppError, AppResult};
 
-const ROOT_LOCK: &str = ".suzumushi-root.lock";
+pub(crate) const ROOT_LOCK: &str = ".suzumushi-root.lock";
 const ACTIVE_LOCK: &str = "active-tui.lock";
 const MAX_IDENTITY_BYTES: u64 = 256;
 
@@ -43,8 +43,11 @@ impl RootMutationLease {
             Mode::empty(),
         )
         .map_err(|error| AppError::io("open root", root, error.into()))?;
-        let root_file = File::from(root_fd);
-        let file = open_private_lock(&root_file, ROOT_LOCK, &root.join(ROOT_LOCK))?;
+        Self::acquire_from(&root_fd, root)
+    }
+
+    pub(crate) fn acquire_from<Fd: AsFd>(root: Fd, display: &Path) -> AppResult<Self> {
+        let file = open_private_lock(root, ROOT_LOCK, &display.join(ROOT_LOCK))?;
         acquire_and_record(file, "root mutation").map(|file| Self { _file: file })
     }
 }

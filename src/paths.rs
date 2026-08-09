@@ -40,8 +40,6 @@ pub struct RootPaths {
     pub library: PathBuf,
     /// Folder playlists hierarchy.
     pub playlists: PathBuf,
-    /// Shared lyrics hierarchy.
-    pub lyrics: PathBuf,
     /// Reconstructible state.
     pub state: PathBuf,
     /// Artwork cache.
@@ -52,8 +50,6 @@ pub struct RootPaths {
     pub backups: PathBuf,
     /// Tag-edit backups.
     pub tag_backups: PathBuf,
-    /// Lyric-edit backups.
-    pub lyric_backups: PathBuf,
     /// Root configuration.
     pub config: PathBuf,
 }
@@ -68,11 +64,9 @@ impl RootPaths {
         Self {
             library: audio.join("library"),
             playlists: audio.join("playlists"),
-            lyrics: audio.join("lyrics"),
             artwork_cache: state.join("artwork"),
             logs: root.join("logs"),
             tag_backups: backups.join("tag-edits"),
-            lyric_backups: backups.join("lyric-edits"),
             config: root.join("config.toml"),
             root,
             audio,

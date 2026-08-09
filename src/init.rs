@@ -17,7 +17,6 @@ use crate::errors::{AppError, AppResult};
 use crate::paths::RootPaths;
 
 const DEMO_README: &str = "Suzumushi demo playlist\n\nCopy audio files here, or add file symlinks to local audio.\nFolders are playlists; directory symlinks are ignored.\n";
-const LYRICS_README: &str = "Suzumushi shared lyrics\n\nPlace .lrc files here for shared lookup. A same-stem .lrc beside an audio entry takes priority.\n";
 
 /// Initializes one app-owned root without following its final component.
 ///
@@ -28,6 +27,7 @@ const LYRICS_README: &str = "Suzumushi shared lyrics\n\nPlace .lrc files here fo
 pub fn initialize(path: &Path) -> AppResult<RootPaths> {
     let root_fd = open_or_create_root(path)?;
     verify_root_owner(&root_fd, path)?;
+    let _root_lease = crate::locks::RootMutationLease::acquire_from(&root_fd, path)?;
 
     let audio = ensure_dir(&root_fd, "audio", 0o755, false, &path.join("audio"))?;
     ensure_dir(&audio, "library", 0o755, false, &path.join("audio/library"))?;
@@ -45,8 +45,6 @@ pub fn initialize(path: &Path) -> AppResult<RootPaths> {
         false,
         &path.join("audio/playlists/demo"),
     )?;
-    let lyrics = ensure_dir(&audio, "lyrics", 0o755, false, &path.join("audio/lyrics"))?;
-
     let state = ensure_dir(&root_fd, "state", 0o700, true, &path.join("state"))?;
     ensure_dir(&state, "artwork", 0o700, true, &path.join("state/artwork"))?;
     ensure_dir(&root_fd, "logs", 0o700, true, &path.join("logs"))?;
@@ -57,13 +55,6 @@ pub fn initialize(path: &Path) -> AppResult<RootPaths> {
         0o700,
         true,
         &path.join("backups/tag-edits"),
-    )?;
-    ensure_dir(
-        &backups,
-        "lyric-edits",
-        0o700,
-        true,
-        &path.join("backups/lyric-edits"),
     )?;
 
     ensure_file(
@@ -82,15 +73,6 @@ pub fn initialize(path: &Path) -> AppResult<RootPaths> {
         false,
         &path.join("audio/playlists/demo/README.txt"),
     )?;
-    ensure_file(
-        &lyrics,
-        "README.txt",
-        LYRICS_README.as_bytes(),
-        0o644,
-        false,
-        &path.join("audio/lyrics/README.txt"),
-    )?;
-
     let canonical = descriptor_path(&root_fd, path)?;
     crate::config::load_from(&root_fd, path)?;
     Ok(RootPaths::new(canonical))
@@ -161,7 +143,14 @@ fn final_normal_component(path: &Path) -> Option<OsString> {
 }
 
 fn reject_unrelated_contents(fd: &OwnedFd, path: &Path) -> AppResult<()> {
-    const OWNED: &[&str] = &["audio", "backups", "config.toml", "logs", "state"];
+    const OWNED: &[&str] = &[
+        "audio",
+        "backups",
+        "config.toml",
+        "logs",
+        "state",
+        crate::locks::ROOT_LOCK,
+    ];
     let mut entries =
         Dir::read_from(fd).map_err(|error| AppError::io("read destination", path, error.into()))?;
     for entry in &mut entries {

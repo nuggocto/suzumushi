@@ -1,17 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Suzumushi root, configuration, locking, and scanner library.
+//! Suzumushi terminal shell, root, configuration, locking, and scanner library.
 
+pub mod app;
 pub mod cli;
 pub mod config;
 pub mod display;
 pub mod errors;
+pub mod event;
 pub mod init;
+pub mod input;
 pub mod locks;
+pub mod logging;
 pub mod metadata;
 pub mod model;
 pub mod paths;
 pub mod scan;
+pub mod terminal;
+pub mod terminal_capabilities;
+pub mod ui;
 
 /// Parses the process command line and returns a conventional exit status.
 #[must_use]

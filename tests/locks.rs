@@ -45,3 +45,20 @@ fn runtime_lock_fails_closed_without_secure_storage() {
         .expect("insecure runtime fixture");
     assert!(ActiveTuiLease::acquire_in(Some(temp.path())).is_err());
 }
+
+#[test]
+fn mutable_session_leases_release_during_unwinding() {
+    let temp = TempDir::new().expect("temporary directory");
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700))
+        .expect("private runtime fixture");
+    let root = initialize(&temp.path().join("root")).expect("initialize root");
+
+    let unwind = std::panic::catch_unwind(|| {
+        let _active = ActiveTuiLease::acquire_in(Some(temp.path())).expect("active lease");
+        let _root = RootMutationLease::acquire(&root.root).expect("root lease");
+        panic!("fixture unwind");
+    });
+    assert!(unwind.is_err());
+    ActiveTuiLease::acquire_in(Some(temp.path())).expect("active lease released while unwinding");
+    RootMutationLease::acquire(&root.root).expect("root lease released while unwinding");
+}

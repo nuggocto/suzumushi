@@ -18,13 +18,13 @@ fn an_absent_config_uses_the_compiled_safe_defaults() {
 }
 
 #[test]
-fn config_reserves_scanner_scratch_with_both_indexes() {
+fn config_reserves_current_app_state_with_both_indexes() {
     let text = config::DEFAULT_CONFIG.replacen(
         "process_memory_budget_bytes = 402653184",
-        "process_memory_budget_bytes = 268435455",
+        "process_memory_budget_bytes = 285212671",
         1,
     );
 
-    let error = config::parse(text.as_bytes()).expect_err("scratch must fit before scanning");
-    assert!(error.to_string().contains("scan/parser scratch"), "{error}");
+    let error = config::parse(text.as_bytes()).expect_err("current app reservation must fit");
+    assert!(error.to_string().contains("UI/state scratch"), "{error}");
 }

@@ -36,21 +36,23 @@ run = [
 ]
 
 [tasks.fuzz-smoke]
-description = "Run bounded scanner and parser boundary fuzz smoke tests"
+description = "Run bounded untrusted-input fuzz smoke tests"
 run = [
   "cargo +nightly-2026-07-01 fuzz run scanner_path_classification -- -max_total_time=5 -timeout=2 -rss_limit_mb=768 -max_len=4096 -verbosity=0",
   "cargo +nightly-2026-07-01 fuzz run config -- -max_total_time=5 -timeout=2 -rss_limit_mb=768 -max_len=65536 -verbosity=0",
   "cargo +nightly-2026-07-01 fuzz run metadata_adapter -- -max_total_time=5 -timeout=2 -rss_limit_mb=768 -max_len=1048576 -verbosity=0",
   "cargo +nightly-2026-07-01 fuzz run terminal_safe_display -- -max_total_time=5 -timeout=2 -rss_limit_mb=768 -max_len=65536 -verbosity=0",
+  "cargo +nightly-2026-07-01 fuzz run terminal_capability -- -max_total_time=5 -timeout=2 -rss_limit_mb=768 -max_len=4096 -verbosity=0",
 ]
 
 [tasks.fuzz-deep]
-description = "Run the bounded scanner and parser fuzz targets for longer"
+description = "Run the bounded untrusted-input fuzz targets for longer"
 run = [
   "cargo +nightly-2026-07-01 fuzz run scanner_path_classification -- -max_total_time=60 -timeout=2 -rss_limit_mb=768 -max_len=4096 -verbosity=0",
   "cargo +nightly-2026-07-01 fuzz run config -- -max_total_time=60 -timeout=2 -rss_limit_mb=768 -max_len=65536 -verbosity=0",
   "cargo +nightly-2026-07-01 fuzz run metadata_adapter -- -max_total_time=60 -timeout=2 -rss_limit_mb=768 -max_len=1048576 -verbosity=0",
   "cargo +nightly-2026-07-01 fuzz run terminal_safe_display -- -max_total_time=60 -timeout=2 -rss_limit_mb=768 -max_len=65536 -verbosity=0",
+  "cargo +nightly-2026-07-01 fuzz run terminal_capability -- -max_total_time=60 -timeout=2 -rss_limit_mb=768 -max_len=4096 -verbosity=0",
 ]
 
 [tasks.ci]

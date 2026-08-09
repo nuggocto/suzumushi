@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Arg, Command};
 
+use crate::app;
 use crate::config;
 use crate::display::terminal_safe;
 use crate::errors::{AppError, AppResult};
@@ -95,17 +96,17 @@ where
             Ok(())
         }
         Some(("diagnose", _)) => diagnose(explicit.as_deref(), current_dir),
-        None => {
-            command()
-                .print_help()
-                .map_err(|error| AppError::io("print help", "stdout", error))?;
-            println!();
-            Ok(())
-        }
+        None => terminal_session(explicit.as_deref(), current_dir),
         Some((name, _)) => Err(AppError::InvalidConfig(format!(
             "unsupported command {name}"
         ))),
     }
+}
+
+fn terminal_session(explicit: Option<&Path>, current_dir: &Path) -> AppResult<()> {
+    let selected = paths::discover_root(explicit, current_dir)?;
+    let config = config::load(&selected.path)?;
+    app::run(&selected.path, &config)
 }
 
 fn diagnose(explicit: Option<&Path>, current_dir: &Path) -> AppResult<()> {
@@ -120,7 +121,6 @@ fn diagnose(explicit: Option<&Path>, current_dir: &Path) -> AppResult<()> {
     println!("assets: {}", index.assets.len());
     println!("tracks: {}", index.entries.len());
     println!("playlists: {}", index.playlists.len());
-    println!("shared lyrics: {}", index.shared_lyrics.len());
     println!("artwork candidates: {}", index.artwork_candidates.len());
     println!("warnings: {}", index.warnings.len());
     for entry in &index.entries {

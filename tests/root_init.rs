@@ -6,6 +6,7 @@ use std::path::Path;
 
 use suzumushi::errors::AppError;
 use suzumushi::init::initialize;
+use suzumushi::locks::RootMutationLease;
 use suzumushi::paths::{RootSource, discover_root_from};
 use tempfile::TempDir;
 
@@ -26,18 +27,15 @@ fn init_creates_the_documented_tree_with_private_storage() {
     for directory in [
         &paths.library,
         &paths.playlists.join("demo"),
-        &paths.lyrics,
         &paths.state,
         &paths.artwork_cache,
         &paths.logs,
         &paths.backups,
         &paths.tag_backups,
-        &paths.lyric_backups,
     ] {
         assert!(directory.is_dir(), "missing {}", directory.display());
     }
     assert!(paths.playlists.join("demo/README.txt").is_file());
-    assert!(paths.lyrics.join("README.txt").is_file());
     assert!(
         fs::read_to_string(&paths.config)
             .expect("config readable")
@@ -49,7 +47,6 @@ fn init_creates_the_documented_tree_with_private_storage() {
         &paths.logs,
         &paths.backups,
         &paths.tag_backups,
-        &paths.lyric_backups,
     ] {
         assert_eq!(
             mode(directory),
@@ -89,6 +86,16 @@ fn init_refuses_symlinks_unrelated_contents_and_exposed_private_storage() {
         .expect("expose state fixture");
     let error = initialize(&exposed).expect_err("insecure private storage is refused");
     assert!(error.to_string().contains("mode 700"));
+
+    let unsafe_lock = temp.path().join("unsafe-lock");
+    initialize(&unsafe_lock).expect("initialize lock fixture");
+    fs::set_permissions(
+        unsafe_lock.join(".suzumushi-root.lock"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .expect("expose root lock fixture");
+    let error = initialize(&unsafe_lock).expect_err("unsafe root lock is refused");
+    assert!(error.to_string().contains("mode 0600"));
 }
 
 #[test]
@@ -106,6 +113,31 @@ fn nested_directory_failure_reports_its_exact_path() {
         AppError::Io { path, .. } => assert_eq!(path, demo),
         other => panic!("expected an I/O error for {demo:?}, got {other}"),
     }
+}
+
+#[test]
+fn reinitialization_respects_the_root_writer_lease() {
+    let temp = TempDir::new().expect("temporary directory");
+    let root = temp.path().join("root");
+    let paths = initialize(&root).expect("initialize fixture");
+    let readme = paths.playlists.join("demo/README.txt");
+    fs::remove_file(&readme).expect("remove owned file");
+    let lease = RootMutationLease::acquire(&root).expect("hold root writer lease");
+
+    let error = initialize(&root).expect_err("reinitialization must contend with the writer");
+    assert!(
+        error
+            .to_string()
+            .contains("root mutation lease is already held")
+    );
+    assert!(
+        !readme.exists(),
+        "a failed reinitialization must not mutate the root"
+    );
+
+    drop(lease);
+    initialize(&root).expect("reinitialization succeeds after the lease is released");
+    assert!(readme.is_file());
 }
 
 #[test]

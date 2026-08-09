@@ -1,0 +1,6 @@
+---
+source: src/ui/mod.rs
+expression: "snapshot(40, 10)"
+---
+Suzumushi needs at least 80x24.
+Resize the terminal or press q to quit.

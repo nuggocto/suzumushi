@@ -18,7 +18,7 @@ use crate::errors::{AppError, AppResult};
 use crate::metadata;
 use crate::model::{
     ArtworkCandidate, FileIdentity, MediaAsset, MediaAssetId, Playlist, PlaylistId, ScanCounters,
-    ScanIndex, ScanWarning, ScanWarningCode, SearchFields, SharedLyrics, TrackEntry, TrackEntryId,
+    ScanIndex, ScanWarning, ScanWarningCode, SearchFields, TrackEntry, TrackEntryId,
     TrackEntrySource, TrackTags, stable_id,
 };
 
@@ -61,7 +61,6 @@ impl ScanObserver for NoopObserver {}
 pub enum PathClass {
     LibraryAudio,
     PlaylistAudio { playlist: Vec<u8> },
-    SharedLyrics,
     Artwork,
     Other,
 }
@@ -104,15 +103,6 @@ pub fn classify_relative_path(path: &Path) -> PathClass {
     );
     if is_artwork_name(path.file_name().unwrap_or_default()) && artwork_context {
         return PathClass::Artwork;
-    }
-    if components
-        .first()
-        .is_some_and(|value| value.as_bytes() == b"lyrics")
-        && path
-            .extension()
-            .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"lrc"))
-    {
-        return PathClass::SharedLyrics;
     }
     if !is_supported_audio_extension(path) {
         return PathClass::Other;
@@ -232,7 +222,6 @@ struct PendingEntry {
     asset_id: MediaAssetId,
     display_path: PathBuf,
     source: TrackEntrySource,
-    stem_key: Vec<u8>,
     tags: TrackTags,
 }
 
@@ -252,8 +241,6 @@ struct Scanner<'a> {
     asset_keys: BTreeMap<(Vec<u8>, FileIdentity), (MediaAssetId, usize)>,
     entries: Vec<PendingEntry>,
     playlists: BTreeMap<Vec<u8>, Playlist>,
-    lrc_paths: BTreeMap<Vec<u8>, PathBuf>,
-    shared_lyrics: Vec<SharedLyrics>,
     artwork: Vec<ArtworkCandidate>,
     warnings: Vec<ScanWarning>,
     counters: ScanCounters,
@@ -285,8 +272,6 @@ impl<'a> Scanner<'a> {
             asset_keys: BTreeMap::new(),
             entries: Vec::new(),
             playlists: BTreeMap::new(),
-            lrc_paths: BTreeMap::new(),
-            shared_lyrics: Vec::new(),
             artwork: Vec::new(),
             warnings: Vec::new(),
             counters: ScanCounters {
@@ -394,6 +379,10 @@ impl<'a> Scanner<'a> {
         if self.limits.ignore_hidden_audio && is_hidden(name) {
             return Ok(());
         }
+        if child.components().count() == 1 && !matches!(name.as_bytes(), b"library" | b"playlists")
+        {
+            return Ok(());
+        }
         if playlist_key(&child).is_some_and(|key| {
             child.components().count() == 2 && !self.ensure_playlist(key, &child)
         }) {
@@ -463,15 +452,6 @@ impl<'a> Scanner<'a> {
                     });
                 }
             }
-            PathClass::SharedLyrics => {
-                self.account_index(retained_lyrics_bytes(&child), &child);
-                if !self.stopped {
-                    self.lrc_paths.insert(stem_key(&child), child.clone());
-                    self.shared_lyrics.push(SharedLyrics {
-                        relative_path: child,
-                    });
-                }
-            }
             PathClass::LibraryAudio | PathClass::PlaylistAudio { .. } => {
                 if self.limits.ignore_hidden_audio && is_hidden(name) {
                     return Ok(());
@@ -500,15 +480,7 @@ impl<'a> Scanner<'a> {
                 result?;
             }
             PathClass::Other => {
-                if child
-                    .extension()
-                    .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"lrc"))
-                {
-                    self.account_index(retained_sidecar_lookup_bytes(&child), &child);
-                    if !self.stopped {
-                        self.lrc_paths.insert(stem_key(&child), child);
-                    }
-                } else if is_media_hierarchy(&child)
+                if is_media_hierarchy(&child)
                     && !child
                         .file_name()
                         .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"README.txt"))
@@ -788,7 +760,6 @@ impl<'a> Scanner<'a> {
             asset_id,
             display_path: child.clone(),
             source,
-            stem_key: stem_key(&child),
             tags,
         });
         if let Some(key) = playlist
@@ -955,7 +926,6 @@ impl<'a> Scanner<'a> {
     fn finish(mut self) -> ScanIndex {
         let mut contextual = Vec::with_capacity(self.entries.len());
         for pending in self.entries {
-            let lyrics_path = self.lrc_paths.get(&pending.stem_key).cloned();
             let filename = pending
                 .display_path
                 .file_stem()
@@ -981,7 +951,6 @@ impl<'a> Scanner<'a> {
                 asset_id: pending.asset_id,
                 display_path: pending.display_path,
                 source: pending.source,
-                lyrics_path,
                 search: SearchFields {
                     metadata,
                     filename,
@@ -997,8 +966,6 @@ impl<'a> Scanner<'a> {
             .map(|(rank, entry)| (entry.id, rank))
             .collect();
         self.assets.sort_by_key(|asset| asset.id);
-        self.shared_lyrics
-            .sort_by(|left, right| natural_path_cmp(&left.relative_path, &right.relative_path));
         self.artwork
             .sort_by(|left, right| natural_path_cmp(&left.relative_path, &right.relative_path));
         let mut playlists: Vec<_> = self.playlists.into_values().collect();
@@ -1014,7 +981,6 @@ impl<'a> Scanner<'a> {
             assets: self.assets,
             entries: contextual,
             playlists,
-            shared_lyrics: self.shared_lyrics,
             artwork_candidates: self.artwork,
             warnings: self.warnings,
             counters: self.counters,
@@ -1100,20 +1066,6 @@ fn playlist_path(path: &Path) -> PathBuf {
     result
 }
 
-fn stem_key(path: &Path) -> Vec<u8> {
-    let mut key = path
-        .parent()
-        .unwrap_or_else(|| Path::new(""))
-        .as_os_str()
-        .as_bytes()
-        .to_vec();
-    key.push(0);
-    if let Some(stem) = path.file_stem() {
-        key.extend_from_slice(stem.as_bytes());
-    }
-    key
-}
-
 fn path_bytes(path: &Path) -> usize {
     path.as_os_str().as_bytes().len()
 }
@@ -1153,17 +1105,6 @@ fn retained_path_record_bytes<T>(path: &Path) -> usize {
     std::mem::size_of::<T>()
         .saturating_add(128)
         .saturating_add(path_bytes(path).saturating_mul(2))
-}
-
-fn retained_sidecar_lookup_bytes(path: &Path) -> usize {
-    std::mem::size_of::<(Vec<u8>, PathBuf)>()
-        .saturating_add(192)
-        .saturating_add(path_bytes(path).saturating_mul(3))
-}
-
-fn retained_lyrics_bytes(path: &Path) -> usize {
-    retained_path_record_bytes::<SharedLyrics>(path)
-        .saturating_add(retained_sidecar_lookup_bytes(path))
 }
 
 fn retained_playlist_bytes(key_bytes: usize, name_bytes: usize, path: &Path) -> usize {

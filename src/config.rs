@@ -17,6 +17,8 @@ use crate::errors::{AppError, AppResult};
 pub const MAX_CONFIG_BYTES: usize = 65_536;
 
 pub(crate) const SCAN_PARSER_SCRATCH_BYTES: usize = 32 * 1_048_576;
+pub(crate) const UI_STATE_SCRATCH_BYTES: usize = 8 * 1_048_576;
+pub(crate) const MAX_LOG_FILES: usize = 5;
 
 pub(crate) fn scan_reservation_bytes(
     active_index_bytes: usize,
@@ -74,15 +76,6 @@ music_search_key = "/"
 palette_key = "space slash"
 metadata_weight = 3
 filename_weight = 1
-
-[lyrics]
-enabled = true
-editing = true
-shared_lookup = true
-max_lrc_bytes = 262144
-max_lines = 5000
-backup_budget_bytes = 268435456
-backup_max_entries = 10000
 
 [artwork]
 enabled = true
@@ -167,7 +160,6 @@ pub struct Config {
     pub input: InputConfig,
     pub scan: ScanConfig,
     pub search: SearchConfig,
-    pub lyrics: LyricsConfig,
     pub artwork: ArtworkConfig,
     pub visualizer: VisualizerConfig,
     pub desktop: DesktopConfig,
@@ -215,15 +207,6 @@ section!(SearchConfig {
     palette_key: String,
     metadata_weight: u8,
     filename_weight: u8
-});
-section!(LyricsConfig {
-    enabled: bool,
-    editing: bool,
-    shared_lookup: bool,
-    max_lrc_bytes: usize,
-    max_lines: usize,
-    backup_budget_bytes: u64,
-    backup_max_entries: usize
 });
 section!(ArtworkConfig {
     enabled: bool,
@@ -524,25 +507,6 @@ impl Config {
         }
         key("search.music_search_key", &self.search.music_search_key)?;
         key("search.palette_key", &self.search.palette_key)?;
-        inclusive(
-            "lyrics.max_lrc_bytes",
-            self.lyrics.max_lrc_bytes,
-            1,
-            262_144,
-        )?;
-        inclusive("lyrics.max_lines", self.lyrics.max_lines, 1, 5_000)?;
-        inclusive(
-            "lyrics.backup_budget_bytes",
-            self.lyrics.backup_budget_bytes,
-            1,
-            268_435_456,
-        )?;
-        inclusive(
-            "lyrics.backup_max_entries",
-            self.lyrics.backup_max_entries,
-            1,
-            10_000,
-        )?;
         let a = &self.artwork;
         inclusive(
             "artwork.max_source_bytes",
@@ -650,7 +614,7 @@ impl Config {
         )?;
         let l = &self.logging;
         inclusive("logging.max_file_bytes", l.max_file_bytes, 1, 10_485_760)?;
-        inclusive("logging.max_files", l.max_files, 1, 5)?;
+        inclusive("logging.max_files", l.max_files, 1, MAX_LOG_FILES)?;
         inclusive("logging.max_record_bytes", l.max_record_bytes, 1, 16_384)?;
         inclusive("logging.queue_capacity", l.queue_capacity, 1, 512)?;
         inclusive("logging.queue_max_bytes", l.queue_max_bytes, 1, 8_388_608)?;
@@ -659,6 +623,21 @@ impl Config {
             &l.queue_full_policy,
             &["drop_and_count"],
         )?;
+        let queued_log_bytes = l
+            .queue_capacity
+            .checked_mul(l.max_record_bytes)
+            .ok_or_else(|| AppError::InvalidConfig("logging queue reservation overflow".into()))?;
+        if queued_log_bytes > l.queue_max_bytes {
+            return Err(AppError::InvalidConfig(
+                "logging.queue_capacity times logging.max_record_bytes must fit logging.queue_max_bytes"
+                    .into(),
+            ));
+        }
+        if l.max_record_bytes > l.max_file_bytes {
+            return Err(AppError::InvalidConfig(
+                "logging.max_record_bytes must not exceed logging.max_file_bytes".into(),
+            ));
+        }
         inclusive(
             "tags.backup_budget_bytes",
             self.tags.backup_budget_bytes,
@@ -697,11 +676,13 @@ impl Config {
             1,
             10_000,
         )?;
-        let reserved_scan = scan_reservation_bytes(s.max_index_bytes, s.max_index_bytes)?;
-        if reserved_scan > r.process_memory_budget_bytes {
+        let reserved_app = scan_reservation_bytes(s.max_index_bytes, s.max_index_bytes)?
+            .checked_add(l.queue_max_bytes)
+            .and_then(|value| value.checked_add(UI_STATE_SCRATCH_BYTES))
+            .ok_or_else(|| AppError::InvalidConfig("application reservation overflow".into()))?;
+        if reserved_app > r.process_memory_budget_bytes {
             return Err(AppError::InvalidConfig(
-                "active and replacement indexes plus scan/parser scratch exceed process_memory_budget_bytes"
-                    .into(),
+                "indexes, scan/parser scratch, logging queue, and UI/state scratch exceed process_memory_budget_bytes".into(),
             ));
         }
         Ok(())
@@ -800,5 +781,19 @@ mod tests {
                 "accepted contradictory {new}"
             );
         }
+
+        let text = replace_once(
+            DEFAULT_CONFIG,
+            "queue_max_bytes = 8388608",
+            "queue_max_bytes = 8388607",
+        );
+        assert!(parse(text.as_bytes()).is_err());
+
+        let text = replace_once(
+            DEFAULT_CONFIG,
+            "max_file_bytes = 10485760",
+            "max_file_bytes = 16383",
+        );
+        assert!(parse(text.as_bytes()).is_err());
     }
 }

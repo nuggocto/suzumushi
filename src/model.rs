@@ -75,7 +75,6 @@ pub struct TrackEntry {
     pub asset_id: MediaAssetId,
     pub display_path: PathBuf,
     pub source: TrackEntrySource,
-    pub lyrics_path: Option<PathBuf>,
     pub search: SearchFields,
     pub scan_generation: u64,
 }
@@ -95,12 +94,6 @@ pub struct Playlist {
     pub name: String,
     pub path: PathBuf,
     pub entries: Vec<TrackEntryId>,
-}
-
-/// A shared `.lrc` file found under `audio/lyrics`.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct SharedLyrics {
-    pub relative_path: PathBuf,
 }
 
 /// An artwork path recorded without decoding image bytes.
@@ -159,7 +152,6 @@ pub struct ScanIndex {
     pub assets: Vec<MediaAsset>,
     pub entries: Vec<TrackEntry>,
     pub playlists: Vec<Playlist>,
-    pub shared_lyrics: Vec<SharedLyrics>,
     pub artwork_candidates: Vec<ArtworkCandidate>,
     pub warnings: Vec<ScanWarning>,
     pub counters: ScanCounters,

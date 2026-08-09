@@ -143,22 +143,19 @@ fn scan(
 }
 
 #[test]
-fn one_pass_finds_context_metadata_lyrics_artwork_and_symlinks() {
+fn one_pass_finds_context_metadata_artwork_and_symlinks() {
     let (_temp, root) = root();
     let library = root.join("audio/library");
     let playlist = root.join("audio/playlists/focus");
     fs::create_dir(&playlist).expect("playlist");
     fs::write(library.join("10 original.mp3"), b"media").expect("library media");
     fs::write(library.join("2 copied.flac"), b"copy").expect("copied media");
-    fs::write(library.join("10 original.lrc"), b"[00:00] local").expect("sidecar");
     fs::write(library.join("cover.jpg"), b"not decoded").expect("artwork");
-    fs::write(root.join("audio/lyrics/shared.lrc"), b"[00:00] shared").expect("shared lyrics");
     symlink(
         library.join("10 original.mp3"),
         playlist.join("10 link.mp3"),
     )
     .expect("playlist symlink");
-    fs::write(playlist.join("10 link.lrc"), b"[00:00] playlist local").expect("playlist lyrics");
     fs::copy(
         library.join("2 copied.flac"),
         playlist.join("2 copied.flac"),
@@ -188,7 +185,6 @@ fn one_pass_finds_context_metadata_lyrics_artwork_and_symlinks() {
         reader.attempts, 3,
         "metadata is parsed once per canonical asset"
     );
-    assert_eq!(index.shared_lyrics.len(), 1);
     assert_eq!(index.artwork_candidates.len(), 1);
     let focus = index
         .playlists
@@ -217,11 +213,12 @@ fn one_pass_finds_context_metadata_lyrics_artwork_and_symlinks() {
         ],
         "playlist entries use natural order, not creation order"
     );
-    assert!(index.entries.iter().any(|entry| matches!(
-        entry.source,
-        TrackEntrySource::PlaylistSymlink { .. }
-    ) && entry.lyrics_path.as_deref()
-        == Some(Path::new("playlists/focus/10 link.lrc"))));
+    assert!(
+        index
+            .entries
+            .iter()
+            .any(|entry| matches!(entry.source, TrackEntrySource::PlaylistSymlink { .. }))
+    );
     assert!(index.entries.iter().all(|entry| {
         entry
             .search
@@ -284,6 +281,34 @@ fn hidden_directory_at_audio_root_does_not_consume_descendant_budgets() {
     let index = scan(&root, &config, &mut reader);
 
     assert!(index.complete, "{:?}", index.warnings);
+    assert_eq!(
+        index.counters.encountered_entries,
+        baseline.counters.encountered_entries + 1
+    );
+    assert_eq!(
+        index.counters.directory_enumerations,
+        baseline.counters.directory_enumerations
+    );
+}
+
+#[test]
+fn unrelated_directory_at_audio_root_does_not_consume_descendant_budgets() {
+    let (_temp, root) = root();
+    let mut reader = FakeMetadata::default();
+    let baseline = scan(&root, &Config::default(), &mut reader);
+
+    let unrelated = root.join("audio/notes");
+    fs::create_dir(&unrelated).expect("unrelated directory");
+    fs::write(unrelated.join("ignored.mp3"), b"ignored").expect("unrelated descendant");
+
+    let mut config = Config::default();
+    config.scan.max_files = 1;
+    config.scan.max_entries = baseline.counters.encountered_entries + 1;
+    let mut reader = FakeMetadata::default();
+    let index = scan(&root, &config, &mut reader);
+
+    assert!(index.complete, "{:?}", index.warnings);
+    assert!(index.entries.is_empty());
     assert_eq!(
         index.counters.encountered_entries,
         baseline.counters.encountered_entries + 1
