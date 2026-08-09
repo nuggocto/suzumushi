@@ -40,7 +40,7 @@
 - Use the `qa` skill only for real-user verification. Exercise the affected supported flow and credible failures; do not turn every change into full release QA.
 - Use the `security` skill for security reviews and changes at actual trust boundaries such as untrusted parsers, filesystem mutation, D-Bus, dependencies, and releases. Keep the review threat-driven and proportional; do not apply generic hardening checklists to unrelated work.
 - Roadmap phase labels and numbers are planning metadata. Keep them in `PROJECT.md` and related planning records only; never put `Phase 2`, `Phase 4`, or similar labels in commit messages, code comments, changelog entries, or user-facing output. Commits describe the change, and comments explain the code's invariant or reason.
-- Load and follow the `vincent` skill for user replies, commit messages, and human-facing prose whenever the format permits it. Keep commit subjects concise and factual. Do not force that voice into code, commands, machine-readable output, legal text, or verbatim quotations.
+- Load and follow the `vincent` skill for user replies, commit messages, and human-facing prose whenever the format permits it. Keep commit subjects concise and factual. For every non-trivial commit, add a short plain-language body that explains what changed and why; omit the body only when the subject fully explains a truly trivial change. Do not force that voice into code, commands, machine-readable output, legal text, or verbatim quotations.
 - Build only the current phase and choose the smallest correct implementation. Avoid speculative abstractions, helper crates, future-feature scaffolding, and performance tooling without a demonstrated problem.
 
 ## Architecture Contracts
