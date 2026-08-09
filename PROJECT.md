@@ -893,7 +893,8 @@ implications, and removes rejected spike dependencies. `Cargo.toml` and
 | First need | Candidate inventory | Intended minimal features to decide and pin in ADR |
 |---|---|---|
 | Audio playback | `rodio` or `symphonia`; `signalsmith-stretch` or selected equivalent | Only proven codec/output/stretch features; no default feature set accepted without review |
-| Foundation/CLI | `clap`, `thiserror`, `anyhow`, `tracing`, `tracing-subscriber`, `tracing-appender` | Derive, bounded nonblocking delivery into app-owned rotating file logging, and only required formatting/registry features |
+| Project setup/CLI | `clap = 4.6.6` | Pinned with default features disabled and only `std`, `help`, and `usage`; MIT OR Apache-2.0, no native/FFI boundary, and reviewed internal unsafe only in the resolved `clap_lex` and `anstyle` dependencies |
+| Foundation/errors/logging | `thiserror`, `anyhow`, `tracing`, `tracing-subscriber`, `tracing-appender` | Bounded nonblocking delivery into app-owned rotating file logging and only required formatting/registry features when first used |
 | TUI/runtime | `ratatui`, `crossterm`, `tokio`, `unicode-width` | Crossterm event stream; Tokio runtime, macros, sync, time, signal, and fs only when used |
 | Scan/search/model | `rustix`, app-owned natural comparator, `nucleo-matcher`, `serde`, `serde_json`, `toml`, `rand` | Only descriptor-relative filesystem APIs and Serde features exercised by the phase; no pathname walker or sorting dependency |
 | Tags/artwork/desktop | `lofty`, `image`, `ratatui-image`, `souvlaki` or `zbus`, `notify-rust`, `time` | Exact supported formats/protocols/backends selected by their ADRs |
@@ -2547,7 +2548,7 @@ Each phase should end with `cargo run -- --root ./suzumushi` or a small CLI comm
 
 **Phases**
 
-- [ ] **Phase 1** - Project Setup
+- [x] **Phase 1** - Project Setup
 - [ ] **Phase 2** - Suzumushi Root And Scanner - *milestone: Local root prototype* - *tag 0.1.0*
 - [ ] **Phase 3** - Minimal TUI Shell - *milestone: Terminal prototype* - *tag 0.2.0*
 - [ ] **Phase 4** - Library, Search, Playlist Browser, And Queue
@@ -2618,7 +2619,7 @@ minimal Rust project setup
 
 ### Phase 1 - Project Setup
 
-**Status:** `in progress`
+**Status:** `done`
 
 **Goal:** Finish a small, reproducible Rust package before feature work begins.
 
@@ -2626,21 +2627,21 @@ minimal Rust project setup
 
 #### Build steps
 
-1. [ ] Finish the root `suzumushi` package metadata with edition `2024`, `rust-version = "1.95.0"`, Apache-2.0, `default-run = "suzumushi"`, strict lints, and committed `Cargo.lock`.
-2. [ ] Keep one canonical `suzumushi` binary and one library target. `main.rs` contains only startup/CLI wiring; `lib.rs` owns implementation exposed to tests.
-3. [ ] Forbid application `unsafe` and add `SPDX-License-Identifier: Apache-2.0` headers to Rust sources.
-4. [ ] Add only the minimal dependency needed for CLI parsing, pinned exactly with minimal features. Do not add audio, TUI, parser, fuzz, or desktop dependencies yet.
-5. [ ] Create `mise.toml` with Rust `1.97.1` and focused `fmt`, `clippy`, `test`, `msrv`, and `ci` tasks. The `msrv` task alone selects Rust `1.95.0`; all Cargo commands use `--locked`.
-6. [ ] Keep `.gitignore`, `LICENSE`, and `CHANGELOG.md` with an `Unreleased` section under version control.
-7. [ ] Add one `.github/workflows/ci.yml` that installs pinned `mise` and runs `mise run ci`.
-8. [ ] Add the smallest CLI test that proves `--help` succeeds and names the canonical command. Do not scaffold future commands or modules merely to test placeholders.
+1. [x] Finish the root `suzumushi` package metadata with edition `2024`, `rust-version = "1.95.0"`, Apache-2.0, `default-run = "suzumushi"`, strict lints, and committed `Cargo.lock`.
+2. [x] Keep one canonical `suzumushi` binary and one library target. `main.rs` contains only startup/CLI wiring; `lib.rs` owns implementation exposed to tests.
+3. [x] Forbid application `unsafe` and add `SPDX-License-Identifier: Apache-2.0` headers to Rust sources.
+4. [x] Add only the minimal dependency needed for CLI parsing, pinned exactly with minimal features. Do not add audio, TUI, parser, fuzz, or desktop dependencies yet.
+5. [x] Create `mise.toml` with Rust `1.97.1` and focused `fmt`, `clippy`, `test`, `msrv`, and `ci` tasks. The `msrv` task alone selects Rust `1.95.0`; all Cargo commands use `--locked`.
+6. [x] Keep `.gitignore`, `LICENSE`, and `CHANGELOG.md` with an `Unreleased` section under version control.
+7. [x] Add one `.github/workflows/ci.yml` that installs pinned `mise` and runs `mise run ci`.
+8. [x] Add the smallest CLI test that proves `--help` succeeds and names the canonical command. Do not scaffold future commands or modules merely to test placeholders.
 
 #### Done when
 
-- [ ] `mise run ci` passes on Rust `1.97.1` and the Rust `1.95.0` MSRV task passes.
-- [ ] `cargo run --locked -- --help` succeeds.
-- [ ] Cargo exposes one binary and one library target with no application features.
-- [ ] No dependency or module exists without behavior required by this phase.
+- [x] `mise run ci` passes on Rust `1.97.1` and the Rust `1.95.0` MSRV task passes.
+- [x] `cargo run --locked -- --help` succeeds.
+- [x] Cargo exposes one binary and one library target with no application features.
+- [x] No dependency or module exists without behavior required by this phase.
 
 #### Do not build yet
 

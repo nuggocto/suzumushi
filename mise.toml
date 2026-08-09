@@ -1,0 +1,30 @@
+[tools]
+rust = "1.97.1"
+
+[tasks.fmt]
+description = "Check Rust formatting"
+run = "cargo --locked fmt --all --check"
+
+[tasks.clippy]
+description = "Lint all Rust targets"
+env = { CARGO_BUILD_WARNINGS = "deny" }
+run = "cargo clippy --locked --workspace --all-targets -- -D warnings"
+
+[tasks.test]
+description = "Run the locked Rust test and doctest suite"
+env = { CARGO_BUILD_WARNINGS = "deny" }
+run = "cargo test --locked --workspace"
+
+[tasks.msrv]
+description = "Verify the supported Rust 1.95.0 baseline"
+env = { RUSTFLAGS = "-D warnings" }
+run = "mise exec rust@1.95.0 -- cargo test --locked --workspace"
+
+[tasks.ci]
+description = "Run the complete project setup verification"
+run = [
+  { task = "fmt" },
+  { task = "clippy" },
+  { task = "test" },
+  { task = "msrv" },
+]
