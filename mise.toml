@@ -29,10 +29,10 @@ run = "mise exec rust@1.95.0 -- cargo test --locked --workspace"
 [tasks.security]
 description = "Check dependency advisories, licenses, bans, and sources"
 run = [
-  "cargo audit --deny warnings --ignore RUSTSEC-2024-0436",
-  "cargo audit --file fuzz/Cargo.lock --deny warnings --ignore RUSTSEC-2024-0436",
-  "cargo deny check advisories bans licenses sources",
-  "cargo deny --manifest-path fuzz/Cargo.toml check --config fuzz/deny.toml advisories bans licenses sources",
+  "mise exec cargo:cargo-audit@0.22.2 -- cargo-audit audit --deny warnings --ignore RUSTSEC-2024-0436",
+  "mise exec cargo:cargo-audit@0.22.2 -- cargo-audit audit --file fuzz/Cargo.lock --deny warnings --ignore RUSTSEC-2024-0436",
+  "mise exec cargo:cargo-deny@0.20.2 -- cargo-deny check advisories bans licenses sources",
+  "mise exec cargo:cargo-deny@0.20.2 -- cargo-deny --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml check advisories bans licenses sources",
 ]
 
 [tasks.fuzz-smoke]
