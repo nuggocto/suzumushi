@@ -39,6 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bounded playback-state identity fields for their worst-case JSON escaping and kept a five-second heartbeat while the TUI is alive.
 - Published a final stopped state after event-loop failures whenever the state directory remains writable.
 - Discarded decoder preroll on seeks and ordered reliable restart events against coalesced position updates.
+- Coalesced held-arrow seek targets so decoder restarts cannot block the terminal, overwrite the newest target, or swallow pause and resume.
 - Preserved shuffle history across queue edits and started new shuffled playlists at their first selected track without skipping the rest.
 - Kept long timeline text visible at 80 columns and removed a scheduler-dependent PTY assertion.
 

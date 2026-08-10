@@ -161,6 +161,7 @@ struct PlaybackState {
     current: Option<QueueItem>,
     position_hint: usize,
     timeline_revision: u64,
+    seek_target: Option<Duration>,
     format: Option<AudioFormat>,
     position: Duration,
     duration: Option<Duration>,
@@ -172,6 +173,7 @@ impl PlaybackState {
             current: None,
             position_hint: 0,
             timeline_revision: 0,
+            seek_target: None,
             format: None,
             position: Duration::ZERO,
             duration: None,
@@ -524,6 +526,7 @@ impl AppState {
                 self.playback_status,
                 PlaybackStatus::Stopped | PlaybackStatus::Error
             )
+            || self.playback.seek_target.is_some()
             || update.timeline_revision < self.playback.timeline_revision
         {
             return;
@@ -537,6 +540,7 @@ impl AppState {
 
     pub(crate) fn session_stopped(&mut self) {
         self.playback_status = PlaybackStatus::Stopped;
+        self.playback.seek_target = None;
         self.playback.format = None;
     }
 
@@ -645,6 +649,7 @@ impl AppState {
         self.playback.duration = None;
         self.playback.format = None;
         self.playback.timeline_revision = 0;
+        self.playback.seek_target = None;
         self.playback_status = PlaybackStatus::Stopped;
         let missing = snapshot
             .queue_entry_ids
@@ -688,6 +693,7 @@ impl AppState {
                 ..
             } => {
                 self.set_playback_status(PlaybackStatus::Playing);
+                self.playback.seek_target = None;
                 self.playback.format = Some(format);
                 self.playback.duration = duration;
                 self.apply_event_position(timeline_revision, position);
@@ -706,6 +712,7 @@ impl AppState {
             }
             AudioEvent::Stopped { .. } => {
                 self.set_playback_status(PlaybackStatus::Stopped);
+                self.playback.seek_target = None;
                 self.playback.format = None;
                 self.playback.position = Duration::ZERO;
                 self.set_status("Stopped");
@@ -716,13 +723,27 @@ impl AppState {
                 position,
                 ..
             } => {
-                self.apply_event_position(timeline_revision, position);
-                self.set_status("Seeked");
+                if self
+                    .playback
+                    .seek_target
+                    .is_some_and(|target| target != position)
+                {
+                    self.playback.timeline_revision =
+                        self.playback.timeline_revision.max(timeline_revision);
+                } else {
+                    self.playback.seek_target = None;
+                    self.apply_event_position(timeline_revision, position);
+                    self.set_status("Seeked");
+                }
                 None
             }
-            AudioEvent::Finished { .. } => self.advance_after_finish(),
+            AudioEvent::Finished { .. } => {
+                self.playback.seek_target = None;
+                self.advance_after_finish()
+            }
             AudioEvent::Failed { message, .. } => {
                 self.set_playback_status(PlaybackStatus::Error);
+                self.playback.seek_target = None;
                 self.playback.format = None;
                 let message = terminal_safe(message.as_bytes(), self.status_text_max_bytes);
                 self.set_status(&format!("Playback error: {message}"));
@@ -946,6 +967,7 @@ impl AppState {
         }
         if self.playback_status == PlaybackStatus::Error {
             self.set_playback_status(PlaybackStatus::Stopped);
+            self.playback.seek_target = None;
             self.playback.format = None;
             self.set_status("Stopped");
             return None;
@@ -1031,6 +1053,7 @@ impl AppState {
                 .position(|candidate| *candidate == item.instance_id);
         }
         self.playback.timeline_revision = 0;
+        self.playback.seek_target = None;
         self.playback.format = None;
         self.playback.position = position;
         self.playback.duration = None;
@@ -1192,15 +1215,17 @@ impl AppState {
             return None;
         }
         let step = Duration::from_secs(5);
+        let current = self.playback.seek_target.unwrap_or(self.playback.position);
         let position = if forward {
-            self.playback.position.saturating_add(step)
+            current.saturating_add(step)
         } else {
-            self.playback.position.saturating_sub(step)
+            current.saturating_sub(step)
         };
         let position = self
             .playback
             .duration
             .map_or(position, |duration| position.min(duration));
+        self.playback.seek_target = Some(position);
         self.playback.position = position;
         self.set_status(if forward {
             "Seek forward 5 seconds"
@@ -2470,6 +2495,60 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn repeated_seeks_keep_the_latest_target_until_it_is_acknowledged() {
+        let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+        select_entry(&mut app, 0);
+        app.apply(AppAction::Activate)
+            .expect("idle Enter starts playback");
+        app.audio_event(AudioEvent::Started {
+            generation: 1,
+            timeline_revision: 1,
+            format: AudioFormat {
+                sample_rate: 48_000,
+                channels: 2,
+            },
+            duration: Some(Duration::from_secs(200)),
+            position: Duration::from_secs(10),
+        });
+
+        let mut final_intent = None;
+        for _ in 0..20 {
+            final_intent = app.apply(AppAction::SeekForward);
+        }
+        assert!(matches!(
+            final_intent,
+            Some(PlaybackIntent::Seek { position, .. })
+                if position == Duration::from_secs(110)
+        ));
+
+        app.audio_position(AudioPosition {
+            generation: 1,
+            timeline_revision: 1,
+            position: Duration::from_secs(12),
+            duration: Some(Duration::from_secs(200)),
+        });
+        app.audio_event(AudioEvent::Seeked {
+            generation: 1,
+            timeline_revision: 2,
+            position: Duration::from_secs(15),
+        });
+        assert_eq!(app.playback_position(), Duration::from_secs(110));
+
+        app.audio_event(AudioEvent::Seeked {
+            generation: 1,
+            timeline_revision: 3,
+            position: Duration::from_secs(110),
+        });
+        app.audio_position(AudioPosition {
+            generation: 1,
+            timeline_revision: 3,
+            position: Duration::from_secs(111),
+            duration: Some(Duration::from_secs(200)),
+        });
+        assert_eq!(app.playback_position(), Duration::from_secs(111));
     }
 
     #[test]

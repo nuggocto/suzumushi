@@ -118,6 +118,10 @@ query text; `Esc` closes search and `Ctrl+c` quits globally.
 The Player shows artist or album-artist metadata when present. Missing creator
 metadata is omitted rather than replaced with a placeholder.
 
+Left and Right seek in five-second steps. Repeated input retains the newest
+app-owned target until the worker acknowledges it; obsolete absolute targets
+are coalesced instead of queueing decoder restarts.
+
 ## Architecture
 
 - The terminal loop exclusively owns `AppState`, focus, library selection,
@@ -126,9 +130,10 @@ metadata is omitted rather than replaced with a placeholder.
 - The audio worker owns the decoder, output device, and current playback state.
   It never chooses the next queue item.
 - Workers use bounded messages, explicit cancellation, and awaited shutdown.
-- Reliable controls and state updates use a bounded lane. Position is a
-  capacity-one latest-value update, and timeline revisions prevent the two
-  lanes from applying playback positions out of order.
+- Reliable discrete controls and state updates use a bounded lane. Absolute
+  seek requests and playback positions each use independent capacity-one
+  latest-value lanes. Timeline revisions prevent feedback from an older seek
+  from replacing the newest app-owned target.
 - The real-time audio callback never allocates, blocks, logs, touches D-Bus,
   takes a lock, or sends on a blocking channel.
 - The session retains the selected root descriptor and filesystem identity.
@@ -259,6 +264,8 @@ against the local PipeWire-backed Linux output device.
   playback automatically.
 - [x] Add the original terminal-native Suzu animation with a deterministic
   resting frame and bounded playing loop.
+- [x] Coalesce repeated absolute seeks without blocking the terminal or losing
+  pause and resume during a decoder restart.
 
 Done when the terminal is a complete local player and position remains correct
 through pause, seek, next, previous, end of track, and a clean close/reopen
@@ -266,7 +273,9 @@ cycle.
 
 Verified with app-owned control, shuffle-history, repeat, generation, and
 cross-lane ordering tests; preroll-free accurate seeking through every verified
-container; deterministic fake-device gain, restart, position, and drain tests;
+container; repeated-seek coalescing and target-acknowledgement tests;
+deterministic fake-device gain, restart, pause-during-restart, position, and
+drain tests;
 bounded escaped-state, atomic replacement, heartbeat, and failure-cleanup tests;
 bounded resume-state parsing, stale-entry recovery, clear-state, and
 resume-position tests; deterministic playback-state animation tests; reviewed

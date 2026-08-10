@@ -68,8 +68,9 @@
   generations, and playback-generation allocation.
 - The audio worker owns playback and the device. It never chooses the next queue
   item.
-- Do not use `Arc<Mutex<AppState>>`. Use bounded reliable messages and a
-  capacity-one latest-position lane.
+- Do not use `Arc<Mutex<AppState>>`. Use bounded reliable messages for discrete
+  controls, plus independent capacity-one latest-seek and latest-position
+  lanes. Obsolete absolute seek targets never queue decoder restarts.
 - Every worker has one owner, bounded input/output, cancellation, and awaited
   shutdown.
 - The real-time audio callback never allocates, blocks, logs, performs D-Bus

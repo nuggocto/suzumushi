@@ -73,7 +73,7 @@ when the player reopens. Playback remains paused until you press `Space`.
 | `Space` | Play or pause |
 | `s` | Stop |
 | `n` or `p` | Play the next or previous track |
-| Left/Right | Seek backward or forward five seconds |
+| Left/Right | Seek backward or forward five seconds; hold to move quickly |
 | `-` or `+` | Lower or raise volume by five percent |
 | `m` | Mute |
 | `x` | Toggle shuffle |
@@ -83,6 +83,9 @@ when the player reopens. Playback remains paused until you press `Space`.
 
 Search checks metadata, filenames, and paths. Pressing `Enter` queues the
 selected result. If nothing is playing, it starts immediately.
+
+Held seek input keeps only the newest target, so releasing the arrow key resumes
+from the position shown instead of replaying obsolete intermediate seeks.
 
 ## Terminal colors
 

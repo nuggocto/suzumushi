@@ -130,6 +130,7 @@ pub enum AudioEvent {
 /// Owns the audio worker and awaits it on every shutdown path.
 pub struct AudioRuntime {
     commands: Option<SyncSender<AudioCommand>>,
+    seeks: Option<Arc<SeekLane>>,
     events: Option<Receiver<AudioEvent>>,
     positions: Option<Arc<PositionLane>>,
     worker: Option<JoinHandle<AppResult<()>>>,
@@ -144,33 +145,66 @@ impl AudioRuntime {
     pub fn start() -> AppResult<Self> {
         let (command_tx, command_rx) = sync_channel(COMMAND_CAPACITY);
         let (event_tx, event_rx) = sync_channel(EVENT_CAPACITY);
+        let seeks = Arc::new(SeekLane::default());
+        let worker_seeks = Arc::clone(&seeks);
         let positions = Arc::new(PositionLane::default());
         let worker_positions = Arc::clone(&positions);
         let worker = thread::Builder::new()
             .name("suzumushi-audio".into())
             .spawn(move || {
-                worker_main(&command_rx, &event_tx, &worker_positions, ProductionBackend)
+                let result = worker_main(
+                    &command_rx,
+                    &worker_seeks,
+                    &event_tx,
+                    &worker_positions,
+                    ProductionBackend,
+                );
+                worker_seeks.close();
+                result
             })
             .map_err(|error| AppError::Audio(format!("cannot start worker: {error}")))?;
         Ok(Self {
             commands: Some(command_tx),
+            seeks: Some(seeks),
             events: Some(event_rx),
             positions: Some(positions),
             worker: Some(worker),
         })
     }
 
-    /// Sends one reliable playback command.
+    /// Sends one playback command without queueing obsolete absolute seeks.
     ///
     /// # Errors
     ///
     /// Returns an audio error when the worker has stopped.
     pub fn send(&self, command: AudioCommand) -> AppResult<()> {
-        self.commands
+        let commands = self
+            .commands
             .as_ref()
-            .ok_or_else(|| AppError::Audio("worker is already stopped".into()))?
-            .send(command)
-            .map_err(|_| AppError::Audio("worker command lane disconnected".into()))
+            .ok_or_else(|| AppError::Audio("worker is already stopped".into()))?;
+        match command {
+            AudioCommand::Seek {
+                generation,
+                position,
+            } => {
+                let accepted = self
+                    .seeks
+                    .as_ref()
+                    .ok_or_else(|| AppError::Audio("worker seek lane is already closed".into()))?
+                    .replace(SeekRequest {
+                        generation,
+                        position,
+                    });
+                if accepted {
+                    Ok(())
+                } else {
+                    Err(AppError::Audio("worker seek lane disconnected".into()))
+                }
+            }
+            command => commands
+                .send(command)
+                .map_err(|_| AppError::Audio("worker command lane disconnected".into())),
+        }
     }
 
     /// Returns the next pending state change without blocking the terminal.
@@ -216,6 +250,9 @@ impl AudioRuntime {
     }
 
     fn stop(&mut self) -> AppResult<()> {
+        if let Some(seeks) = self.seeks.take() {
+            seeks.clear();
+        }
         if let Some(commands) = self.commands.take() {
             let _ = commands.try_send(AudioCommand::Shutdown);
             drop(commands);
@@ -234,6 +271,58 @@ impl AudioRuntime {
 #[derive(Default)]
 struct PositionLane {
     latest: Mutex<Option<AudioPosition>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SeekRequest {
+    generation: u64,
+    position: Duration,
+}
+
+#[derive(Default)]
+struct SeekLane {
+    state: Mutex<SeekLaneState>,
+}
+
+#[derive(Default)]
+struct SeekLaneState {
+    latest: Option<SeekRequest>,
+    closed: bool,
+}
+
+impl SeekLane {
+    fn replace(&self, request: SeekRequest) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.closed {
+            return false;
+        }
+        state.latest = Some(request);
+        true
+    }
+
+    fn take(&self) -> Option<SeekRequest> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .latest
+            .take()
+    }
+
+    fn clear(&self) {
+        let _ = self.take();
+    }
+
+    fn close(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.latest = None;
+        state.closed = true;
+    }
 }
 
 impl PositionLane {
@@ -444,10 +533,14 @@ impl<B: Backend> WorkerCore<B> {
         positions: &PositionLane,
     ) {
         if let Some(active) = self.matching_active(generation)
-            && active.started
             && !active.paused
         {
-            match active.output.pause() {
+            let result = if active.started {
+                active.output.pause()
+            } else {
+                Ok(())
+            };
+            match result {
                 Ok(()) => {
                     active.paused = true;
                     emit(events, AudioEvent::Paused { generation });
@@ -460,10 +553,14 @@ impl<B: Backend> WorkerCore<B> {
 
     fn resume(&mut self, generation: u64, events: &SyncSender<AudioEvent>) {
         if let Some(active) = self.matching_active(generation)
-            && active.started
             && active.paused
         {
-            match active.output.resume() {
+            let result = if active.started {
+                active.output.resume()
+            } else {
+                Ok(())
+            };
+            match result {
                 Ok(()) => {
                     active.paused = false;
                     emit(events, AudioEvent::Resumed { generation });
@@ -882,6 +979,7 @@ fn position_for(active: &ActivePlayback) -> Duration {
 
 fn worker_main<B: Backend>(
     commands: &Receiver<AudioCommand>,
+    seeks: &SeekLane,
     events: &SyncSender<AudioEvent>,
     positions: &PositionLane,
     backend: B,
@@ -903,6 +1001,10 @@ fn worker_main<B: Backend>(
                 return Ok(());
             }
             Err(TryRecvError::Empty) => {}
+        }
+        if let Some(request) = seeks.take() {
+            core.seek(request.generation, request.position, events, positions);
+            continue;
         }
         if core.drive(events, positions) {
             continue;
@@ -934,12 +1036,14 @@ mod tests {
     use std::collections::VecDeque;
     use std::fs::File;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::mpsc::TryRecvError;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use super::{
-        AudioCommand, AudioEvent, AudioFormat, AudioPosition, Backend, DecoderPoll, DecoderStream,
-        OutputStream, PlaybackParts, PlaybackSettings, PositionLane, WorkerCore, sync_channel,
+        AudioCommand, AudioEvent, AudioFormat, AudioPosition, AudioRuntime, Backend, DecoderPoll,
+        DecoderStream, OutputStream, PlaybackParts, PlaybackSettings, PositionLane, SeekLane,
+        SeekRequest, WorkerCore, sync_channel,
     };
 
     #[derive(Default)]
@@ -1137,6 +1241,52 @@ mod tests {
     }
 
     #[test]
+    fn repeated_seeks_bypass_the_reliable_command_backlog() {
+        let (command_tx, commands) = sync_channel(2);
+        let seeks = Arc::new(SeekLane::default());
+        let runtime = AudioRuntime {
+            commands: Some(command_tx),
+            seeks: Some(Arc::clone(&seeks)),
+            events: None,
+            positions: None,
+            worker: None,
+        };
+
+        runtime
+            .send(AudioCommand::Seek {
+                generation: 4,
+                position: Duration::from_secs(15),
+            })
+            .expect("first seek target");
+        runtime
+            .send(AudioCommand::Seek {
+                generation: 4,
+                position: Duration::from_secs(110),
+            })
+            .expect("latest seek target");
+
+        assert!(matches!(commands.try_recv(), Err(TryRecvError::Empty)));
+        assert_eq!(
+            seeks.take(),
+            Some(SeekRequest {
+                generation: 4,
+                position: Duration::from_secs(110),
+            })
+        );
+        assert_eq!(seeks.take(), None);
+
+        seeks.close();
+        assert!(
+            runtime
+                .send(AudioCommand::Seek {
+                    generation: 4,
+                    position: Duration::from_secs(115),
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
     fn initial_play_opens_the_decoder_at_the_requested_resume_position() {
         let format = AudioFormat {
             sample_rate: 48_000,
@@ -1324,6 +1474,84 @@ mod tests {
         assert_eq!(
             fixture.gains.lock().expect("gain log").last(),
             Some(&(65, true))
+        );
+    }
+
+    #[test]
+    fn pause_and_resume_survive_a_seek_decoder_restart() {
+        let format = AudioFormat {
+            sample_rate: 48_000,
+            channels: 1,
+        };
+        let first = VecDeque::from([
+            DecoderPoll::Ready(decoded(format)),
+            DecoderPoll::Samples(vec![0.1; 512]),
+        ]);
+        let (mut backend, fixture) = fixture_backend(first);
+        backend.scripts.push_back(VecDeque::from([
+            DecoderPoll::Ready(decoded_at(format, Duration::from_millis(750))),
+            DecoderPoll::Samples(vec![0.1; 512]),
+        ]));
+        let mut core = WorkerCore::new(backend);
+        let (events, received) = sync_channel(16);
+        let positions = PositionLane::default();
+        core.command(
+            AudioCommand::Play {
+                generation: 11,
+                file: harmless_file(),
+                position: Duration::ZERO,
+                settings: PlaybackSettings::default(),
+            },
+            &events,
+            &positions,
+        )
+        .expect("start fake playback");
+        drive_steps(&mut core, &events, &positions, 6);
+        assert!(matches!(
+            received.try_recv(),
+            Ok(AudioEvent::Started { generation: 11, .. })
+        ));
+
+        core.command(
+            AudioCommand::Seek {
+                generation: 11,
+                position: Duration::from_millis(750),
+            },
+            &events,
+            &positions,
+        )
+        .expect("restart at seek target");
+        core.command(AudioCommand::Pause { generation: 11 }, &events, &positions)
+            .expect("pause during restart");
+        assert_eq!(
+            received.try_recv().expect("paused event"),
+            AudioEvent::Paused { generation: 11 }
+        );
+        drive_steps(&mut core, &events, &positions, 6);
+        assert!(matches!(
+            received.try_recv(),
+            Ok(AudioEvent::Seeked {
+                generation: 11,
+                position,
+                ..
+            }) if position == Duration::from_millis(750)
+        ));
+        assert_eq!(
+            fixture.calls.lock().expect("fake output calls").as_slice(),
+            ["prepare", "write", "play", "stop", "prepare", "write"]
+        );
+
+        core.command(AudioCommand::Resume { generation: 11 }, &events, &positions)
+            .expect("resume after restart");
+        assert_eq!(
+            received.try_recv().expect("resumed event"),
+            AudioEvent::Resumed { generation: 11 }
+        );
+        assert_eq!(
+            fixture.calls.lock().expect("fake output calls").as_slice(),
+            [
+                "prepare", "write", "play", "stop", "prepare", "write", "resume"
+            ]
         );
     }
 
