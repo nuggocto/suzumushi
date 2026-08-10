@@ -55,6 +55,24 @@ run = [
   "cargo +nightly-2026-07-01 fuzz run audio_decoder -- -max_total_time=60 -timeout=2 -rss_limit_mb=768 -max_len=1048576 -verbosity=0",
 ]
 
+[tasks.local-install-qa]
+description = "Install the current checkout and exercise its public local workflow"
+run = '''
+set -eu
+qa_dir=$(mktemp -d "${TMPDIR:-/tmp}/suzumushi-install-qa.XXXXXX")
+cleanup() {
+  rm -rf -- "${qa_dir:?}"
+}
+trap cleanup EXIT HUP INT TERM
+
+cargo install --path . --locked --root "$qa_dir/prefix"
+binary="$qa_dir/prefix/bin/suzumushi"
+"$binary" --version | grep -E '^suzumushi [0-9]+\.[0-9]+\.[0-9]+$'
+"$binary" init "$qa_dir/root" | grep -F 'then run `suzumushi --root <ROOT>`'
+cp tests/fixtures/audio/tone.mp3 "$qa_dir/root/audio/library/tone.mp3"
+"$binary" --root "$qa_dir/root" diagnose | grep -F 'tracks: 1'
+'''
+
 [tasks.ci]
 description = "Run the complete project verification"
 run = [

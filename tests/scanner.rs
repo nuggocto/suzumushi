@@ -218,11 +218,10 @@ fn one_pass_finds_context_metadata_and_symlinks() {
             .any(|entry| matches!(entry.source, TrackEntrySource::PlaylistSymlink { .. }))
     );
     assert!(index.entries.iter().all(|entry| {
-        entry
-            .search
-            .metadata
-            .iter()
-            .any(|field| field == "Calm Artist")
+        index
+            .asset_for_entry(entry)
+            .and_then(|asset| asset.tags.artist.as_deref())
+            == Some("Calm Artist")
     }));
     assert!(
         index
@@ -499,11 +498,7 @@ fn retargeted_symlink_uses_only_the_verified_open_descriptor() {
         .iter()
         .find(|entry| entry.display_path == Path::new("playlists/links/song.mp3"))
         .expect("symlink entry");
-    let asset = index
-        .assets
-        .iter()
-        .find(|asset| asset.id == entry.asset_id)
-        .expect("symlink asset");
+    let asset = index.asset_for_entry(entry).expect("symlink asset");
     assert_eq!(asset.canonical_path, replacement);
 }
 

@@ -450,13 +450,12 @@ mod tests {
             }],
             entries: vec![TrackEntry {
                 id: TrackEntryId(1),
-                asset_id: MediaAssetId(1),
+                asset_index: 0,
                 display_path: PathBuf::from("library/fixture.wav"),
                 source: TrackEntrySource::LibraryFile {
                     relative_path: PathBuf::from("library/fixture.wav"),
                 },
                 search: SearchFields {
-                    metadata: Vec::new(),
                     filename: "fixture".into(),
                     relative_path: "library/fixture.wav".into(),
                 },

@@ -52,6 +52,21 @@ fn help_succeeds_and_names_the_canonical_command() {
 }
 
 #[test]
+fn version_succeeds_without_selecting_a_root() {
+    let output = Command::new(env!("CARGO_BIN_EXE_suzumushi"))
+        .arg("--version")
+        .output()
+        .expect("the installed command should report its version");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("version output is UTF-8"),
+        format!("suzumushi {}\n", env!("CARGO_PKG_VERSION"))
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn internal_audio_helper_decodes_only_its_inherited_descriptor() {
     let fixture = File::open("tests/fixtures/audio/tone.flac").expect("open audio fixture");
     let output = Command::new(env!("CARGO_BIN_EXE_suzumushi"))
@@ -109,6 +124,11 @@ fn terminal_session_restores_the_pty_and_holds_both_leases() {
         .spawn()
         .expect("start terminal session");
     let mut transcript = read_pty_until(&mut master, &mut child, b"Library");
+
+    master.write_all(b"?").expect("open terminal help");
+    transcript.extend(read_pty_until(&mut master, &mut child, b"Navigation"));
+    master.write_all(b"\x1b").expect("close terminal help");
+    transcript.extend(read_pty_until(&mut master, &mut child, b"Library"));
 
     master.write_all(b"\t").expect("send focus key");
     transcript.extend(read_pty_until(&mut master, &mut child, FOCUSED_PLAYER));
@@ -509,6 +529,12 @@ fn init_and_diagnose_work_through_the_real_executable() {
         init.status.success(),
         "{}",
         String::from_utf8_lossy(&init.stderr)
+    );
+    let init_stdout = String::from_utf8(init.stdout).expect("init output is UTF-8");
+    assert!(init_stdout.contains("add audio below"), "{init_stdout}");
+    assert!(
+        init_stdout.contains("suzumushi --root <ROOT>"),
+        "{init_stdout}"
     );
     let root_lock = root.join(".suzumushi-root.lock");
     let lock_identity = fs::read(&root_lock).expect("initialization leaves the owned root lock");

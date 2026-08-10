@@ -15,11 +15,9 @@ use crate::audio::{AudioEvent, AudioFormat, AudioPosition, PlaybackSettings};
 use crate::config::{Config, UI_STATE_SCRATCH_BYTES};
 use crate::display::{bounded_text, terminal_safe};
 use crate::errors::{AppError, AppResult};
-use crate::input::{AppAction, InputState};
+use crate::input::AppAction;
 use crate::locks::{ActiveTuiLease, RootWriterLease};
-use crate::model::{
-    MediaAssetId, PlaylistId, ScanIndex, TrackEntry, TrackEntryId, TrackEntrySource,
-};
+use crate::model::{PlaylistId, ScanIndex, TrackEntry, TrackEntryId, TrackEntrySource};
 use crate::paths::SelectedRoot;
 
 const TUI_STARTUP_OPEN_FILES_PEAK: usize = 6;
@@ -53,6 +51,19 @@ impl Focus {
 pub enum ColorMode {
     Terminal,
     Mono,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StatusKind {
+    Info,
+    Warning,
+    Error,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Overlay {
+    None,
+    Help,
 }
 
 impl ColorMode {
@@ -207,10 +218,11 @@ pub(crate) struct SessionIdentity {
 pub struct AppState {
     pub focus: Focus,
     pub should_quit: bool,
+    overlay: Overlay,
     pub terminal_size: (u16, u16),
     pub color_mode: ColorMode,
     pub status_message: String,
-    pub input: InputState,
+    pub(crate) status_kind: StatusKind,
     pub index: ScanIndex,
     pub(crate) browser_rows: Vec<BrowserRow>,
     pub(crate) library_selection: usize,
@@ -293,27 +305,34 @@ impl AppState {
         let (queue, shuffle_order) = allocate_queue(config)?;
         let shuffle_seed = random_seed();
 
-        let status_message = if index.complete {
-            format!(
-                "Ready: {} tracks, {} playlists",
-                index.entries.len(),
-                index.playlists.len()
+        let (status_message, status_kind) = if index.complete {
+            (
+                format!(
+                    "Ready: {} tracks, {} playlists",
+                    index.entries.len(),
+                    index.playlists.len()
+                ),
+                StatusKind::Info,
             )
         } else {
-            format!(
-                "Partial scan: {} tracks, {} warnings",
-                index.entries.len(),
-                index.warnings.len()
+            (
+                format!(
+                    "Scan incomplete: {} tracks, {} warnings; run diagnose for details",
+                    index.entries.len(),
+                    index.warnings.len()
+                ),
+                StatusKind::Warning,
             )
         };
 
         Ok(Self {
             focus,
             should_quit: false,
+            overlay: Overlay::None,
             terminal_size: (0, 0),
             color_mode,
             status_message,
-            input: InputState::new(Duration::from_millis(config.input.leader_timeout_ms)),
+            status_kind,
             index,
             browser_rows,
             library_selection,
@@ -340,14 +359,25 @@ impl AppState {
     }
 
     /// Resolves a key against the active search mode or normal key map.
-    pub(crate) fn key(&mut self, key: KeyEvent, now: Duration) -> Option<PlaybackIntent> {
+    pub(crate) fn key(&mut self, key: KeyEvent, _now: Duration) -> Option<PlaybackIntent> {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.should_quit = true;
             return None;
         }
+        if self.overlay == Overlay::Help {
+            match key.code {
+                KeyCode::Char('q') if key.modifiers.is_empty() => self.should_quit = true,
+                KeyCode::Esc | KeyCode::Char('?') => {
+                    self.overlay = Overlay::None;
+                    self.set_status("Help closed");
+                }
+                _ => {}
+            }
+            return None;
+        }
         if self.search.active {
             self.search_key(key)
-        } else if let Some(action) = self.input.key(key, now) {
+        } else if let Some(action) = crate::input::resolve(key) {
             self.apply(action)
         } else {
             None
@@ -366,6 +396,18 @@ impl AppState {
             AppAction::MoveLast => self.move_to_edge(true),
             AppAction::Activate => return self.activate(),
             AppAction::SearchOpen => self.open_search(),
+            AppAction::ToggleHelp => {
+                self.overlay = if self.overlay == Overlay::Help {
+                    Overlay::None
+                } else {
+                    Overlay::Help
+                };
+                self.set_status(if self.overlay == Overlay::Help {
+                    "Help opened; press ? or Esc to close"
+                } else {
+                    "Help closed"
+                });
+            }
             AppAction::QueueRemove => self.remove_queue_item(),
             AppAction::QueueClear => self.clear_queue(),
             AppAction::QueueMoveUp => self.move_queue_item(false),
@@ -398,9 +440,6 @@ impl AppState {
             AppAction::RepeatOff => self.set_repeat(RepeatMode::Off),
             AppAction::RepeatAll => self.set_repeat(RepeatMode::All),
             AppAction::RepeatOne => self.set_repeat(RepeatMode::One),
-            AppAction::PalettePlaceholder => {
-                self.set_status("The command palette is not available yet");
-            }
         }
         None
     }
@@ -436,6 +475,11 @@ impl AppState {
     }
 
     #[must_use]
+    pub(crate) fn help_visible(&self) -> bool {
+        self.overlay == Overlay::Help
+    }
+
+    #[must_use]
     pub(crate) fn entry_title(&self, entry_index: usize) -> String {
         self.entry_title_bounded(entry_index, self.status_text_max_bytes)
     }
@@ -445,7 +489,8 @@ impl AppState {
         let Some(entry) = self.entry(entry_index) else {
             return "Missing track".into();
         };
-        self.asset(entry.asset_id)
+        self.index
+            .asset_for_entry(entry)
             .and_then(|asset| asset.tags.title.as_deref())
             .map_or_else(
                 || bounded_text(&entry.search.filename, max_bytes),
@@ -670,7 +715,7 @@ impl AppState {
         }
 
         if self.queue.is_empty() {
-            self.set_status("Saved session has no tracks in the current library");
+            self.set_warning("Saved session has no tracks in the current library");
             return Ok(());
         }
 
@@ -699,7 +744,7 @@ impl AppState {
             self.set_status("Session restored; Space resumes");
         } else {
             let track_label = if missing == 1 { "track" } else { "tracks" };
-            self.set_status(&format!(
+            self.set_warning(&format!(
                 "Session restored; {missing} missing {track_label} skipped; Space resumes"
             ));
         }
@@ -708,12 +753,12 @@ impl AppState {
 
     pub(crate) fn session_ignored(&mut self, reason: &str) {
         let reason = terminal_safe(reason.as_bytes(), self.status_text_max_bytes);
-        self.set_status(&format!("Saved session ignored: {reason}"));
+        self.set_warning(&format!("Saved session ignored: {reason}"));
     }
 
     pub(crate) fn desktop_controls_unavailable(&mut self, reason: &str) {
         let reason = terminal_safe(reason.as_bytes(), self.status_text_max_bytes);
-        self.set_status(&format!("Desktop controls unavailable: {reason}"));
+        self.set_warning(&format!("Desktop controls unavailable: {reason}"));
     }
 
     pub(crate) fn audio_event(&mut self, event: AudioEvent) -> Option<PlaybackIntent> {
@@ -801,7 +846,7 @@ impl AppState {
                 self.playback.seek_target = None;
                 self.playback.format = None;
                 let message = terminal_safe(message.as_bytes(), self.status_text_max_bytes);
-                self.set_status(&format!("Playback error: {message}"));
+                self.set_error(&format!("Playback failed: {message}"));
                 None
             }
         }
@@ -818,15 +863,7 @@ impl AppState {
         if entry.id != item.entry_id {
             return None;
         }
-        Some((entry, self.asset(entry.asset_id)?))
-    }
-
-    fn asset(&self, id: MediaAssetId) -> Option<&crate::model::MediaAsset> {
-        self.index
-            .assets
-            .binary_search_by_key(&id, |asset| asset.id)
-            .ok()
-            .map(|asset_index| &self.index.assets[asset_index])
+        Some((entry, self.index.asset_for_entry(entry)?))
     }
 
     fn search_key(&mut self, key: KeyEvent) -> Option<PlaybackIntent> {
@@ -855,7 +892,7 @@ impl AppState {
             {
                 let next_bytes = self.search.query.len().saturating_add(character.len_utf8());
                 if next_bytes > self.search.max_query_bytes {
-                    self.set_status("Search query limit reached");
+                    self.set_warning("Search query limit reached");
                 } else {
                     self.search.query.push(character);
                     self.rebuild_search();
@@ -913,7 +950,8 @@ impl AppState {
         let needle = query.as_bytes();
         rebuild_ascii_case_prefix(needle, prefix_table);
         for (entry_index, entry) in self.index.entries.iter().enumerate() {
-            if entry_matches(entry, needle, prefix_table) {
+            let tags = self.index.asset_for_entry(entry).map(|asset| &asset.tags);
+            if entry_matches(entry, tags, needle, prefix_table) {
                 results.push(entry_index);
                 if results.len() == *max_results {
                     break;
@@ -1138,7 +1176,7 @@ impl AppState {
     ) -> Option<PlaybackIntent> {
         let item = self.queue.get(index).copied()?;
         let Some(generation) = self.playback_generation.checked_add(1) else {
-            self.set_status("Playback generation exhausted");
+            self.set_error("Playback generation exhausted");
             return None;
         };
         self.playback_generation = generation;
@@ -1174,7 +1212,7 @@ impl AppState {
         };
         if self.playback.current != Some(item) {
             let Some(generation) = self.playback_generation.checked_add(1) else {
-                self.set_status("Playback generation exhausted");
+                self.set_error("Playback generation exhausted");
                 return;
             };
             self.playback_generation = generation;
@@ -1216,6 +1254,13 @@ impl AppState {
 
     fn current_queue_index(&self) -> Option<usize> {
         let current = self.playback.current?;
+        if self
+            .queue
+            .get(self.playback.position_hint)
+            .is_some_and(|item| item.instance_id == current.instance_id)
+        {
+            return Some(self.playback.position_hint);
+        }
         self.queue
             .iter()
             .position(|item| item.instance_id == current.instance_id)
@@ -1551,7 +1596,7 @@ impl AppState {
 
     fn queue_entry(&mut self, entry_index: usize) -> Option<PlaybackIntent> {
         let Some(entry_id) = self.index.entries.get(entry_index).map(|entry| entry.id) else {
-            self.set_status("The selected track is no longer available");
+            self.set_warning("The selected track is no longer available");
             return None;
         };
         if !self.can_append_queue(1) {
@@ -1589,7 +1634,7 @@ impl AppState {
             .get(playlist_index)
             .map(|playlist| playlist.name.clone())
         else {
-            self.set_status("The selected playlist is no longer available");
+            self.set_warning("The selected playlist is no longer available");
             return None;
         };
         let start = browser_position
@@ -1614,7 +1659,7 @@ impl AppState {
                     if self.index.entries.get(*entry_index).is_none()
             )
         }) {
-            self.set_status("The playlist contains a stale track");
+            self.set_warning("The playlist contains a stale track");
             return None;
         }
         if !self.can_append_queue(track_count) {
@@ -1705,7 +1750,7 @@ impl AppState {
 
     fn can_advance_queue_generation(&mut self) -> bool {
         if self.queue_generation == u64::MAX {
-            self.set_status("Queue generation exhausted");
+            self.set_error("Queue generation exhausted");
             false
         } else {
             true
@@ -1723,13 +1768,26 @@ impl AppState {
             || next_bytes.is_none_or(|bytes| bytes > self.queue_max_bytes)
             || !queue_ids_fit
         {
-            self.set_status("Queue limit reached");
+            self.set_warning("Queue limit reached");
             return false;
         }
         self.can_advance_queue_generation()
     }
 
     fn set_status(&mut self, message: &str) {
+        self.set_status_kind(StatusKind::Info, message);
+    }
+
+    fn set_warning(&mut self, message: &str) {
+        self.set_status_kind(StatusKind::Warning, message);
+    }
+
+    fn set_error(&mut self, message: &str) {
+        self.set_status_kind(StatusKind::Error, message);
+    }
+
+    fn set_status_kind(&mut self, kind: StatusKind, message: &str) {
+        self.status_kind = kind;
         self.status_message.clear();
         for character in message.chars() {
             if self
@@ -1824,7 +1882,12 @@ fn search_reservation_bytes(config: &Config) -> AppResult<usize> {
         .ok_or_else(|| AppError::Resource("search reservation overflow".into()))
 }
 
-fn entry_matches(entry: &TrackEntry, needle: &[u8], prefix_table: &[usize]) -> bool {
+fn entry_matches(
+    entry: &TrackEntry,
+    tags: Option<&crate::model::TrackTags>,
+    needle: &[u8],
+    prefix_table: &[usize],
+) -> bool {
     contains_ascii_case_insensitive(entry.search.filename.as_bytes(), needle, prefix_table).found
         || contains_ascii_case_insensitive(
             entry.search.relative_path.as_bytes(),
@@ -1832,8 +1895,13 @@ fn entry_matches(entry: &TrackEntry, needle: &[u8], prefix_table: &[usize]) -> b
             prefix_table,
         )
         .found
-        || entry.search.metadata.iter().any(|field| {
-            contains_ascii_case_insensitive(field.as_bytes(), needle, prefix_table).found
+        || tags.is_some_and(|tags| {
+            [&tags.artist, &tags.album_artist, &tags.album, &tags.title]
+                .into_iter()
+                .flatten()
+                .any(|field| {
+                    contains_ascii_case_insensitive(field.as_bytes(), needle, prefix_table).found
+                })
         })
 }
 
@@ -2106,7 +2174,8 @@ mod tests {
 
     use super::{
         AppState, BrowserRow, ColorMode, Focus, PlaybackIntent, PlaybackStatus, RepeatMode,
-        contains_ascii_case_insensitive, rebuild_ascii_case_prefix, reserve_startup_open_files,
+        StatusKind, contains_ascii_case_insensitive, rebuild_ascii_case_prefix,
+        reserve_startup_open_files,
     };
     use crate::audio::{AudioEvent, AudioFormat, AudioPosition};
     use crate::config::Config;
@@ -2190,13 +2259,12 @@ mod tests {
     }
 
     fn fixture_entries(playlist_id: PlaylistId) -> Vec<TrackEntry> {
-        let entry = |id, asset_id, path: &str, source, metadata: Vec<String>| TrackEntry {
+        let entry = |id, asset_index, path: &str, source| TrackEntry {
             id: TrackEntryId(id),
-            asset_id: MediaAssetId(asset_id),
+            asset_index,
             display_path: PathBuf::from(path),
             source,
             search: SearchFields {
-                metadata,
                 filename: PathBuf::from(path)
                     .file_stem()
                     .expect("fixture filename")
@@ -2209,47 +2277,35 @@ mod tests {
         vec![
             entry(
                 10,
-                1,
+                0,
                 "library/JDR/Campaign One/night.mp3",
                 TrackEntrySource::LibraryFile {
                     relative_path: PathBuf::from("library/JDR/Campaign One/night.mp3"),
                 },
-                vec![
-                    "Calm Artist".into(),
-                    "Campaign One".into(),
-                    "Night Song".into(),
-                ],
             ),
             entry(
                 20,
-                2,
+                1,
                 "library/Music/quiet.flac",
                 TrackEntrySource::LibraryFile {
                     relative_path: PathBuf::from("library/Music/quiet.flac"),
                 },
-                vec![
-                    "Still Artist".into(),
-                    "Quiet Album".into(),
-                    "Quiet Song".into(),
-                ],
             ),
             entry(
                 40,
-                1,
+                0,
                 "playlists/Favorites/night.mp3",
                 TrackEntrySource::PlaylistCopy {
                     playlist: playlist_id,
                 },
-                vec!["Calm Artist".into(), "Night Song".into()],
             ),
             entry(
                 50,
-                2,
+                1,
                 "playlists/Favorites/quiet.flac",
                 TrackEntrySource::PlaylistCopy {
                     playlist: playlist_id,
                 },
-                vec!["Still Artist".into(), "Quiet Song".into()],
             ),
         ]
     }
@@ -2290,6 +2346,24 @@ mod tests {
         assert_eq!(app.focus, Focus::Player);
         app.apply(AppAction::FocusPrevious);
         assert_eq!(app.focus, Focus::Library);
+    }
+
+    #[test]
+    fn help_is_modal_and_closes_without_triggering_hidden_actions() {
+        let mut app = AppState::new(&Config::default(), empty_index()).expect("app state");
+
+        app.apply(AppAction::ToggleHelp);
+        assert!(app.help_visible());
+        app.key(key(KeyCode::Char('x')), Duration::ZERO);
+        assert!(
+            !app.shuffle,
+            "hidden controls stay inactive while help is open"
+        );
+
+        app.key(key(KeyCode::Esc), Duration::ZERO);
+        assert!(!app.help_visible());
+        assert_eq!(app.status_kind, StatusKind::Info);
+        assert_eq!(app.status_message, "Help closed");
     }
 
     #[test]
@@ -2394,7 +2468,14 @@ mod tests {
         for entry in &mut index.entries {
             entry.search.filename = "unrelated-file".into();
             entry.search.relative_path = "unrelated/path".into();
-            entry.search.metadata = vec!["unrelated metadata".into()];
+        }
+        for asset in &mut index.assets {
+            asset.tags = TrackTags {
+                artist: Some("unrelated metadata".into()),
+                album_artist: None,
+                album: None,
+                title: None,
+            };
         }
         index.entries[0].search.filename = "filename-only-token".into();
         index.entries[1].search.relative_path = "folder/path-only-token.flac".into();

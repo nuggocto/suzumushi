@@ -38,9 +38,6 @@ pub const DEFAULT_CONFIG: &str = r#"config_version = 1
 theme = "terminal"
 default_view = "library"
 
-[input]
-leader_timeout_ms = 250
-
 [scan]
 max_files = 50000
 max_entries = 100000
@@ -82,17 +79,13 @@ queue_max_bytes = 8388608
 queue_full_policy = "drop_and_count"
 "#;
 
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug)]
 pub struct Config {
     pub config_version: u32,
     pub theme: String,
     pub default_view: String,
-    pub input: InputConfig,
     pub scan: ScanConfig,
-    #[serde(default)]
     pub search: SearchConfig,
-    #[serde(default)]
     pub queue: QueueConfig,
     pub runtime: RuntimeConfig,
     pub logging: LoggingConfig,
@@ -106,9 +99,6 @@ macro_rules! section {
     };
 }
 
-section!(InputConfig {
-    leader_timeout_ms: u64
-});
 section!(SearchConfig {
     max_results: usize,
     max_query_bytes: usize
@@ -150,6 +140,29 @@ section!(LoggingConfig {
     queue_full_policy: String
 });
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ParsedConfig {
+    config_version: u32,
+    theme: String,
+    default_view: String,
+    #[serde(default)]
+    input: Option<RetiredInputConfig>,
+    scan: ScanConfig,
+    #[serde(default)]
+    search: SearchConfig,
+    #[serde(default)]
+    queue: QueueConfig,
+    runtime: RuntimeConfig,
+    logging: LoggingConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetiredInputConfig {
+    leader_timeout_ms: u64,
+}
+
 impl Default for SearchConfig {
     fn default() -> Self {
         Self {
@@ -188,9 +201,27 @@ pub fn parse(input: &[u8]) -> AppResult<Config> {
         remove_released_prototype_fields(&mut document);
         document.insert("config_version".into(), toml::Value::Integer(1));
     }
-    let config: Config = toml::Value::Table(document)
+    let parsed: ParsedConfig = toml::Value::Table(document)
         .try_into()
         .map_err(|error| AppError::InvalidConfig(error.to_string()))?;
+    if let Some(input) = parsed.input {
+        inclusive(
+            "input.leader_timeout_ms",
+            input.leader_timeout_ms,
+            50,
+            2_000,
+        )?;
+    }
+    let config = Config {
+        config_version: parsed.config_version,
+        theme: parsed.theme,
+        default_view: parsed.default_view,
+        scan: parsed.scan,
+        search: parsed.search,
+        queue: parsed.queue,
+        runtime: parsed.runtime,
+        logging: parsed.logging,
+    };
     config.validate()?;
     Ok(config)
 }
@@ -467,12 +498,6 @@ impl Config {
         }
         one_of("theme", &self.theme, &["terminal", "mono"])?;
         one_of("default_view", &self.default_view, &["library", "queue"])?;
-        inclusive(
-            "input.leader_timeout_ms",
-            self.input.leader_timeout_ms,
-            50,
-            2_000,
-        )?;
         validate_scan(&self.scan)?;
         validate_search(&self.search)?;
         validate_queue(&self.queue)?;
@@ -576,6 +601,18 @@ mod tests {
         assert_eq!(config.search.max_query_bytes, 4_096);
         assert_eq!(config.queue.max_items, 10_000);
         assert_eq!(config.queue.max_bytes, 1_048_576);
+    }
+
+    #[test]
+    fn released_leader_setting_is_accepted_only_in_its_known_shape() {
+        let released = format!("{DEFAULT_CONFIG}\n[input]\nleader_timeout_ms = 250\n");
+        parse(released.as_bytes()).expect("released input setting remains readable");
+
+        let unknown = format!("{DEFAULT_CONFIG}\n[input]\nleader_timeout_ms = 250\nchord = true\n");
+        assert!(
+            parse(unknown.as_bytes()).is_err(),
+            "retired compatibility must not weaken strict configuration parsing"
+        );
     }
 
     #[test]

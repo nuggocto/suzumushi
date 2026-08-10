@@ -17,7 +17,7 @@ pub enum AppEvent {
     Tick(Duration),
 }
 
-/// Owns the monotonic origin used by leader-key deadlines.
+/// Owns the monotonic origin used by input and animation events.
 pub struct EventSource {
     started: Instant,
 }
@@ -30,17 +30,13 @@ impl EventSource {
         }
     }
 
-    /// Waits only until the next periodic tick or pending leader deadline.
+    /// Waits only until the next periodic redraw tick.
     ///
     /// # Errors
     ///
     /// Returns an error when the terminal event stream cannot be polled or read.
-    pub fn next(&self, leader_deadline: Option<Duration>) -> AppResult<AppEvent> {
-        let now = self.elapsed();
-        let deadline_wait =
-            leader_deadline.map_or(MAX_POLL, |deadline| deadline.saturating_sub(now));
-        let wait = MAX_POLL.min(deadline_wait);
-        if !event::poll(wait)
+    pub fn next(&self) -> AppResult<AppEvent> {
+        if !event::poll(MAX_POLL)
             .map_err(|error| AppError::io("poll terminal input", "terminal", error))?
         {
             return Ok(AppEvent::Tick(self.elapsed()));

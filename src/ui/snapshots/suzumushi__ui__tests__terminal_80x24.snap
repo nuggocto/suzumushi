@@ -3,10 +3,10 @@ source: src/ui/mod.rs
 expression: "snapshot(80, 24)"
 ---
 ╔═════Library══════╗┌────────────────Player────────────────┐┌──────Queue───────┐
-║Library/          ║│                                      ││Queue is empty    │
-║Playlists/        ║│                                      ││                  │
-║                  ║│            Nothing playing           ││                  │
-║                  ║│                                      ││                  │
+║Library is empty  ║│                                      ││Queue is empty    │
+║Add audio below   ║│                                      ││Select a track and│
+║audio/library/.   ║│            Nothing playing           ││press Enter.      │
+║Press ? for help. ║│                                      ││                  │
 ║                  ║│                  ╲       ╱           ││                  │
 ║                  ║│                    ╲ ▄▄▄ ╱           ││                  │
 ║                  ║│                    ▐▀• •▀▌           ││                  │
@@ -24,5 +24,5 @@ expression: "snapshot(80, 24)"
 ║                  ║│                                      ││                  │
 ║                  ║│                                      ││                  │
 ╚══════════════════╝└──────────────────────────────────────┘└──────────────────┘
- q quit  Tab focus   / search  Up/Down move  Enter add/play  Ready: 0 tracks, 0
- Space play/pause  s stop  n next  p previous  x shuffle  r repeat
+ Tab focus / search Up or Down move Enter add/play  Ready: 0 tracks, 0 playlists
+ q quit ? help Space play or pause s stop n next p previous x shuffle r repeat

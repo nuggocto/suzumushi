@@ -126,13 +126,12 @@ mod tests {
         (
             TrackEntry {
                 id: TrackEntryId(1),
-                asset_id: MediaAssetId(2),
+                asset_index: 0,
                 display_path: PathBuf::from(relative),
                 source: TrackEntrySource::LibraryFile {
                     relative_path: PathBuf::from(relative),
                 },
                 search: SearchFields {
-                    metadata: Vec::new(),
                     filename: "tone".into(),
                     relative_path: relative.into(),
                 },

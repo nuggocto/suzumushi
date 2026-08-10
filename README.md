@@ -62,22 +62,23 @@ when the player reopens. Playback remains paused until you press `Space`.
 | Key | Action |
 | --- | --- |
 | `Tab` or `Shift+Tab` | Move between Library, Player, and Queue |
-| Up/Down or `j`/`k` | Move the selection |
-| `Home`/`End` or `g`/`G` | Jump to the first or last item |
+| Up or Down, or `j` or `k` | Move the selection |
+| `Home` or `End`, or `g` or `G` | Jump to the first or last item |
 | `Enter` | Add the selected Library item to the Queue and start it when idle |
 | `/` | Search artist, title, filename, and relative path |
 | `Esc` | Close search |
-| `J`/`K` | In Queue, move the selected item down or up |
+| `J` or `K` | In Queue, move the selected item down or up |
 | `d` or `Delete` | In Queue, remove the selected item |
 | `c` | In Queue, clear every item |
 | `Space` | Play or pause |
 | `s` | Stop |
 | `n` or `p` | Play the next or previous track |
-| Left/Right | Seek backward or forward five seconds; hold to move quickly |
+| Left or Right | Seek backward or forward five seconds; hold to move quickly |
 | `-` or `+` | Lower or raise volume by five percent |
 | `m` | Mute |
 | `x` | Toggle shuffle |
 | `r` | Cycle repeat off, queue, and one |
+| `?` | Open or close the built-in key guide |
 | `q` | Quit outside search |
 | `Ctrl+c` | Quit from anywhere |
 
@@ -124,9 +125,9 @@ automatic resampling are not current support claims.
 
 ## Status
 
-Version `0.3.0` is the released complete local library and player. The current
-checkout also includes MPRIS and global media keys. The remaining work is
-terminal polish with local installation, then the verified Linux release and
+Version `0.4.0` is the released complete local player with MPRIS, global media
+keys, finished terminal states, built-in help, and the verified local
+installation path. The remaining work is the verified Linux release and
 `suzumushi-bin` AUR package.
 
 The full contract and roadmap live in [PROJECT.md](PROJECT.md).

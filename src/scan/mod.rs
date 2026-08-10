@@ -245,10 +245,9 @@ fn scan_with_components_from<Fd: AsFd>(
 
 struct PendingEntry {
     id: TrackEntryId,
-    asset_id: MediaAssetId,
+    asset_index: usize,
     display_path: PathBuf,
     source: TrackEntrySource,
-    tags: TrackTags,
 }
 
 struct Scanner<'a> {
@@ -702,14 +701,13 @@ impl<'a> Scanner<'a> {
             return Ok(());
         }
         let key = (canonical_bytes.clone(), identity);
-        let (asset_id, tags) = if let Some((id, asset_index)) = self.asset_keys.get(&key).copied() {
+        let asset_index = if let Some((id, asset_index)) = self.asset_keys.get(&key).copied() {
             let asset = self
                 .assets
                 .get(asset_index)
                 .expect("asset lookup index must name an inserted asset");
             assert_eq!(asset.id, id, "asset lookup ID must match its stored index");
-            let tags = asset.tags.clone();
-            (id, tags)
+            asset_index
         } else {
             let id = MediaAssetId(stable_id(&[
                 &canonical_bytes,
@@ -731,12 +729,12 @@ impl<'a> Scanner<'a> {
             self.assets.push(MediaAsset {
                 id,
                 canonical_path: canonical_path.clone(),
-                tags: tags.clone(),
+                tags,
                 file_identity: identity,
                 external,
                 cross_mount,
             });
-            (id, tags)
+            asset_index
         };
         let child_bytes = child.as_os_str().as_bytes();
         let playlist_id = playlist.as_deref().map(|key| PlaylistId(stable_id(&[key])));
@@ -762,7 +760,7 @@ impl<'a> Scanner<'a> {
             child_bytes.len()
         };
         self.account_index(
-            retained_entry_bytes(child_bytes.len(), source_path_bytes, tag_bytes(&tags)),
+            retained_entry_bytes(child_bytes.len(), source_path_bytes),
             &child,
         );
         if self.stopped {
@@ -770,10 +768,9 @@ impl<'a> Scanner<'a> {
         }
         self.entries.push(PendingEntry {
             id,
-            asset_id,
+            asset_index,
             display_path: child.clone(),
             source,
-            tags,
         });
         if let Some(key) = playlist
             && let Some(playlist) = self.playlists.get_mut(&key)
@@ -936,7 +933,7 @@ impl<'a> Scanner<'a> {
         });
     }
 
-    fn finish(mut self) -> ScanIndex {
+    fn finish(self) -> ScanIndex {
         let mut contextual = Vec::with_capacity(self.entries.len());
         for pending in self.entries {
             let filename = pending
@@ -949,23 +946,12 @@ impl<'a> Scanner<'a> {
                 pending.display_path.as_os_str().as_bytes(),
                 self.limits.max_path_bytes,
             );
-            let metadata = [
-                pending.tags.artist,
-                pending.tags.album_artist,
-                pending.tags.album,
-                pending.tags.title,
-            ]
-            .into_iter()
-            .flatten()
-            .map(|value| terminal_safe(value.as_bytes(), self.limits.max_metadata_field_bytes))
-            .collect();
             contextual.push(TrackEntry {
                 id: pending.id,
-                asset_id: pending.asset_id,
+                asset_index: pending.asset_index,
                 display_path: pending.display_path,
                 source: pending.source,
                 search: SearchFields {
-                    metadata,
                     filename,
                     relative_path,
                 },
@@ -978,7 +964,6 @@ impl<'a> Scanner<'a> {
             .enumerate()
             .map(|(rank, entry)| (entry.id, rank))
             .collect();
-        self.assets.sort_by_key(|asset| asset.id);
         let mut playlists: Vec<_> = self.playlists.into_values().collect();
         for playlist in &mut playlists {
             playlist
@@ -1088,7 +1073,7 @@ fn tag_bytes(tags: &TrackTags) -> usize {
 }
 
 // These charges intentionally exceed the retained model payload. They cover
-// both build-time and final containers, lookup-tree nodes, cloned path/tag
+// both build-time and final containers, lookup-tree nodes, cloned path
 // buffers, vector slack, and allocator bookkeeping under one index budget.
 fn retained_asset_bytes(path_bytes: usize, metadata_bytes: usize) -> usize {
     std::mem::size_of::<MediaAsset>()
@@ -1098,17 +1083,12 @@ fn retained_asset_bytes(path_bytes: usize, metadata_bytes: usize) -> usize {
         .saturating_add(metadata_bytes.saturating_mul(3))
 }
 
-fn retained_entry_bytes(
-    path_bytes: usize,
-    source_path_bytes: usize,
-    metadata_bytes: usize,
-) -> usize {
+fn retained_entry_bytes(path_bytes: usize, source_path_bytes: usize) -> usize {
     std::mem::size_of::<PendingEntry>()
         .saturating_add(std::mem::size_of::<TrackEntry>())
         .saturating_add(256)
         .saturating_add(path_bytes.saturating_mul(12))
         .saturating_add(source_path_bytes.saturating_mul(2))
-        .saturating_add(metadata_bytes.saturating_mul(4))
 }
 
 fn retained_playlist_bytes(key_bytes: usize, name_bytes: usize, path: &Path) -> usize {

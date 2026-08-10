@@ -26,12 +26,17 @@ pub fn render(frame: &mut Frame<'_>, app: &AppState, animation_time: Duration) {
     let area = frame.area();
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         frame.render_widget(
-            Paragraph::new(
-                "Suzumushi needs at least 80x24.\nResize the terminal or press q to quit.",
-            )
+            Paragraph::new(format!(
+                "Suzumushi needs at least 80x24.\nCurrent size: {}x{}.\nResize the terminal or press q to quit.",
+                area.width, area.height
+            ))
             .wrap(Wrap { trim: false }),
             area,
         );
+        return;
+    }
+    if app.help_visible() {
+        render_help(frame, area, app);
         return;
     }
 
@@ -45,13 +50,22 @@ pub fn render(frame: &mut Frame<'_>, app: &AppState, animation_time: Duration) {
 fn render_library(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     let block = panel_block("Library", Focus::Library, app);
     let row_count = app.library_row_count();
-    if row_count == 0 {
-        let message = if app.search.active {
-            "No matches"
-        } else {
-            "Library is empty"
-        };
-        frame.render_widget(Paragraph::new(message).block(block), area);
+    if app.search.active && !app.search.query.is_empty() && row_count == 0 {
+        frame.render_widget(
+            Paragraph::new("No matches\nTry artist, title, filename, or path.")
+                .wrap(Wrap { trim: false })
+                .block(block),
+            area,
+        );
+        return;
+    }
+    if app.index.entries.is_empty() {
+        frame.render_widget(
+            Paragraph::new("Library is empty\nAdd audio below audio/library/.\nPress ? for help.")
+                .wrap(Wrap { trim: false })
+                .block(block),
+            area,
+        );
         return;
     }
 
@@ -113,7 +127,10 @@ fn render_player(frame: &mut Frame<'_>, area: Rect, app: &AppState, animation_ti
     content.push(Line::default());
     content.push(Line::from(timeline));
     content.push(Line::default());
-    content.push(Line::from(format!("State: {state}")));
+    content.push(Line::styled(
+        format!("State: {state}"),
+        playback_state_style(app, app.playback_status),
+    ));
     content.push(Line::from(volume));
     content.push(Line::from(modes));
     if let Some(format) = app.playback_format() {
@@ -180,7 +197,12 @@ fn progress_bar(
 fn render_queue(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     let block = panel_block("Queue", Focus::Queue, app);
     if app.queue.is_empty() {
-        frame.render_widget(Paragraph::new("Queue is empty").block(block), area);
+        frame.render_widget(
+            Paragraph::new("Queue is empty\nSelect a track and press Enter.")
+                .wrap(Wrap { trim: false })
+                .block(block),
+            area,
+        );
         return;
     }
 
@@ -205,6 +227,51 @@ fn render_queue(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         .block(block)
         .highlight_style(selection_style(app, Focus::Queue));
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn render_help(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
+    let heading = if app.color_mode == ColorMode::Terminal {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().add_modifier(Modifier::BOLD)
+    };
+    let lines = vec![
+        Line::styled("Navigation", heading),
+        Line::raw("  Tab or Shift+Tab     focus Library, Player, or Queue"),
+        Line::raw("  Up or Down, j or k   move the selection"),
+        Line::raw("  Home or End, g or G  jump to the first or last item"),
+        Line::default(),
+        Line::styled("Library and search", heading),
+        Line::raw("  /                     search artist, title, filename, and path"),
+        Line::raw("  Enter                 add the selection and play when idle"),
+        Line::raw("  Esc                   close search"),
+        Line::default(),
+        Line::styled("Queue", heading),
+        Line::raw("  J or K                move the selected item down or up"),
+        Line::raw("  d or Delete           remove item    c clear Queue"),
+        Line::default(),
+        Line::styled("Playback", heading),
+        Line::raw("  Space                 play or pause    s stop"),
+        Line::raw("  n or p                 next or previous"),
+        Line::raw("  Left or Right          seek back or forward five seconds"),
+        Line::raw("  - or +                 volume down or up    m mute"),
+        Line::raw("  x                     shuffle    r repeat"),
+        Line::default(),
+        Line::raw("  ? or Esc               close help    q quit    Ctrl+c quit anywhere"),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title("Suzumushi Help")
+                    .title_alignment(Alignment::Center)
+                    .borders(Borders::ALL),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 fn library_row_text(app: &AppState, row: BrowserRow, max_row_bytes: usize) -> String {
@@ -291,6 +358,22 @@ fn selection_style(app: &AppState, focus: Focus) -> Style {
     focus_style(app, app.focus == focus)
 }
 
+fn playback_state_style(app: &AppState, status: PlaybackStatus) -> Style {
+    let style = match status {
+        PlaybackStatus::Loading | PlaybackStatus::Paused => Style::default().fg(Color::Yellow),
+        PlaybackStatus::Playing => Style::default().fg(Color::Green),
+        PlaybackStatus::Error => Style::default().fg(Color::Red),
+        PlaybackStatus::Stopped => Style::default(),
+    };
+    if app.color_mode == ColorMode::Terminal {
+        style
+    } else if status == PlaybackStatus::Error {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -350,6 +433,17 @@ mod tests {
     }
 
     #[test]
+    fn help_is_complete_at_the_minimum_supported_size() {
+        let mut app = AppState::new(&Config::default(), empty_index()).expect("app state");
+        app.apply(crate::input::AppAction::ToggleHelp);
+
+        insta::assert_snapshot!(
+            "terminal_help_80x24",
+            rendered(&app, 80, 24, Duration::ZERO)
+        );
+    }
+
+    #[test]
     fn undersized_terminal_has_a_keyboard_accessible_fallback() {
         insta::assert_snapshot!("terminal_small", snapshot(40, 10));
     }
@@ -369,6 +463,27 @@ mod tests {
         let paused = rendered(&app, 80, 24, Duration::from_millis(200));
         assert!(paused.contains("▐▀• •▀▌"), "{paused}");
         assert!(!paused.contains("▐▀^ ^▀▌"), "{paused}");
+    }
+
+    #[test]
+    fn loading_warning_and_error_states_are_named_in_text() {
+        let mut app = AppState::new(&Config::default(), empty_index()).expect("app state");
+        app.playback_status = crate::app::PlaybackStatus::Loading;
+        let loading = rendered(&app, 80, 24, Duration::ZERO);
+        assert!(loading.contains("State: Loading"), "{loading}");
+
+        app.playback_status = crate::app::PlaybackStatus::Error;
+        app.status_kind = crate::app::StatusKind::Error;
+        app.status_message = "Output device unavailable".into();
+        let error = rendered(&app, 80, 24, Duration::ZERO);
+        assert!(error.contains("State: Error"), "{error}");
+        assert!(error.contains("Error: Output device"), "{error}");
+
+        app.playback_status = crate::app::PlaybackStatus::Stopped;
+        app.status_kind = crate::app::StatusKind::Warning;
+        app.status_message = "Scan incomplete".into();
+        let warning = rendered(&app, 80, 24, Duration::ZERO);
+        assert!(warning.contains("Warning: Scan"), "{warning}");
     }
 
     #[test]

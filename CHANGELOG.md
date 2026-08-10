@@ -7,14 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-10
+
 ### Added
 
 - Added one MPRIS identity for the active terminal session with global media-key and `playerctl` control for playback, navigation, seeking, volume, shuffle, and repeat.
 - Added bounded text metadata and generation-aware track identities without artwork or file URLs.
+- Added a complete built-in key guide, explicit empty and failure guidance, command version output, and clearer initialization instructions.
+- Added a reproducible local-install check that installs the current checkout, initializes a root, and scans a real fixture through the installed binary.
 
 ### Changed
 
 - Routed every desktop control through the existing app-owned actions and published app state through a capacity-one latest projection instead of creating a second playback state.
+- Made Space respond immediately by removing the unused command-palette leader delay. Released configuration containing the old timeout remains narrowly compatible.
+- Stored metadata once per canonical asset and gave contextual library and playlist entries a direct immutable relationship to it.
+- Named informational, warning, and error notices in text and kept loading, playback, help, empty, and small-terminal states useful at the supported minimum size.
 
 ### Fixed
 

@@ -1,0 +1,28 @@
+---
+source: src/ui/mod.rs
+expression: "rendered(&app, 80, 24, Duration::ZERO)"
+---
+┌────────────────────────────────Suzumushi Help────────────────────────────────┐
+│Navigation                                                                    │
+│  Tab or Shift+Tab     focus Library, Player, or Queue                        │
+│  Up or Down, j or k   move the selection                                     │
+│  Home or End, g or G  jump to the first or last item                         │
+│                                                                              │
+│Library and search                                                            │
+│  /                     search artist, title, filename, and path              │
+│  Enter                 add the selection and play when idle                  │
+│  Esc                   close search                                          │
+│                                                                              │
+│Queue                                                                         │
+│  J or K                move the selected item down or up                     │
+│  d or Delete           remove item    c clear Queue                          │
+│                                                                              │
+│Playback                                                                      │
+│  Space                 play or pause    s stop                               │
+│  n or p                 next or previous                                     │
+│  Left or Right          seek back or forward five seconds                    │
+│  - or +                 volume down or up    m mute                          │
+│  x                     shuffle    r repeat                                   │
+│                                                                              │
+│  ? or Esc               close help    q quit    Ctrl+c quit anywhere         │
+└──────────────────────────────────────────────────────────────────────────────┘

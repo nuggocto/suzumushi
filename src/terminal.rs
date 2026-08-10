@@ -125,8 +125,7 @@ fn run_terminal_session(
                 crate::ui::render(frame, app, event_time);
             })
             .map_err(|error| AppError::io("draw terminal", "terminal", error))?;
-        let leader_deadline = app.input.deadline();
-        let event = events.next(leader_deadline)?;
+        let event = events.next()?;
         event_time = event_time_for(event);
         if let AppEvent::Resize(width, height, _) = event {
             let area = validate_terminal_area(width, height, TERMINAL_BUFFER_BYTES)?;
@@ -302,13 +301,7 @@ fn apply_event(app: &mut AppState, event: AppEvent) -> Option<PlaybackIntent> {
             app.terminal_size = (width, height);
             None
         }
-        AppEvent::Tick(now) => {
-            if let Some(action) = app.input.tick(now) {
-                app.apply(action)
-            } else {
-                None
-            }
-        }
+        AppEvent::Tick(_) => None,
     }
 }
 

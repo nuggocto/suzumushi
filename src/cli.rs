@@ -22,6 +22,7 @@ use crate::scan;
 pub fn command() -> Command {
     Command::new("suzumushi")
         .about("A calm, fully local terminal audio player for Linux")
+        .version(env!("CARGO_PKG_VERSION"))
         .arg(
             Arg::new("root")
                 .long("root")
@@ -113,6 +114,8 @@ where
                 .ok_or_else(|| AppError::InvalidConfig("init destination is required".into()))?;
             let initialized = init::initialize(path)?;
             println!("initialized {}", safe_path(&initialized.root, 4_096));
+            println!("add audio below {}", safe_path(&initialized.library, 4_096));
+            println!("then run `suzumushi --root <ROOT>` using the initialized path");
             Ok(())
         }
         Some(("diagnose", _)) => diagnose(explicit.as_deref(), current_dir),
@@ -142,28 +145,26 @@ fn diagnose(explicit: Option<&Path>, current_dir: &Path) -> AppResult<()> {
     println!("tracks: {}", index.entries.len());
     println!("playlists: {}", index.playlists.len());
     println!("warnings: {}", index.warnings.len());
+    if index.entries.is_empty() {
+        println!("hint: add audio below audio/library/");
+    }
     for entry in &index.entries {
-        let asset = index
-            .assets
-            .binary_search_by_key(&entry.asset_id, |asset| asset.id)
-            .ok()
-            .map(|asset_index| &index.assets[asset_index]);
+        let asset = index.asset_for_entry(entry);
         let title = asset
             .and_then(|asset| asset.tags.title.as_deref())
             .map_or_else(
                 || entry.search.filename.clone(),
                 |title| terminal_safe(title.as_bytes(), config.scan.max_metadata_field_bytes),
             );
-        let artist = asset
-            .and_then(|asset| asset.tags.artist.as_deref())
-            .map_or_else(
-                || "unknown artist".to_owned(),
-                |artist| terminal_safe(artist.as_bytes(), config.scan.max_metadata_field_bytes),
+        if let Some(artist) = asset.and_then(|asset| asset.tags.artist.as_deref()) {
+            let artist = terminal_safe(artist.as_bytes(), config.scan.max_metadata_field_bytes);
+            println!(
+                "track: {} - {} [{}]",
+                artist, title, entry.search.relative_path
             );
-        println!(
-            "track: {} - {} [{}]",
-            artist, title, entry.search.relative_path
-        );
+        } else {
+            println!("track: {} [{}]", title, entry.search.relative_path);
+        }
     }
     for warning in &index.warnings {
         println!(

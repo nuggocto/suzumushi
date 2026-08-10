@@ -11,10 +11,10 @@ into the player and reacts only to playback state.
 
 ## Current status
 
-Version `0.3.0` is released. It contains the complete local library, search,
-queue browser, and playback controls on the safe root, scanner, metadata,
-terminal, logging, test, fuzz, and CI foundation. The current checkout adds
-MPRIS and global media-key support for the active terminal session.
+Version `0.4.0` is released. It contains the complete local library, search,
+queue browser, playback controls, MPRIS, global media-key support, finished
+terminal states, built-in help, and the verified local installation path on the
+safe root, scanner, metadata, logging, test, fuzz, and CI foundation.
 
 ```text
 +------------------+----------------------------------------+------------------+
@@ -22,13 +22,13 @@ MPRIS and global media-key support for the active terminal session.
 | folders, tracks  |     title, creator, progress, time     |  ordered tracks  |
 | playlists/search |        volume, state, dancing Suzu     | and queue edits  |
 +------------------+----------------------------------------+------------------+
-| q quit   Tab focus   / search   Enter add   Up/Down move                     |
-| Space play/pause  s stop  n next  p previous  x shuffle  r repeat             |
+| q quit   ? help   Tab focus   / search   Enter add   Up or Down move         |
+| Space play or pause  s stop  n next  p previous  x shuffle  r repeat         |
 +------------------------------------------------------------------------------+
 ```
 
-The complete local player and its desktop controls are implemented. The next
-work is Phase 8.
+The complete local player, desktop controls, and terminal experience are
+implemented. The next work is Phase 9.
 
 ## Product contract
 
@@ -93,7 +93,9 @@ The root lock file is app-owned and hidden. Roots created by `0.2.0` may still
 contain now-unused `state/artwork/` and `backups/` directories. New code does
 not read or write them. Their released configuration is read through a narrow
 migration that discards only the retired prototype fields. New configuration is
-versioned and remains strict.
+versioned and remains strict. Version 1 roots may also retain the released
+`[input] leader_timeout_ms` setting. Its exact known shape remains readable but
+has no effect; new roots omit it because Space is immediate.
 
 `state/session.json` is the single private, bounded, versioned resume
 checkpoint. It stores stable entry identifiers rather than media paths. Queue
@@ -114,8 +116,10 @@ process with read, operation, output, file descriptor, memory, CPU, and wall-tim
 limits.
 
 Search is modal and ASCII-case-insensitive. Each query update uses a linear-time
-matcher over the retained bounded fields. While search is open, `q` remains
-query text; `Esc` closes search and `Ctrl+c` quits globally.
+matcher over the retained bounded fields. Metadata is stored once per canonical
+asset, and each contextual library or playlist entry holds one checked index
+into that immutable asset table. While search is open, `q` remains query text;
+`Esc` closes search and `Ctrl+c` quits globally.
 
 The Player shows artist or album-artist metadata when present. Missing creator
 metadata is omitted rather than replaced with a placeholder.
@@ -149,6 +153,9 @@ are coalesced instead of queueing decoder restarts.
   additional dependency.
 - `src/main.rs` remains thin. Behavior exposed to integration tests lives in
   the library target. A module is added only with its first real behavior.
+- Canonical metadata lives once on each media asset. Contextual entries keep a
+  direct immutable asset index for constant-time playback and search access,
+  while stable entry IDs remain the persisted queue identity.
 
 The terminal inherits the user's foreground and background. It uses default or
 named ANSI colors only, honors `NO_COLOR` and `theme = "mono"`, and never relies
@@ -209,6 +216,7 @@ mise run test
 mise run msrv
 mise run security
 mise run fuzz-smoke
+mise run local-install-qa
 mise run ci
 ```
 
@@ -321,28 +329,35 @@ relative seek boundaries, volume, shuffle, repeat, metadata, and MPRIS Quit.
 The journey also confirmed that the terminal restores, consecutive paused
 navigation releases CPAL streams cleanly, and the MPRIS worker exits cleanly.
 
-**Milestone:** desktop controls, planned `0.4.0`.
+**Milestone:** desktop controls, released `0.4.0`.
 
 ### Phase 8: terminal polish and local installation
 
-**Status:** next
+**Status:** complete
 
-- Finish empty, loading, warning, error, help, and small-terminal states.
-- Keep the three-panel layout calm and useful at 80x24 and wider sizes.
-- Add the simple local installation path:
+- [x] Finish empty, loading, warning, error, help, and small-terminal states.
+- [x] Keep the three-panel layout calm and useful at 80x24 and wider sizes.
+- [x] Add the simple local installation path:
 
   ```sh
   cargo install --path . --locked
   ```
 
-- Run real keyboard, audio-device, media-key, and supported terminal QA.
+- [x] Run real keyboard, audio-device, media-key, and supported terminal QA.
 
 Done when a friend can clone the repository, run one install command, initialize
 a root, and use the player without reading project internals.
 
+Verified with the built-in 80x24 help screen; reviewed 80x24, 120x32, empty,
+loading, warning, error, and small-terminal states; the real-executable PTY
+keyboard journeys; the isolated `mise run local-install-qa` flow; the local
+PipeWire-backed audio device; a private session-bus `playerctl` play, pause,
+resume, stop, and metadata journey; the full `mise run ci` sequence; and a
+release-profile scan benchmark over 10,000 contextual playlist references.
+
 ### Phase 9: Linux release and AUR
 
-**Status:** not started
+**Status:** next
 
 - Add the single release workflow only when the application is feature complete.
 - Build verified `x86_64-unknown-linux-gnu` archives and checksums from tags.
@@ -382,6 +397,7 @@ No website or Node dependency belongs in this repository.
 
 `CHANGELOG.md` holds user-visible changes. Git tags use a `v` prefix while Cargo
 and changelog versions do not. `v0.2.0` is the released terminal foundation and
-`v0.3.0` is the released playable core. The next planned milestones are `0.4.0`
-and `1.0.0` as described above. A version is tagged only after local CI, real
-executable QA, and the exact pushed commit are green.
+`v0.3.0` is the released playable core, and `v0.4.0` is the released desktop and
+terminal experience. The next planned milestone is `1.0.0` as described above.
+A version is tagged only after local CI, real executable QA, and the exact
+pushed commit are green.

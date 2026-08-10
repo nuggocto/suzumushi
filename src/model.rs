@@ -72,17 +72,19 @@ pub enum TrackEntrySource {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct TrackEntry {
     pub id: TrackEntryId,
-    pub asset_id: MediaAssetId,
+    pub asset_index: usize,
     pub display_path: PathBuf,
     pub source: TrackEntrySource,
     pub search: SearchFields,
     pub scan_generation: u64,
 }
 
-/// Searchable metadata and path fallbacks for one contextual entry.
+/// Searchable path fields owned by one contextual entry.
+///
+/// Metadata remains on [`MediaAsset`], so playlist entries can share it instead
+/// of retaining another copy for every path that names the same file.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SearchFields {
-    pub metadata: Vec<String>,
     pub filename: String,
     pub relative_path: String,
 }
@@ -148,6 +150,14 @@ pub struct ScanIndex {
     pub playlists: Vec<Playlist>,
     pub warnings: Vec<ScanWarning>,
     pub counters: ScanCounters,
+}
+
+impl ScanIndex {
+    /// Returns the canonical asset named by a contextual entry.
+    #[must_use]
+    pub fn asset_for_entry(&self, entry: &TrackEntry) -> Option<&MediaAsset> {
+        self.assets.get(entry.asset_index)
+    }
 }
 
 /// Deterministic app-owned FNV-1a identifier.
