@@ -15,6 +15,7 @@ pub mod locks;
 pub mod logging;
 pub mod metadata;
 pub mod model;
+pub mod mpris;
 pub mod paths;
 pub mod scan;
 pub mod state;

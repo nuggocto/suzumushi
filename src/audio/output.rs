@@ -29,6 +29,7 @@ pub(super) struct CpalOutput {
     failure: Arc<AtomicU8>,
     gain: Arc<AtomicU32>,
     written: u64,
+    stream_active: bool,
 }
 
 impl CpalOutput {
@@ -42,6 +43,7 @@ impl CpalOutput {
             failure: Arc::new(AtomicU8::new(0)),
             gain: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
             written: 0,
+            stream_active: false,
         }
     }
 }
@@ -89,6 +91,7 @@ impl OutputStream for CpalOutput {
         self.consumed.store(0, Ordering::Release);
         self.failure.store(0, Ordering::Release);
         self.written = 0;
+        self.stream_active = false;
         let frames_read = Arc::clone(&self.consumed);
         let failure = Arc::clone(&self.failure);
         let gain = Arc::clone(&self.gain);
@@ -177,15 +180,22 @@ impl OutputStream for CpalOutput {
             .as_ref()
             .ok_or_else(|| "audio output stream is unavailable".to_owned())?
             .play()
-            .map_err(|error| format!("cannot start the audio output stream: {error}"))
+            .map_err(|error| format!("cannot start the audio output stream: {error}"))?;
+        self.stream_active = true;
+        Ok(())
     }
 
     fn pause(&mut self) -> Result<(), String> {
+        if !self.stream_active {
+            return Ok(());
+        }
         self.stream
             .as_ref()
             .ok_or_else(|| "audio output stream is unavailable".to_owned())?
             .pause()
-            .map_err(|error| format!("cannot pause the audio output stream: {error}"))
+            .map_err(|error| format!("cannot pause the audio output stream: {error}"))?;
+        self.stream_active = false;
+        Ok(())
     }
 
     fn resume(&mut self) -> Result<(), String> {
@@ -193,14 +203,11 @@ impl OutputStream for CpalOutput {
     }
 
     fn stop(&mut self) -> Result<(), String> {
-        let pause_error = self
-            .stream
-            .as_ref()
-            .and_then(|stream| stream.pause().err())
-            .map(|error| format!("cannot stop the audio output stream: {error}"));
+        let pause_error = self.pause().err();
         self.stream.take();
         self.producer.take();
         self.source = None;
+        self.stream_active = false;
         pause_error.map_or(Ok(()), Err)
     }
 
@@ -330,5 +337,19 @@ fn finite_or_silence(sample: f32) -> f32 {
         sample.clamp(-1.0, 1.0)
     } else {
         0.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CpalOutput, OutputStream};
+
+    #[test]
+    fn inactive_stream_lifecycle_is_idempotent() {
+        let mut output = CpalOutput::new();
+        output
+            .pause()
+            .expect("an inactive stream is already paused");
+        output.stop().expect("an inactive stream stops cleanly");
     }
 }

@@ -135,6 +135,7 @@ pub(crate) enum PlaybackIntent {
         item: QueueItem,
         position: Duration,
         settings: PlaybackSettings,
+        paused: bool,
     },
     Pause {
         generation: u64,
@@ -165,6 +166,7 @@ struct PlaybackState {
     format: Option<AudioFormat>,
     position: Duration,
     duration: Option<Duration>,
+    start_paused: bool,
 }
 
 impl PlaybackState {
@@ -177,6 +179,7 @@ impl PlaybackState {
             format: None,
             position: Duration::ZERO,
             duration: None,
+            start_paused: false,
         }
     }
 }
@@ -228,6 +231,7 @@ pub struct AppState {
     shuffle_order: Vec<u64>,
     shuffle_cursor: Option<usize>,
     shuffle_seed: u64,
+    seek_revision: u64,
     playback: PlaybackState,
 }
 
@@ -330,6 +334,7 @@ impl AppState {
             shuffle_order,
             shuffle_cursor: None,
             shuffle_seed,
+            seek_revision: 0,
             playback: PlaybackState::new(),
         })
     }
@@ -366,16 +371,33 @@ impl AppState {
             AppAction::QueueMoveUp => self.move_queue_item(false),
             AppAction::QueueMoveDown => self.move_queue_item(true),
             AppAction::PlayPause => return self.play_pause(),
+            AppAction::Play => return self.play(),
+            AppAction::Pause => return self.pause(),
             AppAction::Stop => return self.stop_playback(),
             AppAction::Next => return self.next_track(),
             AppAction::Previous => return self.previous_track(),
             AppAction::SeekBackward => return self.seek(false),
             AppAction::SeekForward => return self.seek(true),
+            AppAction::SeekRelative { forward, distance } => {
+                return self.seek_relative(forward, distance);
+            }
+            AppAction::SeekAbsolute {
+                playback_generation,
+                queue_instance,
+                position,
+            } => {
+                return self.seek_absolute(playback_generation, queue_instance, position);
+            }
             AppAction::VolumeDown => return self.change_volume(false),
             AppAction::VolumeUp => return self.change_volume(true),
+            AppAction::SetVolume(volume_percent) => return self.set_volume(volume_percent),
             AppAction::ToggleMute => return self.toggle_mute(),
             AppAction::ToggleShuffle => self.toggle_shuffle(),
+            AppAction::SetShuffle(enabled) => self.set_shuffle(enabled),
             AppAction::CycleRepeat => self.cycle_repeat(),
+            AppAction::RepeatOff => self.set_repeat(RepeatMode::Off),
+            AppAction::RepeatAll => self.set_repeat(RepeatMode::All),
+            AppAction::RepeatOne => self.set_repeat(RepeatMode::One),
             AppAction::PalettePlaceholder => {
                 self.set_status("The command palette is not available yet");
             }
@@ -517,6 +539,24 @@ impl AppState {
     #[must_use]
     pub(crate) fn queue_position(&self) -> Option<usize> {
         self.current_queue_index().map(|index| index + 1)
+    }
+
+    #[must_use]
+    pub(crate) fn current_track_token(&self) -> Option<(u64, u64)> {
+        self.playback
+            .current
+            .map(|item| (self.playback_generation, item.instance_id))
+    }
+
+    #[must_use]
+    pub(crate) fn can_go_next(&self) -> bool {
+        self.next_queue_index(self.repeat == RepeatMode::All)
+            .is_some()
+    }
+
+    #[must_use]
+    pub(crate) const fn seek_revision(&self) -> u64 {
+        self.seek_revision
     }
 
     pub(crate) fn audio_position(&mut self, update: AudioPosition) {
@@ -671,6 +711,11 @@ impl AppState {
         self.set_status(&format!("Saved session ignored: {reason}"));
     }
 
+    pub(crate) fn desktop_controls_unavailable(&mut self, reason: &str) {
+        let reason = terminal_safe(reason.as_bytes(), self.status_text_max_bytes);
+        self.set_status(&format!("Desktop controls unavailable: {reason}"));
+    }
+
     pub(crate) fn audio_event(&mut self, event: AudioEvent) -> Option<PlaybackIntent> {
         let generation = match &event {
             AudioEvent::Started { generation, .. }
@@ -692,12 +737,21 @@ impl AppState {
                 position,
                 ..
             } => {
-                self.set_playback_status(PlaybackStatus::Playing);
+                let status = if self.playback.start_paused {
+                    PlaybackStatus::Paused
+                } else {
+                    PlaybackStatus::Playing
+                };
+                self.set_playback_status(status);
                 self.playback.seek_target = None;
                 self.playback.format = Some(format);
                 self.playback.duration = duration;
                 self.apply_event_position(timeline_revision, position);
-                self.set_status("Playing");
+                self.set_status(if status == PlaybackStatus::Paused {
+                    "Paused"
+                } else {
+                    "Playing"
+                });
                 None
             }
             AudioEvent::Paused { .. } => {
@@ -733,6 +787,7 @@ impl AppState {
                 } else {
                     self.playback.seek_target = None;
                     self.apply_event_position(timeline_revision, position);
+                    self.seek_revision = self.seek_revision.saturating_add(1);
                     self.set_status("Seeked");
                 }
                 None
@@ -958,6 +1013,22 @@ impl AppState {
         }
     }
 
+    fn play(&mut self) -> Option<PlaybackIntent> {
+        match self.playback_status {
+            PlaybackStatus::Paused => Some(PlaybackIntent::Resume {
+                generation: self.playback_generation,
+            }),
+            PlaybackStatus::Stopped | PlaybackStatus::Error => self.play_pause(),
+            PlaybackStatus::Loading | PlaybackStatus::Playing => None,
+        }
+    }
+
+    fn pause(&self) -> Option<PlaybackIntent> {
+        (self.playback_status == PlaybackStatus::Playing).then_some(PlaybackIntent::Pause {
+            generation: self.playback_generation,
+        })
+    }
+
     fn stop_playback(&mut self) -> Option<PlaybackIntent> {
         if self.playback.current.is_none()
             || matches!(self.playback_status, PlaybackStatus::Stopped)
@@ -983,7 +1054,14 @@ impl AppState {
         }
         if let Some(next) = self.next_queue_index(self.repeat == RepeatMode::All) {
             self.queue_selection = next;
-            self.start_queue_index(next)
+            match self.playback_status {
+                PlaybackStatus::Paused => self.start_queue_index_paused(next),
+                PlaybackStatus::Stopped | PlaybackStatus::Error => {
+                    self.select_stopped_queue_index(next);
+                    None
+                }
+                PlaybackStatus::Loading | PlaybackStatus::Playing => self.start_queue_index(next),
+            }
         } else if matches!(
             self.playback_status,
             PlaybackStatus::Loading | PlaybackStatus::Playing | PlaybackStatus::Paused
@@ -1010,7 +1088,14 @@ impl AppState {
             .unwrap_or(current)
             .min(self.queue.len() - 1);
         self.queue_selection = previous;
-        self.start_queue_index(previous)
+        match self.playback_status {
+            PlaybackStatus::Paused => self.start_queue_index_paused(previous),
+            PlaybackStatus::Stopped | PlaybackStatus::Error => {
+                self.select_stopped_queue_index(previous);
+                None
+            }
+            PlaybackStatus::Loading | PlaybackStatus::Playing => self.start_queue_index(previous),
+        }
     }
 
     fn advance_after_finish(&mut self) -> Option<PlaybackIntent> {
@@ -1037,7 +1122,20 @@ impl AppState {
         self.start_queue_index_at(index, Duration::ZERO)
     }
 
+    fn start_queue_index_paused(&mut self, index: usize) -> Option<PlaybackIntent> {
+        self.start_queue_index_with_state(index, Duration::ZERO, true)
+    }
+
     fn start_queue_index_at(&mut self, index: usize, position: Duration) -> Option<PlaybackIntent> {
+        self.start_queue_index_with_state(index, position, false)
+    }
+
+    fn start_queue_index_with_state(
+        &mut self,
+        index: usize,
+        position: Duration,
+        paused: bool,
+    ) -> Option<PlaybackIntent> {
         let item = self.queue.get(index).copied()?;
         let Some(generation) = self.playback_generation.checked_add(1) else {
             self.set_status("Playback generation exhausted");
@@ -1057,6 +1155,7 @@ impl AppState {
         self.playback.format = None;
         self.playback.position = position;
         self.playback.duration = None;
+        self.playback.start_paused = paused;
         self.set_playback_status(PlaybackStatus::Loading);
         let title = self.queue_item_title(item, self.status_text_max_bytes);
         self.set_status(&format!("Loading: {title}"));
@@ -1065,7 +1164,38 @@ impl AppState {
             item,
             position,
             settings: self.playback_settings(),
+            paused,
         })
+    }
+
+    fn select_stopped_queue_index(&mut self, index: usize) {
+        let Some(item) = self.queue.get(index).copied() else {
+            return;
+        };
+        if self.playback.current != Some(item) {
+            let Some(generation) = self.playback_generation.checked_add(1) else {
+                self.set_status("Playback generation exhausted");
+                return;
+            };
+            self.playback_generation = generation;
+            self.playback.current = Some(item);
+        }
+        self.playback.position_hint = index;
+        if self.shuffle {
+            self.shuffle_cursor = self
+                .shuffle_order
+                .iter()
+                .position(|candidate| *candidate == item.instance_id);
+        }
+        self.playback.timeline_revision = 0;
+        self.playback.seek_target = None;
+        self.playback.format = None;
+        self.playback.position = Duration::ZERO;
+        self.playback.duration = None;
+        self.playback.start_paused = false;
+        self.set_playback_status(PlaybackStatus::Stopped);
+        let title = self.queue_item_title(item, self.status_text_max_bytes);
+        self.set_status(&format!("Selected: {title}"));
     }
 
     fn start_new_shuffle_round(&mut self, index: usize) -> Option<PlaybackIntent> {
@@ -1191,6 +1321,17 @@ impl AppState {
         self.gain_intent()
     }
 
+    fn set_volume(&mut self, volume_percent: u8) -> Option<PlaybackIntent> {
+        let volume_percent = volume_percent.min(100);
+        if self.volume_percent == volume_percent && !self.muted {
+            return None;
+        }
+        self.volume_percent = volume_percent;
+        self.muted = false;
+        self.set_status(&format!("Volume: {}%", self.volume_percent));
+        self.gain_intent()
+    }
+
     fn toggle_mute(&mut self) -> Option<PlaybackIntent> {
         self.muted = !self.muted;
         self.set_status(if self.muted { "Muted" } else { "Unmuted" });
@@ -1207,6 +1348,10 @@ impl AppState {
     }
 
     fn seek(&mut self, forward: bool) -> Option<PlaybackIntent> {
+        self.seek_relative(forward, Duration::from_secs(5))
+    }
+
+    fn seek_relative(&mut self, forward: bool, distance: Duration) -> Option<PlaybackIntent> {
         if !matches!(
             self.playback_status,
             PlaybackStatus::Playing | PlaybackStatus::Paused
@@ -1214,24 +1359,64 @@ impl AppState {
             self.set_status("Nothing seekable is playing");
             return None;
         }
-        let step = Duration::from_secs(5);
         let current = self.playback.seek_target.unwrap_or(self.playback.position);
         let position = if forward {
-            current.saturating_add(step)
+            current.saturating_add(distance)
         } else {
-            current.saturating_sub(step)
+            current.saturating_sub(distance)
         };
+        if forward
+            && self
+                .playback
+                .duration
+                .is_some_and(|duration| position > duration)
+        {
+            return self.next_track();
+        }
+        let seconds = distance.as_secs();
         let position = self
             .playback
             .duration
             .map_or(position, |duration| position.min(duration));
         self.playback.seek_target = Some(position);
         self.playback.position = position;
-        self.set_status(if forward {
-            "Seek forward 5 seconds"
+        let status = if forward {
+            format!("Seek forward {seconds} seconds")
         } else {
-            "Seek backward 5 seconds"
-        });
+            format!("Seek backward {seconds} seconds")
+        };
+        self.set_status(&status);
+        Some(PlaybackIntent::Seek {
+            generation: self.playback_generation,
+            position,
+        })
+    }
+
+    fn seek_absolute(
+        &mut self,
+        playback_generation: u64,
+        queue_instance: u64,
+        position: Duration,
+    ) -> Option<PlaybackIntent> {
+        if self.current_track_token() != Some((playback_generation, queue_instance)) {
+            return None;
+        }
+        if !matches!(
+            self.playback_status,
+            PlaybackStatus::Playing | PlaybackStatus::Paused
+        ) {
+            return None;
+        }
+        if self
+            .playback
+            .duration
+            .is_some_and(|duration| position > duration)
+        {
+            return None;
+        }
+        self.playback.seek_target = Some(position);
+        self.playback.position = position;
+        self.set_status("Seeked");
         Some(PlaybackIntent::Seek {
             generation: self.playback_generation,
             position,
@@ -1247,7 +1432,14 @@ impl AppState {
     }
 
     fn toggle_shuffle(&mut self) {
-        self.shuffle = !self.shuffle;
+        self.set_shuffle(!self.shuffle);
+    }
+
+    fn set_shuffle(&mut self, enabled: bool) {
+        if self.shuffle == enabled {
+            return;
+        }
+        self.shuffle = enabled;
         self.refresh_shuffle_order();
         self.set_status(if self.shuffle {
             "Shuffle: on"
@@ -1257,7 +1449,14 @@ impl AppState {
     }
 
     fn cycle_repeat(&mut self) {
-        self.repeat = self.repeat.next();
+        self.set_repeat(self.repeat.next());
+    }
+
+    fn set_repeat(&mut self, repeat: RepeatMode) {
+        if self.repeat == repeat {
+            return;
+        }
+        self.repeat = repeat;
         self.set_status(&format!("Repeat: {}", self.repeat.label()));
     }
 
@@ -2494,6 +2693,227 @@ mod tests {
                 muted: true,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn external_controls_use_exact_idempotent_app_actions() {
+        let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+        select_entry(&mut app, 0);
+        app.apply(AppAction::Activate)
+            .expect("idle Enter starts playback");
+        let queue_instance = app.queue[0].instance_id;
+        app.audio_event(AudioEvent::Started {
+            generation: 1,
+            timeline_revision: 1,
+            format: AudioFormat {
+                sample_rate: 48_000,
+                channels: 2,
+            },
+            duration: Some(Duration::from_secs(90)),
+            position: Duration::from_secs(20),
+        });
+
+        assert!(app.apply(AppAction::Play).is_none());
+        assert!(matches!(
+            app.apply(AppAction::Pause),
+            Some(PlaybackIntent::Pause { generation: 1 })
+        ));
+        app.audio_event(AudioEvent::Paused { generation: 1 });
+        assert!(app.apply(AppAction::Pause).is_none());
+        assert!(matches!(
+            app.apply(AppAction::Play),
+            Some(PlaybackIntent::Resume { generation: 1 })
+        ));
+
+        app.muted = true;
+        assert!(matches!(
+            app.apply(AppAction::SetVolume(37)),
+            Some(PlaybackIntent::SetGain {
+                generation: 1,
+                volume_percent: 37,
+                muted: false,
+            })
+        ));
+        assert_eq!(app.volume_percent, 37);
+        assert!(!app.muted);
+
+        app.apply(AppAction::SetShuffle(true));
+        app.apply(AppAction::SetShuffle(true));
+        assert!(app.shuffle);
+        app.apply(AppAction::RepeatOne);
+        assert_eq!(app.repeat, RepeatMode::One);
+        app.apply(AppAction::RepeatAll);
+        assert_eq!(app.repeat, RepeatMode::All);
+        app.apply(AppAction::RepeatOff);
+        assert_eq!(app.repeat, RepeatMode::Off);
+
+        assert!(matches!(
+            app.apply(AppAction::SeekRelative {
+                forward: false,
+                distance: Duration::from_secs(7),
+            }),
+            Some(PlaybackIntent::Seek { position, .. })
+                if position == Duration::from_secs(13)
+        ));
+        assert!(
+            app.apply(AppAction::SeekAbsolute {
+                playback_generation: 2,
+                queue_instance,
+                position: Duration::from_secs(30),
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn next_and_previous_preserve_paused_playback() {
+        let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+        select_entry(&mut app, 0);
+        app.apply(AppAction::Activate)
+            .expect("idle Enter starts playback");
+        select_entry(&mut app, 1);
+        assert!(app.apply(AppAction::Activate).is_none());
+        app.audio_event(AudioEvent::Started {
+            generation: 1,
+            timeline_revision: 1,
+            format: AudioFormat {
+                sample_rate: 48_000,
+                channels: 2,
+            },
+            duration: Some(Duration::from_secs(90)),
+            position: Duration::from_secs(20),
+        });
+        app.audio_event(AudioEvent::Paused { generation: 1 });
+
+        assert!(matches!(
+            app.apply(AppAction::Next),
+            Some(PlaybackIntent::Load {
+                generation: 2,
+                item,
+                paused: true,
+                ..
+            }) if item.entry_id == TrackEntryId(20)
+        ));
+        app.audio_event(AudioEvent::Started {
+            generation: 2,
+            timeline_revision: 1,
+            format: AudioFormat {
+                sample_rate: 48_000,
+                channels: 2,
+            },
+            duration: Some(Duration::from_secs(80)),
+            position: Duration::ZERO,
+        });
+        assert_eq!(app.playback_status, PlaybackStatus::Paused);
+
+        assert!(matches!(
+            app.apply(AppAction::Previous),
+            Some(PlaybackIntent::Load {
+                generation: 3,
+                item,
+                paused: true,
+                ..
+            }) if item.entry_id == TrackEntryId(10)
+        ));
+        app.audio_event(AudioEvent::Started {
+            generation: 3,
+            timeline_revision: 1,
+            format: AudioFormat {
+                sample_rate: 48_000,
+                channels: 2,
+            },
+            duration: Some(Duration::from_secs(90)),
+            position: Duration::ZERO,
+        });
+        assert_eq!(app.playback_status, PlaybackStatus::Paused);
+    }
+
+    #[test]
+    fn next_and_previous_only_select_tracks_while_stopped() {
+        let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+        select_entry(&mut app, 0);
+        app.apply(AppAction::Activate)
+            .expect("idle Enter starts playback");
+        select_entry(&mut app, 1);
+        assert!(app.apply(AppAction::Activate).is_none());
+        app.audio_event(AudioEvent::Stopped { generation: 1 });
+
+        assert!(app.apply(AppAction::Next).is_none());
+        assert_eq!(app.playback_status, PlaybackStatus::Stopped);
+        assert_eq!(app.queue_position(), Some(2));
+        assert!(app.apply(AppAction::Previous).is_none());
+        assert_eq!(app.playback_status, PlaybackStatus::Stopped);
+        assert_eq!(app.queue_position(), Some(1));
+    }
+
+    #[test]
+    fn relative_seek_beyond_the_end_advances_to_the_next_track() {
+        let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+        select_entry(&mut app, 0);
+        app.apply(AppAction::Activate)
+            .expect("idle Enter starts playback");
+        select_entry(&mut app, 1);
+        assert!(app.apply(AppAction::Activate).is_none());
+        app.audio_event(AudioEvent::Started {
+            generation: 1,
+            timeline_revision: 1,
+            format: AudioFormat {
+                sample_rate: 48_000,
+                channels: 2,
+            },
+            duration: Some(Duration::from_secs(10)),
+            position: Duration::from_secs(8),
+        });
+
+        assert!(matches!(
+            app.apply(AppAction::SeekRelative {
+                forward: true,
+                distance: Duration::from_secs(5),
+            }),
+            Some(PlaybackIntent::Load {
+                generation: 2,
+                item,
+                ..
+            }) if item.entry_id == TrackEntryId(20)
+        ));
+    }
+
+    #[test]
+    fn absolute_seek_beyond_the_duration_is_ignored() {
+        let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+        select_entry(&mut app, 0);
+        app.apply(AppAction::Activate)
+            .expect("idle Enter starts playback");
+        let queue_instance = app.queue[0].instance_id;
+        app.audio_event(AudioEvent::Started {
+            generation: 1,
+            timeline_revision: 1,
+            format: AudioFormat {
+                sample_rate: 48_000,
+                channels: 2,
+            },
+            duration: Some(Duration::from_secs(90)),
+            position: Duration::from_secs(20),
+        });
+
+        assert!(
+            app.apply(AppAction::SeekAbsolute {
+                playback_generation: 1,
+                queue_instance,
+                position: Duration::from_secs(91),
+            })
+            .is_none()
+        );
+        assert_eq!(app.playback_position(), Duration::from_secs(20));
+        assert!(matches!(
+            app.apply(AppAction::SeekAbsolute {
+                playback_generation: 1,
+                queue_instance,
+                position: Duration::from_secs(90),
+            }),
+            Some(PlaybackIntent::Seek { position, .. })
+                if position == Duration::from_secs(90)
         ));
     }
 

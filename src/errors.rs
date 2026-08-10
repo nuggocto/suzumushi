@@ -39,6 +39,9 @@ pub enum AppError {
     /// The owned decoder or output worker failed.
     #[error("audio failed: {0}")]
     Audio(String),
+    /// The owned desktop-control worker failed.
+    #[error("desktop controls failed: {0}")]
+    Mpris(String),
     /// A lock cannot be acquired or stored safely.
     #[error("lock unavailable: {0}")]
     Lock(String),

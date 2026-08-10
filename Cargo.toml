@@ -23,6 +23,7 @@ thiserror = { version = "=2.0.20", default-features = false }
 toml = { version = "=1.1.4", default-features = false, features = ["parse", "serde", "std"] }
 tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "std"] }
+zbus = { version = "=5.19.0", default-features = false, features = ["async-io", "blocking-api"] }
 
 [dev-dependencies]
 insta = { version = "=1.48.0", default-features = false }

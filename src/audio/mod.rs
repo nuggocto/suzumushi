@@ -72,6 +72,7 @@ pub enum AudioCommand {
         file: File,
         position: Duration,
         settings: PlaybackSettings,
+        paused: bool,
     },
     Pause {
         generation: u64,
@@ -446,7 +447,8 @@ impl<B: Backend> WorkerCore<B> {
                 file,
                 position,
                 settings,
-            } => self.play(generation, file, position, settings, events),
+                paused,
+            } => self.play(generation, file, position, settings, paused, events),
             AudioCommand::Pause { generation } => {
                 self.pause(generation, events, positions);
             }
@@ -483,6 +485,7 @@ impl<B: Backend> WorkerCore<B> {
         file: File,
         position: Duration,
         mut settings: PlaybackSettings,
+        paused: bool,
         events: &SyncSender<AudioEvent>,
     ) {
         settings.volume_percent = settings.volume_percent.min(100);
@@ -509,7 +512,7 @@ impl<B: Backend> WorkerCore<B> {
                     settings,
                     pending: None,
                     started: false,
-                    paused: false,
+                    paused,
                     ended: false,
                     base_position: position,
                     last_reported_position: position,
@@ -1307,6 +1310,7 @@ mod tests {
                 file: harmless_file(),
                 position,
                 settings: PlaybackSettings::default(),
+                paused: false,
             },
             &events,
             &positions,
@@ -1333,6 +1337,55 @@ mod tests {
     }
 
     #[test]
+    fn initially_paused_playback_waits_for_resume_before_starting_output() {
+        let format = AudioFormat {
+            sample_rate: 48_000,
+            channels: 2,
+        };
+        let (backend, fixture) = fixture_backend(VecDeque::from([
+            DecoderPoll::Ready(decoded(format)),
+            DecoderPoll::Samples(vec![0.1, -0.1]),
+        ]));
+        let mut core = WorkerCore::new(backend);
+        let (events, received) = sync_channel(4);
+        let positions = PositionLane::default();
+
+        core.command(
+            AudioCommand::Play {
+                generation: 8,
+                file: harmless_file(),
+                position: Duration::ZERO,
+                settings: PlaybackSettings::default(),
+                paused: true,
+            },
+            &events,
+            &positions,
+        )
+        .expect("load paused playback");
+        drive_steps(&mut core, &events, &positions, 4);
+
+        assert!(matches!(
+            received.try_recv(),
+            Ok(AudioEvent::Started { generation: 8, .. })
+        ));
+        assert_eq!(
+            fixture.calls.lock().expect("fake output calls").as_slice(),
+            ["prepare", "write"]
+        );
+
+        core.command(AudioCommand::Resume { generation: 8 }, &events, &positions)
+            .expect("resume paused playback");
+        assert_eq!(
+            received.try_recv().expect("resumed event"),
+            AudioEvent::Resumed { generation: 8 }
+        );
+        assert_eq!(
+            fixture.calls.lock().expect("fake output calls").as_slice(),
+            ["prepare", "write", "resume"]
+        );
+    }
+
+    #[test]
     fn fake_device_observes_ordered_play_pause_resume_and_stop() {
         let format = AudioFormat {
             sample_rate: 48_000,
@@ -1352,6 +1405,7 @@ mod tests {
                 file: harmless_file(),
                 position: Duration::ZERO,
                 settings: PlaybackSettings::default(),
+                paused: false,
             },
             &events,
             &positions,
@@ -1413,6 +1467,7 @@ mod tests {
                 file: harmless_file(),
                 position: Duration::ZERO,
                 settings: PlaybackSettings::default(),
+                paused: false,
             },
             &events,
             &positions,
@@ -1454,6 +1509,7 @@ mod tests {
                 file: harmless_file(),
                 position: Duration::ZERO,
                 settings: PlaybackSettings::default(),
+                paused: false,
             },
             &events,
             &positions,
@@ -1501,6 +1557,7 @@ mod tests {
                 file: harmless_file(),
                 position: Duration::ZERO,
                 settings: PlaybackSettings::default(),
+                paused: false,
             },
             &events,
             &positions,
@@ -1580,6 +1637,7 @@ mod tests {
                 file: harmless_file(),
                 position: Duration::ZERO,
                 settings: PlaybackSettings::default(),
+                paused: false,
             },
             &events,
             &positions,

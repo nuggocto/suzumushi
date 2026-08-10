@@ -87,6 +87,22 @@ selected result. If nothing is playing, it starts immediately.
 Held seek input keeps only the newest target, so releasing the arrow key resumes
 from the position shown instead of replaying obsolete intermediate seeks.
 
+## Desktop controls
+
+While the terminal player is open, Suzumushi exposes one standard MPRIS player.
+Desktop media keys and tools such as `playerctl` use the same play, pause, stop,
+next, previous, seek, volume, shuffle, and repeat actions as the terminal. For
+example:
+
+```sh
+playerctl --player=suzumushi play-pause
+playerctl --player=suzumushi next
+playerctl --player=suzumushi metadata
+```
+
+Only bounded text metadata is published. Suzumushi does not publish artwork or
+accept files and URLs through MPRIS.
+
 ## Terminal colors
 
 Suzumushi inherits the terminal's foreground, background, and named ANSI
@@ -108,8 +124,9 @@ automatic resampling are not current support claims.
 
 ## Status
 
-Version `0.3.0` is the released complete local library and player. The remaining
-work is MPRIS with global media keys, terminal polish with local installation,
-then the verified Linux release and `suzumushi-bin` AUR package.
+Version `0.3.0` is the released complete local library and player. The current
+checkout also includes MPRIS and global media keys. The remaining work is
+terminal polish with local installation, then the verified Linux release and
+`suzumushi-bin` AUR package.
 
 The full contract and roadmap live in [PROJECT.md](PROJECT.md).

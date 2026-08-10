@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added one MPRIS identity for the active terminal session with global media-key and `playerctl` control for playback, navigation, seeking, volume, shuffle, and repeat.
+- Added bounded text metadata and generation-aware track identities without artwork or file URLs.
+
+### Changed
+
+- Routed every desktop control through the existing app-owned actions and published app state through a capacity-one latest projection instead of creating a second playback state.
+
+### Fixed
+
+- Made the MPRIS worker release its D-Bus connection and join promptly when the terminal quits.
+- Preserved paused and stopped playback across MPRIS navigation, kept paused tracks pausable, advanced oversized relative seeks like Next, and ignored oversized absolute positions.
+- Made the CPAL stream lifecycle idempotent so consecutive navigation while paused cannot fail by pausing an inactive replacement stream.
+
 ## [0.3.0] - 2026-08-10
 
 ### Added

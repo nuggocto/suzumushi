@@ -24,6 +24,7 @@ use crate::config::{Config, TERMINAL_BUFFER_BYTES};
 use crate::errors::{AppError, AppResult};
 use crate::event::{AppEvent, EventSource};
 use crate::model::ScanIndex;
+use crate::mpris::{MprisProjection, MprisRuntime, REQUEST_CAPACITY};
 
 const STATE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -49,21 +50,36 @@ pub fn run(
     let mut state_sync = StateSynchronizer::default();
     state_sync.sync(&app, &mut state_store, Duration::ZERO)?;
     let audio = AudioRuntime::start()?;
+    let mpris = match MprisRuntime::start(MprisProjection::from_app(&app)) {
+        Ok(runtime) => Some(runtime),
+        Err(error) => {
+            tracing::warn!(%error, "desktop controls unavailable");
+            app.desktop_controls_unavailable(&error.to_string());
+            None
+        }
+    };
     let session_result = run_terminal_session(
         root,
         initial_area,
         &mut app,
         &audio,
+        mpris.as_ref(),
         &mut state_store,
         &mut state_sync,
     );
     let audio_result = audio.shutdown();
+    app.session_stopped();
+    let mpris_result = mpris.map_or(Ok(()), |runtime| {
+        runtime
+            .publish(MprisProjection::from_app(&app))
+            .and_then(|()| runtime.shutdown())
+    });
     finish_session(
         &mut app,
         &mut state_store,
         &mut state_sync,
         session_result,
-        audio_result,
+        combine_results(audio_result, mpris_result),
     )
 }
 
@@ -84,6 +100,7 @@ fn run_terminal_session(
     initial_area: Rect,
     app: &mut AppState,
     audio: &AudioRuntime,
+    mpris: Option<&MprisRuntime>,
     state_store: &mut crate::state::StateStore,
     state_sync: &mut StateSynchronizer,
 ) -> AppResult<()> {
@@ -99,6 +116,8 @@ fn run_terminal_session(
 
     while !app.should_quit {
         drain_audio_events(app, root, audio)?;
+        drain_mpris_actions(app, root, audio, mpris)?;
+        publish_mpris(app, mpris)?;
         state_sync.sync(app, state_store, event_time)?;
         terminal
             .draw(|frame| {
@@ -119,6 +138,7 @@ fn run_terminal_session(
         if let Some(intent) = apply_event(app, event) {
             dispatch_playback(app, root, audio, intent)?;
         }
+        publish_mpris(app, mpris)?;
         state_sync.sync(app, state_store, event_time)?;
     }
 
@@ -127,6 +147,32 @@ fn run_terminal_session(
         .map_err(|error| AppError::io("show terminal cursor", "terminal", error))?;
     drop(terminal);
     guard.restore()
+}
+
+fn drain_mpris_actions(
+    app: &mut AppState,
+    root: BorrowedFd<'_>,
+    audio: &AudioRuntime,
+    mpris: Option<&MprisRuntime>,
+) -> AppResult<()> {
+    let Some(mpris) = mpris else {
+        return Ok(());
+    };
+    for _ in 0..REQUEST_CAPACITY {
+        let Some(action) = mpris.try_action() else {
+            break;
+        };
+        if let Some(intent) = app.apply(action) {
+            dispatch_playback(app, root, audio, intent)?;
+        }
+    }
+    Ok(())
+}
+
+fn publish_mpris(app: &AppState, mpris: Option<&MprisRuntime>) -> AppResult<()> {
+    mpris.map_or(Ok(()), |runtime| {
+        runtime.publish(MprisProjection::from_app(app))
+    })
 }
 
 #[derive(Default)]
@@ -294,6 +340,7 @@ fn dispatch_playback(
             item,
             position,
             settings,
+            paused,
         } => {
             let opened = app
                 .media_for_item(item)
@@ -305,6 +352,7 @@ fn dispatch_playback(
                     file,
                     position,
                     settings,
+                    paused,
                 },
                 Err(error) => {
                     let _ = app.audio_event(AudioEvent::Failed {

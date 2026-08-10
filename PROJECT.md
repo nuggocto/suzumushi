@@ -13,7 +13,8 @@ into the player and reacts only to playback state.
 
 Version `0.3.0` is released. It contains the complete local library, search,
 queue browser, and playback controls on the safe root, scanner, metadata,
-terminal, logging, test, fuzz, and CI foundation.
+terminal, logging, test, fuzz, and CI foundation. The current checkout adds
+MPRIS and global media-key support for the active terminal session.
 
 ```text
 +------------------+----------------------------------------+------------------+
@@ -26,7 +27,8 @@ terminal, logging, test, fuzz, and CI foundation.
 +------------------------------------------------------------------------------+
 ```
 
-The complete local player is implemented. The next work is Phase 7.
+The complete local player and its desktop controls are implemented. The next
+work is Phase 8.
 
 ## Product contract
 
@@ -139,8 +141,9 @@ are coalesced instead of queueing decoder restarts.
 - The session retains the selected root descriptor and filesystem identity.
   Config, locking, scanning, logging, and state files are opened relative
   to that descriptor.
-- The future MPRIS adapter will route D-Bus requests into the existing app-owned
-  playback actions. It will not create a second playback state.
+- The single MPRIS worker owns the session-bus connection. It sends fixed-size
+  actions into the app loop and receives a capacity-one latest projection. The
+  app remains the only owner of queue, repeat, shuffle, and playback truth.
 - Suzu's frame is derived from the app-owned playback status and the terminal's
   existing monotonic tick. It uses no worker, decoder data, media artwork, or
   additional dependency.
@@ -154,7 +157,7 @@ on color alone for focus or state.
 ## Safety boundaries
 
 Local does not mean trusted. Media, metadata, filenames, configuration, state,
-filesystem entries, and later D-Bus arguments are bounded before allocation or
+filesystem entries, and D-Bus arguments are bounded before allocation or
 expensive work.
 
 - Application Rust forbids `unsafe`.
@@ -163,8 +166,16 @@ expensive work.
   no-follow access where identity matters.
 - The current-UID active TUI lock lives below verified `$XDG_RUNTIME_DIR`.
   There is no `/tmp` fallback and stale files are never blindly deleted.
-- Terminal, JSON, file URI, and later D-Bus values each receive bounded
-  validation or escaping appropriate to their destination.
+- Terminal, JSON, file URI, and D-Bus values each receive bounded validation or
+  escaping appropriate to their destination.
+- MPRIS accepts only fixed-size control values through a 32-item non-blocking
+  request lane. Absolute seeks must match the current app-owned playback
+  generation and queue instance. Invalid or stale track paths are ignored,
+  non-finite volume values are rejected, and `OpenUri` remains unsupported.
+- MPRIS publishes at most 1 KiB each for title and creator after replacing
+  control characters. It exposes no file URI, artwork URL, or second playback
+  state. The pure-Rust `zbus 5.19.0` dependency is exact-version pinned with
+  only its async-I/O and blocking API features.
 - Known dependency advisories are denied. `RUSTSEC-2024-0436` is temporarily
   accepted because it reports unmaintained `paste 1.0.15`, reached only through
   Lofty, not a vulnerability. Review or remove the exception by 2026-11-09.
@@ -287,21 +298,34 @@ audio-device PTY check.
 
 ### Phase 7: MPRIS and global media keys
 
-**Status:** next
+**Status:** complete
 
-- Add one MPRIS identity on the winning terminal session.
-- Route global media keys and `playerctl` through normal app actions.
-- Validate stale track IDs and playback generations for seeking.
-- Publish bounded text metadata only.
+- [x] Add one MPRIS identity on the winning terminal session.
+- [x] Route global media keys and `playerctl` through normal app actions.
+- [x] Validate stale track IDs and playback generations for seeking.
+- [x] Publish bounded text metadata only.
+- [x] Preserve paused and stopped playback across desktop navigation, keep
+  paused tracks pausable, and follow the MPRIS relative and absolute seek
+  boundary rules.
 
 Done when play, pause, stop, next, previous, seek, volume, and metadata work
 through MPRIS and global media keys without a second playback state.
+
+Verified with exact and idempotent app-action tests; paused and stopped
+navigation, seek-boundary, and track-level pause-capability tests; bounded
+request-lane, track-path, hostile-text, metadata, volume, and seek conversion
+tests; the full `mise run ci` sequence; and a private session-bus PTY journey
+using the production binary and
+`playerctl` for play, pause, stop, paused and stopped navigation, absolute and
+relative seek boundaries, volume, shuffle, repeat, metadata, and MPRIS Quit.
+The journey also confirmed that the terminal restores, consecutive paused
+navigation releases CPAL streams cleanly, and the MPRIS worker exits cleanly.
 
 **Milestone:** desktop controls, planned `0.4.0`.
 
 ### Phase 8: terminal polish and local installation
 
-**Status:** not started
+**Status:** next
 
 - Finish empty, loading, warning, error, help, and small-terminal states.
 - Keep the three-panel layout calm and useful at 80x24 and wider sizes.
