@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-10
+
 ### Added
 
 - Initial Rust package with a canonical `suzumushi` command and library target.
@@ -43,7 +45,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bounded both terminal cell buffers before initial allocation and resize, with clean restoration when a reported terminal size exceeds the UI reservation.
 - Required initialization to verify and acquire the root writer lease before repairing an existing root.
 - Reserved the terminal session's five-descriptor startup peak before opening locks or log storage.
-
-### Removed
-
-- Simplified initialized roots, configuration, diagnostics, scanning, the terminal layout, and the roadmap to the smaller v1 scope.
+- Disabled embedded cover-art parsing during text-only metadata scans.
+- Kept the selected root descriptor and filesystem identity pinned across configuration, locking, scanning, and logging for the whole command or terminal session.

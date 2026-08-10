@@ -105,14 +105,14 @@ where
 
 fn terminal_session(explicit: Option<&Path>, current_dir: &Path) -> AppResult<()> {
     let selected = paths::discover_root(explicit, current_dir)?;
-    let config = config::load(&selected.path)?;
-    app::run(&selected.path, &config)
+    let config = config::load_from(selected.descriptor(), &selected.path)?;
+    app::run(&selected, &config)
 }
 
 fn diagnose(explicit: Option<&Path>, current_dir: &Path) -> AppResult<()> {
     let selected = paths::discover_root(explicit, current_dir)?;
-    let config = config::load(&selected.path)?;
-    let index = scan::scan(&selected.path, &config, 1)?;
+    let config = config::load_from(selected.descriptor(), &selected.path)?;
+    let index = scan::scan_from(selected.descriptor(), &selected.path, &config, 1)?;
     println!(
         "root: {}",
         safe_path(&selected.path, config.runtime.status_text_max_bytes)

@@ -10,6 +10,7 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
+use rustix::fd::AsFd;
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::process::getuid;
 use tracing_subscriber::fmt::MakeWriter;
@@ -86,7 +87,27 @@ impl LoggingReport {
 /// Returns an error for unsafe storage, rotation failure, or an existing global
 /// tracing subscriber.
 pub fn initialize(root: &Path, config: &LoggingConfig) -> AppResult<LoggingGuard> {
-    let writer = RotatingWriter::open(root, config.max_file_bytes, config.max_files)?;
+    let root_fd = rustix::fs::open(
+        root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| AppError::io("open root for logging", root, error.into()))?;
+    initialize_from(&root_fd, root, config)
+}
+
+/// Installs logging beneath an already pinned session root.
+///
+/// # Errors
+///
+/// Returns an error for unsafe storage, rotation failure, or an existing global
+/// tracing subscriber.
+pub fn initialize_from<Fd: AsFd>(
+    root_fd: Fd,
+    root: &Path,
+    config: &LoggingConfig,
+) -> AppResult<LoggingGuard> {
+    let writer = RotatingWriter::open_from(root_fd, root, config.max_file_bytes, config.max_files)?;
     let current_path = writer.current_path();
     let write_failed = Arc::new(AtomicBool::new(false));
     let (queue, receiver) = LogQueue::new(config.queue_capacity, Arc::clone(&write_failed));
@@ -282,16 +303,15 @@ struct RotatingWriter {
 }
 
 impl RotatingWriter {
-    fn open(root: &Path, max_file_bytes: usize, max_files: usize) -> AppResult<Self> {
-        let root_fd = rustix::fs::open(
-            root,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(|error| AppError::io("open root for logging", root, error.into()))?;
+    fn open_from<Fd: AsFd>(
+        root_fd: Fd,
+        root: &Path,
+        max_file_bytes: usize,
+        max_files: usize,
+    ) -> AppResult<Self> {
         let directory_path = root.join("logs");
         let directory_fd = rustix::fs::openat(
-            &root_fd,
+            root_fd,
             "logs",
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),

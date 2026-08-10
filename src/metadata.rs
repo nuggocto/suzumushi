@@ -252,7 +252,11 @@ fn apply_helper_limits() -> Result<(), String> {
 fn parse_reader<R: Read + Seek>(reader: R) -> Result<TrackTags, String> {
     let reader = BudgetedReader::new(reader)?;
     let tagged = Probe::new(BufReader::new(reader))
-        .options(ParseOptions::new().read_properties(false))
+        .options(
+            ParseOptions::new()
+                .read_properties(false)
+                .read_cover_art(false),
+        )
         .guess_file_type()
         .map_err(|error| error.to_string())?
         .read()

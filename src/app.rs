@@ -3,13 +3,13 @@
 //! App-owned terminal state and session lifecycle.
 
 use std::io;
-use std::path::Path;
 use std::time::Duration;
 
 use crate::config::Config;
 use crate::errors::{AppError, AppResult};
 use crate::input::{AppAction, InputState};
 use crate::locks::{ActiveTuiLease, RootMutationLease};
+use crate::paths::SelectedRoot;
 use crate::terminal_capabilities::ImageProtocol;
 
 const TUI_STARTUP_OPEN_FILES_PEAK: usize = 5;
@@ -117,11 +117,11 @@ impl AppState {
 /// # Errors
 ///
 /// Returns a typed startup, logging, terminal, or event-loop error.
-pub fn run(root: &Path, config: &Config) -> AppResult<()> {
+pub fn run(root: &SelectedRoot, config: &Config) -> AppResult<()> {
     reserve_startup_open_files(config.runtime.max_open_files)?;
     let _active_lease = ActiveTuiLease::acquire()?;
-    let _root_lease = RootMutationLease::acquire(root)?;
-    let logging = crate::logging::initialize(root, &config.logging)?;
+    let _root_lease = RootMutationLease::acquire_from(root.descriptor(), &root.path)?;
+    let logging = crate::logging::initialize_from(root.descriptor(), &root.path, &config.logging)?;
     tracing::info!("terminal session starting");
     let result = crate::terminal::run(config);
     if result.is_ok() {

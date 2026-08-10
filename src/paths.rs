@@ -3,8 +3,8 @@
 //! Root selection and the app-owned directory model.
 
 use std::env;
-use std::fs;
-use std::os::fd::AsRawFd;
+use std::fs::{self, File};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::path::{Path, PathBuf};
 
 use crate::errors::{AppError, AppResult};
@@ -20,13 +20,31 @@ pub enum RootSource {
     WorkingDirectory,
 }
 
-/// A selected, canonical root and its source.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Stable filesystem identity of the selected root descriptor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RootIdentity {
+    pub device: u64,
+    pub inode: u64,
+}
+
+/// A selected root pinned for the lifetime of one command or terminal session.
+#[derive(Debug)]
 pub struct SelectedRoot {
     /// Canonical filesystem path.
     pub path: PathBuf,
     /// Winning precedence source.
     pub source: RootSource,
+    /// Identity captured from the verified descriptor.
+    pub identity: RootIdentity,
+    descriptor: File,
+}
+
+impl SelectedRoot {
+    /// Borrows the descriptor that all root-relative session work must use.
+    #[must_use]
+    pub fn descriptor(&self) -> BorrowedFd<'_> {
+        self.descriptor.as_fd()
+    }
 }
 
 /// All paths owned by one Suzumushi root.
@@ -136,7 +154,7 @@ fn validate_selected(path: &Path, source: RootSource) -> AppResult<SelectedRoot>
         path: path.to_path_buf(),
         reason: error.to_string(),
     })?;
-    rustix::fs::openat(
+    let audio_fd = rustix::fs::openat(
         &root_fd,
         "audio",
         rustix::fs::OFlags::RDONLY
@@ -149,6 +167,11 @@ fn validate_selected(path: &Path, source: RootSource) -> AppResult<SelectedRoot>
         path: path.to_path_buf(),
         reason: format!("audio must be a real readable directory: {error}"),
     })?;
+    drop(audio_fd);
+    let stat = rustix::fs::fstat(&root_fd).map_err(|error| AppError::InvalidRoot {
+        path: path.to_path_buf(),
+        reason: format!("cannot inspect the verified root descriptor: {error}"),
+    })?;
     let canonical =
         fs::read_link(format!("/proc/self/fd/{}", root_fd.as_raw_fd())).map_err(|error| {
             AppError::InvalidRoot {
@@ -159,5 +182,10 @@ fn validate_selected(path: &Path, source: RootSource) -> AppResult<SelectedRoot>
     Ok(SelectedRoot {
         path: canonical,
         source,
+        identity: RootIdentity {
+            device: stat.st_dev,
+            inode: stat.st_ino,
+        },
+        descriptor: File::from(root_fd),
     })
 }

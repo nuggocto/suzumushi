@@ -5,10 +5,10 @@ surface. Each run uses a fresh local temporary directory and removes it from the
 workspace after evidence is checked.
 
 Last verdict: **PASS** on 2026-08-10 (Europe/Paris), from the working tree based
-on commit `ac1580401800` on branch `shrek`. `mise run ci` passed from this tree with
-Rust 1.97.1, the Rust 1.95.0 MSRV, dependency policy checks, 62 automated tests,
+on commit `1259e59d12c7` on branch `shrek`. `mise run ci` passed from this tree with
+Rust 1.97.1, the Rust 1.95.0 MSRV, dependency policy checks, 63 automated tests,
 and all five bounded fuzz smoke targets. The tested debug executable SHA-256 was
-`346ff5b927db8df5662e407d7f4d20dde62a44a85cdf96994281d8a8ab372153`.
+`9663a241d47300da257eb0e97e5bd63535397924e03840d84987fbb25cf1a72b`.
 The terminal flow uses that real executable attached to an 80x24 pseudo-terminal;
 test-only roots, runtime storage, logs, and terminal descriptors are removed
 when the case ends.
@@ -45,6 +45,7 @@ the dedicated `fuzz/` targets.
 | `SUZU-QA-LOG-003` | Hold a background write, start logging shutdown, and require the guard to remain pending until the owned worker is released and joined | PASS (automated) |
 | `SUZU-QA-LOCK-002` | Start a second terminal identity while the first is active, then exercise normal exit, startup error, and unwinding panic; require both active-TUI and root leases to release on every destructor path | PASS |
 | `SUZU-QA-FD-001` | Set `runtime.max_open_files` below the five-descriptor terminal startup peak; require refusal before runtime storage, leases, or a log file are opened | PASS (automated) |
+| `SUZU-QA-ROOT-002` | Select a root, rename it, replace its old path with another valid root, then load config and scan; require both operations to remain on the selected descriptor and identity | PASS (automated) |
 
 Physical audio devices, playback, packaged artifacts, network syscall
 observation, and later desktop/status/mutation surfaces are not present and are

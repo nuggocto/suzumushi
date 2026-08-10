@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fs;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::Path;
 
 use suzumushi::errors::AppError;
 use suzumushi::init::initialize;
 use suzumushi::locks::RootMutationLease;
 use suzumushi::paths::{RootSource, discover_root_from};
+use suzumushi::{config, scan};
 use tempfile::TempDir;
 
 fn mode(path: &Path) -> u32 {
@@ -184,4 +185,34 @@ fn root_precedence_never_falls_through_an_invalid_higher_source() {
         discover_root_from(Some(&linked), None, empty.path()),
         Err(AppError::InvalidRoot { .. })
     ));
+}
+
+#[test]
+fn selected_root_stays_pinned_when_its_path_is_replaced() {
+    let temp = TempDir::new().expect("temporary directory");
+    let root = temp.path().join("root");
+    let original = initialize(&root).expect("initialize original root");
+    fs::write(original.library.join("original.mp3"), b"").expect("write original media fixture");
+    let original_config = config::DEFAULT_CONFIG.replacen("max_files = 50000", "max_files = 1", 1);
+    fs::write(&original.config, original_config).expect("write distinctive original config");
+    let selected =
+        discover_root_from(Some(&root), None, temp.path()).expect("select original root");
+
+    let held = temp.path().join("held-root");
+    fs::rename(&root, &held).expect("move selected root aside");
+    let replacement = initialize(&root).expect("initialize replacement root");
+    fs::write(replacement.library.join("replacement.mp3"), b"")
+        .expect("write replacement media fixture");
+
+    let held_metadata = fs::metadata(&held).expect("inspect held root");
+    assert_eq!(selected.identity.device, held_metadata.dev());
+    assert_eq!(selected.identity.inode, held_metadata.ino());
+    let loaded = config::load_from(selected.descriptor(), &selected.path)
+        .expect("load config through selected descriptor");
+    assert_eq!(loaded.scan.max_files, 1);
+    let index = scan::scan_from(selected.descriptor(), &selected.path, &loaded, 1)
+        .expect("scan through selected descriptor");
+    assert_eq!(index.entries.len(), 1);
+    assert_eq!(index.entries[0].search.filename, "original");
+    assert_ne!(index.entries[0].search.filename, "replacement");
 }

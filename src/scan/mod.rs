@@ -151,6 +151,30 @@ pub fn scan(root: &Path, config: &Config, generation: u64) -> AppResult<ScanInde
     scan_with_options(root, config, generation, ScanOptions::default())
 }
 
+/// Scans relative to an already pinned session root descriptor.
+///
+/// # Errors
+///
+/// Returns an error when reservation or descriptor traversal cannot be established.
+pub fn scan_from<Fd: AsFd>(
+    root_file: Fd,
+    root: &Path,
+    config: &Config,
+    generation: u64,
+) -> AppResult<ScanIndex> {
+    let mut reader = metadata::HelperMetadataReader;
+    let mut observer = NoopObserver;
+    scan_with_components_from(
+        root_file,
+        root,
+        config,
+        generation,
+        ScanOptions::default(),
+        &mut reader,
+        &mut observer,
+    )
+}
+
 /// Scans one root with explicit instrumentation seams.
 ///
 /// # Errors
@@ -187,7 +211,6 @@ pub fn scan_with_components(
     reader: &mut dyn metadata::MetadataReader,
     observer: &mut dyn ScanObserver,
 ) -> AppResult<ScanIndex> {
-    reserve_replacement(config, options.active_index_bytes)?;
     let root_file = rustix::fs::open(
         root,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
@@ -195,9 +218,23 @@ pub fn scan_with_components(
     )
     .map(File::from)
     .map_err(|error| AppError::io("open scan root", root, error.into()))?;
-    let audio_fd = open_direct_directory(&root_file, OsStr::new("audio"), false)
+    scan_with_components_from(
+        &root_file, root, config, generation, options, reader, observer,
+    )
+}
+
+fn scan_with_components_from<Fd: AsFd>(
+    root_file: Fd,
+    root: &Path,
+    config: &Config,
+    generation: u64,
+    options: ScanOptions,
+    reader: &mut dyn metadata::MetadataReader,
+    observer: &mut dyn ScanObserver,
+) -> AppResult<ScanIndex> {
+    reserve_replacement(config, options.active_index_bytes)?;
+    let audio_fd = open_direct_directory(root_file, OsStr::new("audio"), false)
         .map_err(|error| AppError::io("open audio root", root.join("audio"), error.into()))?;
-    drop(root_file);
     let root_device = options.root_device_override.unwrap_or(
         rustix::fs::fstat(&audio_fd)
             .map_err(|error| AppError::io("inspect audio root", root.join("audio"), error.into()))?
