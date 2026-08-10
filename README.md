@@ -5,7 +5,8 @@ audio from folders, searches it, builds a queue, and plays it. There is no
 account, database, streaming service, or network access.
 
 The interface has three panels: Library, Player, and Queue. It follows the
-terminal's own colors and stays out of the way.
+terminal's own colors and stays out of the way. Suzu, the small bell-cricket
+mascot, dances in the Player while audio is playing and rests when it is not.
 
 ## Install the current checkout
 

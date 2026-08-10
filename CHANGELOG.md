@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added volume, mute, five-second seeking, progress, shuffle, and repeat off/queue/one.
 - Added a bounded, private, versioned `state/now-playing.json` playback projection.
 - Added bounded automatic restoration of the last Queue, current track, and playback position in a paused state.
+- Added an original terminal-native Suzu animation that dances during playback and rests in every non-playing state.
 
 ### Changed
 
@@ -31,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Made Enter start a newly queued selection when playback is idle while retaining normal append behavior during playback.
 - Made next, previous, shuffle, and repeat controls permanently visible in the terminal footer.
 - Made repeat control permanently visible and named whole-Queue repetition `queue`.
+- Omitted the creator line when a track has no artist or album-artist metadata.
 
 ### Fixed
 

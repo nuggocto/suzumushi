@@ -6,7 +6,8 @@ terminal.
 
 The project is intentionally personal and simple. It has no album artwork,
 terminal image protocol, visualizer, tag editor, database, account, cloud
-service, or network feature.
+service, or network feature. Suzu's small terminal-native animation is compiled
+into the player and reacts only to playback state.
 
 ## Current status
 
@@ -18,7 +19,7 @@ scanner, metadata, terminal, logging, test, fuzz, and CI foundation.
 +------------------+----------------------------------------+------------------+
 |     Library      |                 Player                 |      Queue       |
 | folders, tracks  |     title, creator, progress, time     |  ordered tracks  |
-| playlists/search |          volume, playback state        | and queue edits  |
+| playlists/search |        volume, state, dancing Suzu     | and queue edits  |
 +------------------+----------------------------------------+------------------+
 | q quit   Tab focus   / search   Enter add   Up/Down move                     |
 | Space play/pause  s stop  n next  p previous  x shuffle  r repeat             |
@@ -37,6 +38,8 @@ The complete local player is implemented. The next work is Phase 7.
 - Copied files and file symlinks in playlists.
 - Library browsing, local search, and a bounded queue.
 - Play, pause, stop, next, previous, seek, volume, mute, shuffle, and repeat.
+- An original fixed-size Suzu character animation in the Player. Suzu dances
+  only while audio is playing and returns to one calm resting frame otherwise.
 - Automatic restoration of the last non-empty queue, current track, and
   playback position. Restored sessions remain paused until the user presses
   Space.
@@ -50,7 +53,7 @@ The complete local player is implemented. The next work is Phase 7.
 
 - Album covers, embedded picture extraction, artwork caches, Kitty, Sixel,
   iTerm2 image support, and `mpris:artUrl`.
-- Audio visualizers and decorative playback effects.
+- PCM-reactive visualizers and decorative effects derived from audio data.
 - Tag editing, batch marking, backup journals, and media-file mutation.
 - Lyrics, streaming services, RSS, downloads, accounts, cloud sync, remote
   control, and any IPv4 or IPv6 runtime access.
@@ -58,8 +61,9 @@ The complete local player is implemented. The next work is Phase 7.
 - Waybar, tmux, and Zellij status renderers.
 - Desktop notifications.
 
-The mascot remains part of the project identity. It belongs in release assets
-and the future landing page, not in the terminal playback path.
+The mascot remains part of the project identity. Her small original terminal
+animation ships with the player; richer mascot art belongs in release assets
+and the future landing page.
 
 ## Filesystem model
 
@@ -111,6 +115,9 @@ Search is modal and ASCII-case-insensitive. Each query update uses a linear-time
 matcher over the retained bounded fields. While search is open, `q` remains
 query text; `Esc` closes search and `Ctrl+c` quits globally.
 
+The Player shows artist or album-artist metadata when present. Missing creator
+metadata is omitted rather than replaced with a placeholder.
+
 ## Architecture
 
 - The terminal loop exclusively owns `AppState`, focus, library selection,
@@ -129,6 +136,9 @@ query text; `Esc` closes search and `Ctrl+c` quits globally.
   to that descriptor.
 - The future MPRIS adapter will route D-Bus requests into the existing app-owned
   playback actions. It will not create a second playback state.
+- Suzu's frame is derived from the app-owned playback status and the terminal's
+  existing monotonic tick. It uses no worker, decoder data, media artwork, or
+  additional dependency.
 - `src/main.rs` remains thin. Behavior exposed to integration tests lives in
   the library target. A module is added only with its first real behavior.
 
@@ -247,6 +257,8 @@ against the local PipeWire-backed Linux output device.
 - [x] Write the bounded, versioned `state/now-playing.json` projection.
 - [x] Restore the last queue, current track, and position without starting
   playback automatically.
+- [x] Add the original terminal-native Suzu animation with a deterministic
+  resting frame and bounded playing loop.
 
 Done when the terminal is a complete local player and position remains correct
 through pause, seek, next, previous, end of track, and a clean close/reopen
@@ -257,8 +269,8 @@ cross-lane ordering tests; preroll-free accurate seeking through every verified
 container; deterministic fake-device gain, restart, position, and drain tests;
 bounded escaped-state, atomic replacement, heartbeat, and failure-cleanup tests;
 bounded resume-state parsing, stale-entry recovery, clear-state, and
-resume-position tests;
-reviewed 80x24 and 120x32 snapshots; the full `mise run ci` sequence; a PTY
+resume-position tests; deterministic playback-state animation tests; reviewed
+Suzu cycle, 80x24, and 120x32 snapshots; the full `mise run ci` sequence; a PTY
 search, queue, state-file, and close/reopen journey; and the real Linux
 audio-device PTY check.
 
@@ -320,8 +332,11 @@ character is quiet, cozy, and unhurried, usually pictured on a windowsill or a
 curled leaf beneath a low warm lamp.
 
 Suzu belongs to the project's identity, release assets, and website. The mascot
-does not add artwork, animation, a visualizer, or decorative image behavior to
-the terminal player.
+also appears in the terminal as original fixed-size character art. The Player
+advances Suzu through a small loop only while audio is playing and immediately
+returns to the resting frame while paused, stopped, loading, or failed. This is
+not an audio visualizer: it never receives PCM, volume, frequency, or media
+artwork data.
 
 After v1, create `suzumushi-front` as a separate static Astro repository for
 `suzumushi.org`, deployed on Cloudflare Pages. Keep the mascot and the calm

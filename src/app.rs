@@ -465,10 +465,9 @@ impl AppState {
                     .as_deref()
                     .or(asset.tags.album_artist.as_deref())
             })
-            .map_or_else(
-                || "Unknown creator".into(),
-                |creator| terminal_safe(creator.as_bytes(), max_bytes),
-            )
+            .map_or_else(String::new, |creator| {
+                terminal_safe(creator.as_bytes(), max_bytes)
+            })
     }
 
     #[must_use]
@@ -494,10 +493,7 @@ impl AppState {
             .artist
             .as_deref()
             .or(asset.tags.album_artist.as_deref())
-            .map_or_else(
-                || "Unknown creator".into(),
-                |creator| bounded_text(creator, max_bytes),
-            );
+            .map_or_else(String::new, |creator| bounded_text(creator, max_bytes));
         (title, creator)
     }
 
@@ -2070,6 +2066,19 @@ mod tests {
         assert_eq!(app.focus, Focus::Player);
         app.apply(AppAction::FocusPrevious);
         assert_eq!(app.focus, Focus::Library);
+    }
+
+    #[test]
+    fn missing_creator_metadata_is_omitted() {
+        let mut index = fixture_index();
+        index.assets[0].tags.artist = None;
+        index.assets[0].tags.album_artist = None;
+        let mut app = AppState::new(&Config::default(), index).expect("app state");
+        app.apply(AppAction::Activate)
+            .expect("untagged fixture starts");
+
+        assert_eq!(app.player_creator(80), "");
+        assert_eq!(app.state_identity(80).1, "");
     }
 
     #[test]

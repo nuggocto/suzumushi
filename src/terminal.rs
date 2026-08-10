@@ -103,7 +103,7 @@ fn run_terminal_session(
         terminal
             .draw(|frame| {
                 app.terminal_size = (frame.area().width, frame.area().height);
-                crate::ui::render(frame, app);
+                crate::ui::render(frame, app, event_time);
             })
             .map_err(|error| AppError::io("draw terminal", "terminal", error))?;
         let leader_deadline = app.input.deadline();

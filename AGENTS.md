@@ -22,8 +22,9 @@
   files, or inotify in v1.
 - Keep MPRIS and global media-key support. Do not add status renderers or
   desktop notifications.
-- Keep the mascot and future `suzumushi-front` website separate from this Rust
-  repository.
+- Keep Suzu's original fixed-size terminal animation compiled into this Rust
+  repository. Do not add downloaded animation assets, Lottie, or image
+  protocols. Keep the future `suzumushi-front` website separate.
 - Publish only `suzumushi-bin` to AUR from verified release artifacts.
 
 ## Rust and repository shape
@@ -75,6 +76,9 @@
   work, takes locks, or sends on a blocking channel.
 - MPRIS routes D-Bus requests through the existing app-owned actions. It does
   not create a second playback state.
+- Suzu's terminal frame derives only from app-owned playback status and the
+  existing monotonic terminal tick. Non-playing states always render frame zero;
+  the audio worker and callback never receive animation work.
 
 ## Filesystem and parser safety
 

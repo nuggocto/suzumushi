@@ -3,13 +3,16 @@
 //! Calm library, player, and queue interface with visible keyboard focus.
 
 pub mod layout;
+mod mascot;
 pub mod status;
 
 use std::os::unix::ffi::OsStrExt;
+use std::time::Duration;
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::Line;
 use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::app::{AppState, BrowserRow, ColorMode, Focus, PlaybackStatus, normal_component};
@@ -19,7 +22,7 @@ const MIN_WIDTH: u16 = 80;
 const MIN_HEIGHT: u16 = 24;
 const MAX_ROW_TEXT_BYTES: usize = 4_096;
 
-pub fn render(frame: &mut Frame<'_>, app: &AppState) {
+pub fn render(frame: &mut Frame<'_>, app: &AppState, animation_time: Duration) {
     let area = frame.area();
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         frame.render_widget(
@@ -34,7 +37,7 @@ pub fn render(frame: &mut Frame<'_>, app: &AppState) {
 
     let panels = layout::panels(area);
     render_library(frame, panels.library, app);
-    render_player(frame, panels.player, app);
+    render_player(frame, panels.player, app, animation_time);
     render_queue(frame, panels.queue, app);
     status::render(frame, panels.status, app);
 }
@@ -68,7 +71,7 @@ fn render_library(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn render_player(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
+fn render_player(frame: &mut Frame<'_>, area: Rect, app: &AppState, animation_time: Duration) {
     let max_bytes = row_text_max_bytes(area);
     let title = app.player_title(max_bytes);
     let creator = app.player_creator(max_bytes);
@@ -96,16 +99,37 @@ fn render_player(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         if app.shuffle { "on" } else { "off" },
         app.repeat.label(),
     );
-    let format = app.playback_format().map_or_else(String::new, |format| {
-        format!("\n{} Hz  {} ch", format.sample_rate, format.channels)
-    });
-    let creator = if creator.is_empty() {
-        String::new()
-    } else {
-        format!("\n{creator}")
-    };
-    let content =
-        format!("{title}{creator}\n\n{timeline}\n\nState: {state}\n{volume}\n{modes}{format}");
+    let mut content = Vec::with_capacity(18);
+    content.push(Line::from(title));
+    if !creator.is_empty() {
+        content.push(Line::from(creator));
+    }
+    content.push(Line::default());
+    content.extend(mascot::lines(
+        app.playback_status,
+        animation_time,
+        app.color_mode,
+    ));
+    content.push(Line::default());
+    content.push(Line::from(timeline));
+    content.push(Line::default());
+    content.push(Line::from(format!("State: {state}")));
+    content.push(Line::from(volume));
+    content.push(Line::from(modes));
+    if let Some(format) = app.playback_format() {
+        content.push(Line::from(format!(
+            "{} Hz  {} ch",
+            format.sample_rate, format.channels
+        )));
+    }
+    let available_lines = usize::from(area.height.saturating_sub(2));
+    let top_padding = available_lines.saturating_sub(content.len()) / 2;
+    if top_padding > 0 {
+        let mut centered = Vec::with_capacity(content.len() + top_padding);
+        centered.resize_with(top_padding, Line::default);
+        centered.append(&mut content);
+        content = centered;
+    }
     frame.render_widget(
         Paragraph::new(content)
             .alignment(Alignment::Center)
@@ -291,12 +315,11 @@ mod tests {
         }
     }
 
-    fn snapshot(width: u16, height: u16) -> String {
+    fn rendered(app: &AppState, width: u16, height: u16, animation_time: Duration) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test terminal");
-        let app = AppState::new(&Config::default(), empty_index()).expect("app state");
         terminal
-            .draw(|frame| super::render(frame, &app))
+            .draw(|frame| super::render(frame, app, animation_time))
             .expect("draw UI");
         let buffer = terminal.backend().buffer();
         let mut output = String::new();
@@ -315,6 +338,11 @@ mod tests {
         output
     }
 
+    fn snapshot(width: u16, height: u16) -> String {
+        let app = AppState::new(&Config::default(), empty_index()).expect("app state");
+        rendered(&app, width, height, Duration::ZERO)
+    }
+
     #[test]
     fn supported_terminal_layouts_are_stable() {
         insta::assert_snapshot!("terminal_80x24", snapshot(80, 24));
@@ -324,6 +352,23 @@ mod tests {
     #[test]
     fn undersized_terminal_has_a_keyboard_accessible_fallback() {
         insta::assert_snapshot!("terminal_small", snapshot(40, 10));
+    }
+
+    #[test]
+    fn player_animation_follows_playback_state() {
+        let mut app = AppState::new(&Config::default(), empty_index()).expect("app state");
+        let resting = rendered(&app, 80, 24, Duration::from_millis(200));
+        assert!(resting.contains("▐▀• •▀▌"), "{resting}");
+
+        app.playback_status = crate::app::PlaybackStatus::Playing;
+        let dancing = rendered(&app, 80, 24, Duration::from_millis(200));
+        assert!(dancing.contains("▐▀^ ^▀▌"), "{dancing}");
+        assert!(!dancing.contains("▐▀• •▀▌"), "{dancing}");
+
+        app.playback_status = crate::app::PlaybackStatus::Paused;
+        let paused = rendered(&app, 80, 24, Duration::from_millis(200));
+        assert!(paused.contains("▐▀• •▀▌"), "{paused}");
+        assert!(!paused.contains("▐▀^ ^▀▌"), "{paused}");
     }
 
     #[test]
