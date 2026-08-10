@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Simplified the terminal to three full-height Library, Player, and Queue panels.
+- Simplified the terminal to three full-height Library, Player, and Queue panels, with the Player receiving half the terminal width.
 - Reduced configuration to behavior that exists today; later phases will add settings with their features.
 - Consolidated the product contract, safety notes, verification rules, and roadmap into `PROJECT.md` and `AGENTS.md`.
 - Renamed the root mutation lease to the root writer lease to match its remaining state and logging role.

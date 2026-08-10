@@ -21,9 +21,9 @@ pub fn panels(area: Rect) -> PanelLayout {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(30),
-            Constraint::Percentage(40),
-            Constraint::Percentage(30),
+            Constraint::Percentage(25),
+            Constraint::Percentage(50),
+            Constraint::Percentage(25),
         ])
         .split(vertical[0]);
     PanelLayout {
@@ -31,5 +31,19 @@ pub fn panels(area: Rect) -> PanelLayout {
         player: columns[1],
         queue: columns[2],
         status: vertical[1],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Rect, panels};
+
+    #[test]
+    fn player_receives_half_the_supported_width() {
+        let layout = panels(Rect::new(0, 0, 80, 24));
+
+        assert_eq!(layout.library.width, 20);
+        assert_eq!(layout.player.width, 40);
+        assert_eq!(layout.queue.width, 20);
     }
 }

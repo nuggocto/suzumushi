@@ -17,13 +17,13 @@ logging, tests, fuzz targets, and CI foundation.
 The development branch has simplified that shell to three panels:
 
 ```text
-+----------------------+----------------------------+----------------------+
-|       Library        |           Player           |        Queue         |
-| folders, playlists   | title, creator, progress   | upcoming tracks      |
-| and search results   | time, volume, speed        | and queue controls   |
-+----------------------+----------------------------+----------------------+
++------------------+------------------------------------+------------------+
+|     Library      |               Player               |      Queue       |
+| library and      | title, creator, progress, time     | upcoming tracks  |
+| playlists/search | volume, speed, playback state      | queue controls   |
++------------------+------------------------------------+------------------+
 | q quit   Tab focus   Space play/pause   / search   ? help                |
-+----------------------------------------------------------------------------+
++--------------------------------------------------------------------------+
 ```
 
 Playback is not implemented yet. The next work is Phase 4.
