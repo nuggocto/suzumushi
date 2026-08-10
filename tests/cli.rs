@@ -265,7 +265,7 @@ fn terminal_reopens_the_last_queue_without_autoplay() {
         .stderr(Stdio::from(second_slave))
         .spawn()
         .expect("reopen terminal session");
-    let mut transcript = read_pty_until(&mut second_master, &mut second, b"restored;");
+    let mut transcript = read_pty_until(&mut second_master, &mut second, b"Stopped");
     second_master
         .write_all(b"q")
         .expect("close restored session");
@@ -273,6 +273,15 @@ fn terminal_reopens_the_last_queue_without_autoplay() {
 
     assert!(byte_contains(&transcript, b"Night"));
     assert!(byte_contains(&transcript, b"Stopped"));
+
+    let state: serde_json::Value = serde_json::from_slice(
+        &fs::read(root.join("state/now-playing.json")).expect("read final now-playing state"),
+    )
+    .expect("parse final now-playing state");
+    assert_eq!(state["status"], "stopped");
+    assert_eq!(state["title"], "Night Song");
+    assert_eq!(state["queue_position"], 1);
+    assert_eq!(state["queue_length"], 1);
 }
 
 #[test]
@@ -745,6 +754,7 @@ fn terminal_command(root: &std::path::Path, runtime: &std::path::Path) -> Comman
         .arg(root)
         .env("XDG_RUNTIME_DIR", runtime)
         .env("TERM", "xterm-256color")
+        .env_remove("DBUS_SESSION_BUS_ADDRESS")
         .env_remove("NO_COLOR");
     command
 }
