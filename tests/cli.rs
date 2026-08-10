@@ -227,6 +227,55 @@ fn terminal_user_can_search_and_build_a_queue_without_audio() {
 }
 
 #[test]
+fn terminal_reopens_the_last_queue_without_autoplay() {
+    let temp = TempDir::new().expect("temporary directory");
+    let root = temp.path().join("root");
+    initialize_root(&root);
+    fs::write(root.join("audio/library/night.mp3"), id3_fixture()).expect("write tagged fixture");
+    let runtime = temp.path().join("runtime");
+    fs::create_dir(&runtime).expect("create runtime directory");
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))
+        .expect("make runtime directory private");
+
+    let (mut first_master, first_slave) = open_test_pty(80, 24);
+    let mut first = terminal_command(&root, &runtime)
+        .stdin(Stdio::from(duplicate_file(&first_slave)))
+        .stdout(Stdio::from(duplicate_file(&first_slave)))
+        .stderr(Stdio::from(first_slave))
+        .spawn()
+        .expect("start first terminal session");
+    read_pty_until(&mut first_master, &mut first, b"Night Song");
+    first_master.write_all(b"\r").expect("queue the track");
+    read_pty_until(&mut first_master, &mut first, FIRST_QUEUE_ITEM);
+    first_master
+        .write_all(b"q")
+        .expect("close the first session");
+    read_pty_to_exit(&mut first_master, &mut first);
+
+    let saved: serde_json::Value = serde_json::from_slice(
+        &fs::read(root.join("state/session.json")).expect("read saved session"),
+    )
+    .expect("saved session is valid JSON");
+    assert_eq!(saved["queue_entry_ids"].as_array().map(Vec::len), Some(1));
+
+    let (mut second_master, second_slave) = open_test_pty(80, 24);
+    let mut second = terminal_command(&root, &runtime)
+        .stdin(Stdio::from(duplicate_file(&second_slave)))
+        .stdout(Stdio::from(duplicate_file(&second_slave)))
+        .stderr(Stdio::from(second_slave))
+        .spawn()
+        .expect("reopen terminal session");
+    let mut transcript = read_pty_until(&mut second_master, &mut second, b"restored;");
+    second_master
+        .write_all(b"q")
+        .expect("close restored session");
+    transcript.extend(read_pty_to_exit(&mut second_master, &mut second));
+
+    assert!(byte_contains(&transcript, b"Night"));
+    assert!(byte_contains(&transcript, b"Stopped"));
+}
+
+#[test]
 #[ignore = "requires a real Linux default audio output device"]
 fn terminal_user_can_play_a_queued_file_on_the_real_device() {
     let temp = TempDir::new().expect("temporary directory");

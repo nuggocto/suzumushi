@@ -40,22 +40,27 @@ pub fn run(
 ) -> AppResult<()> {
     let initial_area = current_terminal_area()?;
     let mut app = AppState::new(config, index)?;
-    let mut state_writer = crate::state::NowPlayingWriter::open(root, root_path)?;
+    let mut state_store = crate::state::StateStore::open(root, root_path)?;
+    match state_store.read_session(&config.queue)? {
+        crate::state::SessionLoad::Missing => {}
+        crate::state::SessionLoad::Loaded(snapshot) => app.restore_session(&snapshot)?,
+        crate::state::SessionLoad::Ignored(reason) => app.session_ignored(&reason),
+    }
     let mut state_sync = StateSynchronizer::default();
-    state_sync.sync(&app, &mut state_writer, Duration::ZERO)?;
+    state_sync.sync(&app, &mut state_store, Duration::ZERO)?;
     let audio = AudioRuntime::start()?;
     let session_result = run_terminal_session(
         root,
         initial_area,
         &mut app,
         &audio,
-        &mut state_writer,
+        &mut state_store,
         &mut state_sync,
     );
     let audio_result = audio.shutdown();
     finish_session(
         &mut app,
-        &mut state_writer,
+        &mut state_store,
         &mut state_sync,
         session_result,
         audio_result,
@@ -64,13 +69,13 @@ pub fn run(
 
 fn finish_session(
     app: &mut AppState,
-    state_writer: &mut crate::state::NowPlayingWriter,
+    state_store: &mut crate::state::StateStore,
     state_sync: &mut StateSynchronizer,
     session_result: AppResult<()>,
     audio_result: AppResult<()>,
 ) -> AppResult<()> {
     app.session_stopped();
-    let state_result = state_sync.force(app, state_writer);
+    let state_result = state_sync.force(app, state_store);
     combine_results(combine_results(session_result, audio_result), state_result)
 }
 
@@ -79,7 +84,7 @@ fn run_terminal_session(
     initial_area: Rect,
     app: &mut AppState,
     audio: &AudioRuntime,
-    state_writer: &mut crate::state::NowPlayingWriter,
+    state_store: &mut crate::state::StateStore,
     state_sync: &mut StateSynchronizer,
 ) -> AppResult<()> {
     let stdout = io::stdout();
@@ -94,7 +99,7 @@ fn run_terminal_session(
 
     while !app.should_quit {
         drain_audio_events(app, root, audio)?;
-        state_sync.sync(app, state_writer, event_time)?;
+        state_sync.sync(app, state_store, event_time)?;
         terminal
             .draw(|frame| {
                 app.terminal_size = (frame.area().width, frame.area().height);
@@ -114,7 +119,7 @@ fn run_terminal_session(
         if let Some(intent) = apply_event(app, event) {
             dispatch_playback(app, root, audio, intent)?;
         }
-        state_sync.sync(app, state_writer, event_time)?;
+        state_sync.sync(app, state_store, event_time)?;
     }
 
     terminal
@@ -126,40 +131,61 @@ fn run_terminal_session(
 
 #[derive(Default)]
 struct StateSynchronizer {
-    previous: Option<crate::state::NowPlayingProjection>,
-    last_write: Option<Duration>,
+    previous_now_playing: Option<crate::state::NowPlayingProjection>,
+    last_now_playing_write: Option<Duration>,
+    session_initialized: bool,
+    previous_session: Option<crate::app::SessionIdentity>,
+    last_session_write: Option<Duration>,
 }
 
 impl StateSynchronizer {
     fn sync(
         &mut self,
         app: &AppState,
-        writer: &mut crate::state::NowPlayingWriter,
+        store: &mut crate::state::StateStore,
         now: Duration,
     ) -> AppResult<()> {
         let projection = crate::state::NowPlayingProjection::from_app(app);
-        let changed = self.previous.as_ref() != Some(&projection);
+        let changed = self.previous_now_playing.as_ref() != Some(&projection);
         let heartbeat_due = self
-            .last_write
+            .last_now_playing_write
             .is_none_or(|last| now.saturating_sub(last) >= STATE_HEARTBEAT_INTERVAL);
-        if !changed && !heartbeat_due {
-            return Ok(());
+        if changed || heartbeat_due {
+            store.write_now_playing(&projection)?;
+            self.previous_now_playing = Some(projection);
+            self.last_now_playing_write = Some(now);
         }
-        writer.write(&projection)?;
-        self.previous = Some(projection);
-        self.last_write = Some(now);
+
+        let identity = app.session_identity();
+        let session_changed = !self.session_initialized || self.previous_session != identity;
+        let checkpoint_due = identity.is_some()
+            && self
+                .last_session_write
+                .is_none_or(|last| now.saturating_sub(last) >= STATE_HEARTBEAT_INTERVAL);
+        if session_changed || checkpoint_due {
+            write_session(app, store)?;
+            self.session_initialized = true;
+            self.previous_session = identity;
+            self.last_session_write = identity.map(|_| now);
+        }
         Ok(())
     }
 
-    fn force(
-        &mut self,
-        app: &AppState,
-        writer: &mut crate::state::NowPlayingWriter,
-    ) -> AppResult<()> {
+    fn force(&mut self, app: &AppState, store: &mut crate::state::StateStore) -> AppResult<()> {
         let projection = crate::state::NowPlayingProjection::from_app(app);
-        writer.write(&projection)?;
-        self.previous = Some(projection);
-        Ok(())
+        let now_playing_result = store.write_now_playing(&projection);
+        if now_playing_result.is_ok() {
+            self.previous_now_playing = Some(projection);
+        }
+        let session_result = write_session(app, store);
+        combine_results(now_playing_result, session_result)
+    }
+}
+
+fn write_session(app: &AppState, store: &mut crate::state::StateStore) -> AppResult<()> {
+    match app.session_snapshot()? {
+        Some(snapshot) => store.write_session(&snapshot),
+        None => store.clear_session(),
     }
 }
 
@@ -266,6 +292,7 @@ fn dispatch_playback(
         PlaybackIntent::Load {
             generation,
             item,
+            position,
             settings,
         } => {
             let opened = app
@@ -276,6 +303,7 @@ fn dispatch_playback(
                 Ok(file) => AudioCommand::Play {
                     generation,
                     file,
+                    position,
                     settings,
                 },
                 Err(error) => {
@@ -306,9 +334,6 @@ fn dispatch_playback(
             generation,
             position,
         },
-        PlaybackIntent::SetSpeed { generation, speed } => {
-            AudioCommand::SetSpeed { generation, speed }
-        }
     };
     audio.send(command)
 }
@@ -448,18 +473,14 @@ mod tests {
         assert!(!app.should_quit);
     }
 
-    fn state_writer() -> (
-        tempfile::TempDir,
-        std::fs::File,
-        crate::state::NowPlayingWriter,
-    ) {
+    fn state_writer() -> (tempfile::TempDir, std::fs::File, crate::state::StateStore) {
         let root = tempfile::tempdir().expect("temporary root");
         fs::create_dir(root.path().join("state")).expect("state directory");
         fs::set_permissions(root.path().join("state"), fs::Permissions::from_mode(0o700))
             .expect("private state permissions");
         let root_file = std::fs::File::open(root.path()).expect("open root");
-        let writer = crate::state::NowPlayingWriter::open(root_file.as_fd(), root.path())
-            .expect("state writer");
+        let writer =
+            crate::state::StateStore::open(root_file.as_fd(), root.path()).expect("state writer");
         (root, root_file, writer)
     }
 
@@ -477,11 +498,11 @@ mod tests {
             STATE_HEARTBEAT_INTERVAL.saturating_sub(Duration::from_millis(1)),
         )
         .expect("state before heartbeat");
-        assert_eq!(sync.last_write, Some(Duration::ZERO));
+        assert_eq!(sync.last_now_playing_write, Some(Duration::ZERO));
 
         sync.sync(&app, &mut writer, STATE_HEARTBEAT_INTERVAL)
             .expect("heartbeat state");
-        assert_eq!(sync.last_write, Some(STATE_HEARTBEAT_INTERVAL));
+        assert_eq!(sync.last_now_playing_write, Some(STATE_HEARTBEAT_INTERVAL));
     }
 
     #[test]

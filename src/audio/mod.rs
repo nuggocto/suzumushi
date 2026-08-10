@@ -5,7 +5,6 @@
 mod decoder;
 mod file;
 mod output;
-mod stretch;
 
 use std::fs::File;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
@@ -40,62 +39,11 @@ pub struct AudioFormat {
     pub channels: u16,
 }
 
-/// One validated pitch-preserving playback speed in quarter steps.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PlaybackSpeed(u8);
-
-impl PlaybackSpeed {
-    pub const HALF: Self = Self(2);
-    pub const NORMAL: Self = Self(4);
-    pub const DOUBLE: Self = Self(8);
-
-    #[must_use]
-    pub fn slower(self) -> Self {
-        Self(self.0.saturating_sub(1).max(Self::HALF.0))
-    }
-
-    #[must_use]
-    pub fn faster(self) -> Self {
-        Self(self.0.saturating_add(1).min(Self::DOUBLE.0))
-    }
-
-    #[must_use]
-    pub fn percent(self) -> u16 {
-        u16::from(self.0) * 25
-    }
-
-    #[must_use]
-    pub fn multiplier(self) -> f32 {
-        f32::from(self.0) * 0.25
-    }
-
-    #[must_use]
-    pub fn label(self) -> &'static str {
-        match self.0 {
-            2 => "0.5x",
-            3 => "0.75x",
-            4 => "1.0x",
-            5 => "1.25x",
-            6 => "1.5x",
-            7 => "1.75x",
-            8 => "2.0x",
-            _ => unreachable!("playback speed is constructed only within its fixed bounds"),
-        }
-    }
-}
-
-impl Default for PlaybackSpeed {
-    fn default() -> Self {
-        Self::NORMAL
-    }
-}
-
 /// App-owned playback settings applied to each newly opened track.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PlaybackSettings {
     pub volume_percent: u8,
     pub muted: bool,
-    pub speed: PlaybackSpeed,
 }
 
 impl Default for PlaybackSettings {
@@ -103,7 +51,6 @@ impl Default for PlaybackSettings {
         Self {
             volume_percent: 100,
             muted: false,
-            speed: PlaybackSpeed::NORMAL,
         }
     }
 }
@@ -123,6 +70,7 @@ pub enum AudioCommand {
     Play {
         generation: u64,
         file: File,
+        position: Duration,
         settings: PlaybackSettings,
     },
     Pause {
@@ -142,10 +90,6 @@ pub enum AudioCommand {
     Seek {
         generation: u64,
         position: Duration,
-    },
-    SetSpeed {
-        generation: u64,
-        speed: PlaybackSpeed,
     },
     Shutdown,
 }
@@ -172,12 +116,6 @@ pub enum AudioEvent {
     Seeked {
         generation: u64,
         timeline_revision: u64,
-        position: Duration,
-    },
-    SpeedChanged {
-        generation: u64,
-        timeline_revision: u64,
-        speed: PlaybackSpeed,
         position: Duration,
     },
     Finished {
@@ -372,9 +310,9 @@ impl Backend for ProductionBackend {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum RestartNotice {
-    Seek,
-    Speed,
+enum StartNotice {
+    Started,
+    Seeked,
 }
 
 struct ActivePlayback {
@@ -385,14 +323,13 @@ struct ActivePlayback {
     output: Box<dyn OutputStream>,
     info: Option<DecodedInfo>,
     settings: PlaybackSettings,
-    tempo: Option<stretch::TempoProcessor>,
     pending: Option<(Vec<f32>, usize)>,
     started: bool,
     paused: bool,
     ended: bool,
     base_position: Duration,
     last_reported_position: Duration,
-    restart_notice: Option<RestartNotice>,
+    start_notice: StartNotice,
 }
 
 struct WorkerCore<B: Backend> {
@@ -418,8 +355,9 @@ impl<B: Backend> WorkerCore<B> {
             AudioCommand::Play {
                 generation,
                 file,
+                position,
                 settings,
-            } => self.play(generation, file, settings, events),
+            } => self.play(generation, file, position, settings, events),
             AudioCommand::Pause { generation } => {
                 self.pause(generation, events, positions);
             }
@@ -442,9 +380,6 @@ impl<B: Backend> WorkerCore<B> {
                 generation,
                 position,
             } => self.seek(generation, position, events, positions),
-            AudioCommand::SetSpeed { generation, speed } => {
-                self.set_speed(generation, speed, events);
-            }
             AudioCommand::Shutdown => {
                 self.stop_active()?;
                 return Ok(true);
@@ -457,6 +392,7 @@ impl<B: Backend> WorkerCore<B> {
         &mut self,
         generation: u64,
         file: File,
+        position: Duration,
         mut settings: PlaybackSettings,
         events: &SyncSender<AudioEvent>,
     ) {
@@ -471,7 +407,7 @@ impl<B: Backend> WorkerCore<B> {
             );
             return;
         }
-        match self.backend.open(&file, Duration::ZERO) {
+        match self.backend.open(&file, position) {
             Ok((decoder, mut output)) => {
                 output.set_gain(settings.volume_percent, settings.muted);
                 self.active = Some(ActivePlayback {
@@ -482,14 +418,13 @@ impl<B: Backend> WorkerCore<B> {
                     output,
                     info: None,
                     settings,
-                    tempo: None,
                     pending: None,
                     started: false,
                     paused: false,
                     ended: false,
-                    base_position: Duration::ZERO,
-                    last_reported_position: Duration::ZERO,
-                    restart_notice: None,
+                    base_position: position,
+                    last_reported_position: position,
+                    start_notice: StartNotice::Started,
                 });
             }
             Err(message) => emit(
@@ -598,8 +533,7 @@ impl<B: Backend> WorkerCore<B> {
             .active
             .as_ref()
             .is_some_and(|active| active.generation == generation)
-            && let Err(message) =
-                self.restart_active(generation, position, None, RestartNotice::Seek)
+            && let Err(message) = self.restart_active(generation, position)
         {
             emit(
                 events,
@@ -608,55 +542,6 @@ impl<B: Backend> WorkerCore<B> {
                     message,
                 },
             );
-        }
-    }
-
-    fn set_speed(
-        &mut self,
-        generation: u64,
-        speed: PlaybackSpeed,
-        events: &SyncSender<AudioEvent>,
-    ) {
-        let Some(active) = self
-            .active
-            .as_ref()
-            .filter(|active| active.generation == generation)
-        else {
-            return;
-        };
-        if active.settings.speed == speed {
-            return;
-        }
-        if active.info.is_none() {
-            let position = active.base_position;
-            let timeline_revision = active.timeline_revision;
-            self.active
-                .as_mut()
-                .expect("matching loading playback is retained")
-                .settings
-                .speed = speed;
-            emit(
-                events,
-                AudioEvent::SpeedChanged {
-                    generation,
-                    timeline_revision,
-                    speed,
-                    position,
-                },
-            );
-        } else {
-            let position = self.current_position().unwrap_or(Duration::ZERO);
-            if let Err(message) =
-                self.restart_active(generation, position, Some(speed), RestartNotice::Speed)
-            {
-                emit(
-                    events,
-                    AudioEvent::Failed {
-                        generation,
-                        message,
-                    },
-                );
-            }
         }
     }
 
@@ -671,7 +556,6 @@ impl<B: Backend> WorkerCore<B> {
 
         self.publish_position(positions, false);
         self.write_pending(events, generation)
-            || self.pull_tempo(events, generation)
             || self.poll_decoder(events, generation)
             || self.finish_drained(events, positions, generation)
     }
@@ -710,27 +594,6 @@ impl<B: Backend> WorkerCore<B> {
         }
     }
 
-    fn pull_tempo(&mut self, events: &SyncSender<AudioEvent>, generation: u64) -> bool {
-        let active = self.active.as_mut().expect("active playback is retained");
-        if active.pending.is_some() {
-            return false;
-        }
-        let Some(tempo) = active.tempo.as_mut() else {
-            return false;
-        };
-        match tempo.pull() {
-            Ok(Some(samples)) => {
-                active.pending = Some((samples, 0));
-                true
-            }
-            Ok(None) => false,
-            Err(message) => {
-                self.fail(events, generation, &message);
-                true
-            }
-        }
-    }
-
     fn poll_decoder(&mut self, events: &SyncSender<AudioEvent>, generation: u64) -> bool {
         let active = self.active.as_mut().expect("active playback is retained");
         if active.pending.is_some() || active.ended {
@@ -748,11 +611,6 @@ impl<B: Backend> WorkerCore<B> {
             }
             DecoderPoll::End => {
                 active.ended = true;
-                if let Some(tempo) = active.tempo.as_mut()
-                    && let Err(message) = tempo.finish()
-                {
-                    self.fail(events, generation, &message);
-                }
                 true
             }
             DecoderPoll::Failed(message) => {
@@ -779,17 +637,6 @@ impl<B: Backend> WorkerCore<B> {
                 .set_gain(active.settings.volume_percent, active.settings.muted);
             active.base_position = info.position;
             active.last_reported_position = info.position;
-            active.tempo = if active.settings.speed == PlaybackSpeed::NORMAL {
-                None
-            } else {
-                match stretch::TempoProcessor::new(info.format, active.settings.speed) {
-                    Ok(tempo) => Some(tempo),
-                    Err(message) => {
-                        self.fail(events, generation, &message);
-                        return;
-                    }
-                }
-            };
             active.info = Some(info);
         }
     }
@@ -812,10 +659,6 @@ impl<B: Backend> WorkerCore<B> {
         };
         if let Some(message) = invalid {
             self.fail(events, generation, message);
-        } else if let Some(tempo) = active.tempo.as_mut() {
-            if let Err(message) = tempo.push(&samples) {
-                self.fail(events, generation, &message);
-            }
         } else {
             active.pending = Some((samples, 0));
         }
@@ -828,11 +671,7 @@ impl<B: Backend> WorkerCore<B> {
         generation: u64,
     ) -> bool {
         let active = self.active.as_ref().expect("active playback is retained");
-        let tempo_drained = active
-            .tempo
-            .as_ref()
-            .is_none_or(stretch::TempoProcessor::drained);
-        if !active.ended || active.pending.is_some() || !tempo_drained {
+        if !active.ended || active.pending.is_some() {
             return false;
         }
         if !active.started {
@@ -871,13 +710,7 @@ impl<B: Backend> WorkerCore<B> {
         true
     }
 
-    fn restart_active(
-        &mut self,
-        generation: u64,
-        position: Duration,
-        speed: Option<PlaybackSpeed>,
-        notice: RestartNotice,
-    ) -> Result<(), String> {
+    fn restart_active(&mut self, generation: u64, position: Duration) -> Result<(), String> {
         let Some(mut old) = self.active.take() else {
             return Ok(());
         };
@@ -887,9 +720,6 @@ impl<B: Backend> WorkerCore<B> {
         }
         let output_error = old.output.stop().err();
         let decoder_error = old.decoder.shutdown().err();
-        if let Some(speed) = speed {
-            old.settings.speed = speed;
-        }
         let timeline_revision = old
             .timeline_revision
             .checked_add(1)
@@ -909,20 +739,15 @@ impl<B: Backend> WorkerCore<B> {
             output,
             info: None,
             settings: old.settings,
-            tempo: None,
             pending: None,
             started: false,
             paused,
             ended: false,
             base_position: position,
             last_reported_position: position,
-            restart_notice: Some(notice),
+            start_notice: StartNotice::Seeked,
         });
         Ok(())
-    }
-
-    fn current_position(&self) -> Option<Duration> {
-        self.active.as_ref().map(position_for)
     }
 
     fn publish_position(&mut self, positions: &PositionLane, force: bool) {
@@ -1012,23 +837,17 @@ fn emit_started(active: &mut ActivePlayback, events: &SyncSender<AudioEvent>) {
         .expect("samples require prepared decoder information");
     let generation = active.generation;
     let timeline_revision = active.timeline_revision;
-    let event = match active.restart_notice.take() {
-        None => AudioEvent::Started {
+    let event = match active.start_notice {
+        StartNotice::Started => AudioEvent::Started {
             generation,
             timeline_revision,
             format: info.format,
             duration: info.duration,
             position: info.position,
         },
-        Some(RestartNotice::Seek) => AudioEvent::Seeked {
+        StartNotice::Seeked => AudioEvent::Seeked {
             generation,
             timeline_revision,
-            position: info.position,
-        },
-        Some(RestartNotice::Speed) => AudioEvent::SpeedChanged {
-            generation,
-            timeline_revision,
-            speed: active.settings.speed,
             position: info.position,
         },
     };
@@ -1048,11 +867,9 @@ fn position_for(active: &ActivePlayback) -> Duration {
         return active.base_position;
     };
     let frames = u128::from(active.output.consumed_frames());
-    let speed_percent = u128::from(active.settings.speed.percent());
-    let denominator = u128::from(info.format.sample_rate).saturating_mul(100);
+    let denominator = u128::from(info.format.sample_rate);
     let nanos = frames
         .saturating_mul(1_000_000_000)
-        .saturating_mul(speed_percent)
         .checked_div(denominator)
         .unwrap_or(0)
         .min(u128::from(u64::MAX));
@@ -1122,8 +939,7 @@ mod tests {
 
     use super::{
         AudioCommand, AudioEvent, AudioFormat, AudioPosition, Backend, DecoderPoll, DecoderStream,
-        OutputStream, PlaybackParts, PlaybackSettings, PlaybackSpeed, PositionLane, WorkerCore,
-        sync_channel,
+        OutputStream, PlaybackParts, PlaybackSettings, PositionLane, WorkerCore, sync_channel,
     };
 
     #[derive(Default)]
@@ -1321,18 +1137,49 @@ mod tests {
     }
 
     #[test]
-    fn playback_speed_steps_clamp_at_half_and_double() {
-        let mut speed = PlaybackSpeed::NORMAL;
-        for _ in 0..10 {
-            speed = speed.slower();
-        }
-        assert_eq!(speed, PlaybackSpeed::HALF);
-        assert_eq!(speed.label(), "0.5x");
-        for _ in 0..10 {
-            speed = speed.faster();
-        }
-        assert_eq!(speed, PlaybackSpeed::DOUBLE);
-        assert_eq!(speed.label(), "2.0x");
+    fn initial_play_opens_the_decoder_at_the_requested_resume_position() {
+        let format = AudioFormat {
+            sample_rate: 48_000,
+            channels: 2,
+        };
+        let position = Duration::from_millis(750);
+        let (backend, fixture) = fixture_backend(VecDeque::from([
+            DecoderPoll::Ready(decoded_at(format, position)),
+            DecoderPoll::Samples(vec![0.1, -0.1]),
+        ]));
+        let mut core = WorkerCore::new(backend);
+        let (events, received) = sync_channel(4);
+        let positions = PositionLane::default();
+
+        core.command(
+            AudioCommand::Play {
+                generation: 6,
+                file: harmless_file(),
+                position,
+                settings: PlaybackSettings::default(),
+            },
+            &events,
+            &positions,
+        )
+        .expect("start resumed playback");
+        drive_steps(&mut core, &events, &positions, 4);
+
+        assert_eq!(
+            fixture
+                .opened_positions
+                .lock()
+                .expect("open position log")
+                .as_slice(),
+            [position]
+        );
+        assert!(matches!(
+            received.try_recv(),
+            Ok(AudioEvent::Started {
+                generation: 6,
+                position: started,
+                ..
+            }) if started == position
+        ));
     }
 
     #[test]
@@ -1353,6 +1200,7 @@ mod tests {
             AudioCommand::Play {
                 generation: 7,
                 file: harmless_file(),
+                position: Duration::ZERO,
                 settings: PlaybackSettings::default(),
             },
             &events,
@@ -1413,6 +1261,7 @@ mod tests {
             AudioCommand::Play {
                 generation: 9,
                 file: harmless_file(),
+                position: Duration::ZERO,
                 settings: PlaybackSettings::default(),
             },
             &events,
@@ -1453,6 +1302,7 @@ mod tests {
             AudioCommand::Play {
                 generation: 10,
                 file: harmless_file(),
+                position: Duration::ZERO,
                 settings: PlaybackSettings::default(),
             },
             &events,
@@ -1478,7 +1328,7 @@ mod tests {
     }
 
     #[test]
-    fn controls_restart_at_the_app_selected_source_position() {
+    fn seek_restarts_at_the_app_selected_source_position() {
         let format = AudioFormat {
             sample_rate: 48_000,
             channels: 1,
@@ -1493,11 +1343,6 @@ mod tests {
             DecoderPoll::Samples(vec![0.1; 16_384]),
             DecoderPoll::End,
         ]));
-        backend.scripts.push_back(VecDeque::from([
-            DecoderPoll::Ready(decoded_at(format, Duration::from_millis(750))),
-            DecoderPoll::Samples(vec![0.1; 16_384]),
-            DecoderPoll::End,
-        ]));
         let mut core = WorkerCore::new(backend);
         let (events, received) = sync_channel(16);
         let positions = PositionLane::default();
@@ -1505,6 +1350,7 @@ mod tests {
             AudioCommand::Play {
                 generation: 11,
                 file: harmless_file(),
+                position: Duration::ZERO,
                 settings: PlaybackSettings::default(),
             },
             &events,
@@ -1547,36 +1393,13 @@ mod tests {
             }
         );
 
-        core.command(
-            AudioCommand::SetSpeed {
-                generation: 11,
-                speed: PlaybackSpeed::DOUBLE,
-            },
-            &events,
-            &positions,
-        )
-        .expect("change fake speed");
-        drive_steps(&mut core, &events, &positions, 6);
-        assert_eq!(
-            received.try_recv().expect("speed event"),
-            AudioEvent::SpeedChanged {
-                generation: 11,
-                timeline_revision: 3,
-                speed: PlaybackSpeed::DOUBLE,
-                position: Duration::from_millis(750),
-            }
-        );
         assert_eq!(
             fixture
                 .opened_positions
                 .lock()
                 .expect("open log")
                 .as_slice(),
-            [
-                Duration::ZERO,
-                Duration::from_millis(750),
-                Duration::from_millis(750),
-            ]
+            [Duration::ZERO, Duration::from_millis(750)]
         );
     }
 }

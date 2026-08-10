@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Bounded, descriptor-rooted projection of the app-owned playback state.
+//! Bounded, descriptor-rooted playback projection and resume checkpoint.
 
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::mem::size_of;
 use std::os::fd::BorrowedFd;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -11,19 +12,23 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rustix::fd::AsFd;
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::process::getuid;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use crate::app::{AppState, PlaybackStatus};
+use crate::app::{AppState, PlaybackStatus, QueueItem};
+use crate::config::QueueConfig;
 use crate::errors::{AppError, AppResult};
 
 const STATE_VERSION: u32 = 1;
 const STATE_FILE: &str = "now-playing.json";
 const STATE_MAX_BYTES: usize = 16 * 1_024;
+const SESSION_FILE: &str = "session.json";
+const SESSION_MAX_BYTES: usize = 256 * 1_024;
+const SESSION_MAX_POSITION_MS: u64 = 365 * 24 * 60 * 60 * 1_000;
 // JSON control escapes can occupy six bytes, so two fields at this bound still
 // leave room for the fixed document fields inside STATE_MAX_BYTES.
 const STATE_IDENTITY_MAX_BYTES: usize = 1_024;
 
-/// Stable app-owned fields consumed by later read-only status commands.
+/// Stable app-owned playback fields written to private local state.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct NowPlayingProjection {
     version: u32,
@@ -35,7 +40,6 @@ pub(crate) struct NowPlayingProjection {
     duration_ms: Option<u64>,
     volume_percent: u8,
     muted: bool,
-    speed_percent: u16,
     shuffle: bool,
     repeat: &'static str,
     queue_position: Option<usize>,
@@ -56,7 +60,6 @@ impl NowPlayingProjection {
             duration_ms: app.playback_duration().map(duration_millis),
             volume_percent: app.volume_percent,
             muted: app.muted,
-            speed_percent: app.speed.percent(),
             shuffle: app.shuffle,
             repeat: app.repeat.label(),
             queue_position: app.queue_position(),
@@ -72,14 +75,43 @@ struct StateDocument<'a> {
     updated_at_unix_ms: u64,
 }
 
+/// Minimal app-owned state needed to resume a listening session.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SessionSnapshot {
+    version: u32,
+    pub(crate) queue_entry_ids: Vec<u64>,
+    pub(crate) current_index: usize,
+    pub(crate) position_ms: u64,
+}
+
+impl SessionSnapshot {
+    #[must_use]
+    pub(crate) fn new(queue_entry_ids: Vec<u64>, current_index: usize, position_ms: u64) -> Self {
+        Self {
+            version: STATE_VERSION,
+            queue_entry_ids,
+            current_index,
+            position_ms: position_ms.min(SESSION_MAX_POSITION_MS),
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum SessionLoad {
+    Missing,
+    Loaded(SessionSnapshot),
+    Ignored(String),
+}
+
 /// Owns the verified private state directory for one terminal session.
-pub(crate) struct NowPlayingWriter {
+pub(crate) struct StateStore {
     directory: File,
     directory_path: PathBuf,
     next_temporary: u64,
 }
 
-impl NowPlayingWriter {
+impl StateStore {
     pub(crate) fn open(root: BorrowedFd<'_>, root_path: &Path) -> AppResult<Self> {
         let directory_path = root_path.join("state");
         let directory = rustix::fs::openat(
@@ -90,7 +122,18 @@ impl NowPlayingWriter {
         )
         .map_err(|error| AppError::io("open state directory", &directory_path, error.into()))?;
         verify_private_directory(&directory, &directory_path)?;
-        verify_existing_projection(&directory, &directory_path)?;
+        drop(open_verified_state_file(
+            &directory,
+            &directory_path,
+            STATE_FILE,
+            "playback state",
+        )?);
+        drop(open_verified_state_file(
+            &directory,
+            &directory_path,
+            SESSION_FILE,
+            "resume state",
+        )?);
         Ok(Self {
             directory: File::from(directory),
             directory_path,
@@ -98,7 +141,49 @@ impl NowPlayingWriter {
         })
     }
 
-    pub(crate) fn write(&mut self, projection: &NowPlayingProjection) -> AppResult<()> {
+    pub(crate) fn read_session(&self, queue: &QueueConfig) -> AppResult<SessionLoad> {
+        let Some(file) = open_verified_state_file(
+            &self.directory,
+            &self.directory_path,
+            SESSION_FILE,
+            "resume state",
+        )?
+        else {
+            return Ok(SessionLoad::Missing);
+        };
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(SESSION_MAX_BYTES.saturating_add(1))
+            .map_err(|error| AppError::Resource(format!("cannot reserve resume state: {error}")))?;
+        file.take((SESSION_MAX_BYTES as u64).saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|error| {
+                AppError::io(
+                    "read resume state",
+                    self.directory_path.join(SESSION_FILE),
+                    error,
+                )
+            })?;
+        if bytes.len() > SESSION_MAX_BYTES {
+            return Ok(SessionLoad::Ignored(format!(
+                "saved session exceeds the {SESSION_MAX_BYTES}-byte limit"
+            )));
+        }
+        let snapshot = match serde_json::from_slice::<SessionSnapshot>(&bytes) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return Ok(SessionLoad::Ignored(format!(
+                    "saved session is not valid JSON: {error}"
+                )));
+            }
+        };
+        if let Some(reason) = invalid_session_reason(&snapshot, queue) {
+            return Ok(SessionLoad::Ignored(reason));
+        }
+        Ok(SessionLoad::Loaded(snapshot))
+    }
+
+    pub(crate) fn write_now_playing(&mut self, projection: &NowPlayingProjection) -> AppResult<()> {
         let updated_at_unix_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| {
@@ -118,7 +203,40 @@ impl NowPlayingWriter {
             )));
         }
 
-        let temporary = self.temporary_name()?;
+        self.write_bytes(STATE_FILE, "now-playing", &bytes)
+    }
+
+    pub(crate) fn write_session(&mut self, snapshot: &SessionSnapshot) -> AppResult<()> {
+        let mut bytes = serde_json::to_vec(snapshot)
+            .map_err(|error| AppError::Resource(format!("cannot encode resume state: {error}")))?;
+        bytes.push(b'\n');
+        if bytes.len() > SESSION_MAX_BYTES {
+            return Err(AppError::Resource(format!(
+                "resume state exceeds the {SESSION_MAX_BYTES}-byte limit"
+            )));
+        }
+        self.write_bytes(SESSION_FILE, "session", &bytes)
+    }
+
+    pub(crate) fn clear_session(&self) -> AppResult<()> {
+        match rustix::fs::unlinkat(&self.directory, SESSION_FILE, AtFlags::empty()) {
+            Ok(()) => Ok(()),
+            Err(error) if error == rustix::io::Errno::NOENT => Ok(()),
+            Err(error) => Err(AppError::io(
+                "remove resume state",
+                self.directory_path.join(SESSION_FILE),
+                error.into(),
+            )),
+        }
+    }
+
+    fn write_bytes(
+        &mut self,
+        file_name: &str,
+        temporary_stem: &str,
+        bytes: &[u8],
+    ) -> AppResult<()> {
+        let temporary = self.temporary_name(temporary_stem)?;
         let temporary_path = self.directory_path.join(&temporary);
         let fd = rustix::fs::openat(
             &self.directory,
@@ -126,33 +244,24 @@ impl NowPlayingWriter {
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::from_raw_mode(0o600),
         )
-        .map_err(|error| {
-            AppError::io(
-                "create temporary playback state",
-                &temporary_path,
-                error.into(),
-            )
-        })?;
+        .map_err(|error| AppError::io("create temporary state", &temporary_path, error.into()))?;
         let result = (|| {
             rustix::fs::fchmod(&fd, Mode::from_raw_mode(0o600)).map_err(|error| {
-                AppError::io(
-                    "set playback state permissions",
-                    &temporary_path,
-                    error.into(),
-                )
+                AppError::io("set state permissions", &temporary_path, error.into())
             })?;
             // Readers need one complete snapshot; crash durability is unnecessary for ephemeral state.
             let mut file = File::from(fd);
-            file.write_all(&bytes)
-                .map_err(|error| AppError::io("write playback state", &temporary_path, error))?;
-            rustix::fs::renameat(&self.directory, &temporary, &self.directory, STATE_FILE)
-                .map_err(|error| {
+            file.write_all(bytes)
+                .map_err(|error| AppError::io("write state", &temporary_path, error))?;
+            rustix::fs::renameat(&self.directory, &temporary, &self.directory, file_name).map_err(
+                |error| {
                     AppError::io(
-                        "replace playback state",
-                        self.directory_path.join(STATE_FILE),
+                        "replace state",
+                        self.directory_path.join(file_name),
                         error.into(),
                     )
-                })?;
+                },
+            )?;
             Ok(())
         })();
         if result.is_err() {
@@ -161,16 +270,13 @@ impl NowPlayingWriter {
         result
     }
 
-    fn temporary_name(&mut self) -> AppResult<String> {
+    fn temporary_name(&mut self, stem: &str) -> AppResult<String> {
         let counter = self.next_temporary;
-        self.next_temporary = self.next_temporary.checked_add(1).ok_or_else(|| {
-            AppError::Resource("playback state temporary counter exhausted".into())
-        })?;
-        Ok(format!(
-            ".now-playing.{}.{}.tmp",
-            std::process::id(),
-            counter
-        ))
+        self.next_temporary = self
+            .next_temporary
+            .checked_add(1)
+            .ok_or_else(|| AppError::Resource("state temporary counter exhausted".into()))?;
+        Ok(format!(".{stem}.{}.{}.tmp", std::process::id(), counter))
     }
 }
 
@@ -189,27 +295,32 @@ fn verify_private_directory(directory: impl AsFd, path: &Path) -> AppResult<()> 
     Ok(())
 }
 
-fn verify_existing_projection(directory: impl AsFd, directory_path: &Path) -> AppResult<()> {
+fn open_verified_state_file(
+    directory: impl AsFd,
+    directory_path: &Path,
+    file_name: &str,
+    description: &str,
+) -> AppResult<Option<File>> {
     let fd = match rustix::fs::openat(
         directory,
-        STATE_FILE,
+        file_name,
         OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     ) {
         Ok(fd) => fd,
-        Err(error) if error == rustix::io::Errno::NOENT => return Ok(()),
+        Err(error) if error == rustix::io::Errno::NOENT => return Ok(None),
         Err(error) => {
             return Err(AppError::io(
-                "open existing playback state",
-                directory_path.join(STATE_FILE),
+                "open existing state",
+                directory_path.join(file_name),
                 error.into(),
             ));
         }
     };
     let stat = rustix::fs::fstat(&fd).map_err(|error| {
         AppError::io(
-            "inspect existing playback state",
-            directory_path.join(STATE_FILE),
+            "inspect existing state",
+            directory_path.join(file_name),
             error.into(),
         )
     })?;
@@ -219,12 +330,38 @@ fn verify_existing_projection(directory: impl AsFd, directory_path: &Path) -> Ap
         || stat.st_nlink != 1
     {
         return Err(AppError::InvalidRoot {
-            path: directory_path.join(STATE_FILE),
-            reason: "playback state must be a current-user-owned regular file with mode 0600 and one link"
-                .into(),
+            path: directory_path.join(file_name),
+            reason: format!(
+                "{description} must be a current-user-owned regular file with mode 0600 and one link"
+            ),
         });
     }
-    Ok(())
+    Ok(Some(File::from(fd)))
+}
+
+fn invalid_session_reason(snapshot: &SessionSnapshot, queue: &QueueConfig) -> Option<String> {
+    let queue_bytes = snapshot
+        .queue_entry_ids
+        .len()
+        .checked_mul(size_of::<QueueItem>());
+    if snapshot.version != STATE_VERSION {
+        Some(format!(
+            "saved session version {} is unsupported",
+            snapshot.version
+        ))
+    } else if snapshot.queue_entry_ids.is_empty() {
+        Some("saved session queue is empty".into())
+    } else if snapshot.queue_entry_ids.len() > queue.max_items
+        || queue_bytes.is_none_or(|bytes| bytes > queue.max_bytes)
+    {
+        Some("saved session queue exceeds the configured limit".into())
+    } else if snapshot.current_index >= snapshot.queue_entry_ids.len() {
+        Some("saved session current track is outside the queue".into())
+    } else if snapshot.position_ms > SESSION_MAX_POSITION_MS {
+        Some("saved session position exceeds one year".into())
+    } else {
+        None
+    }
 }
 
 const fn playback_status(status: PlaybackStatus) -> &'static str {
@@ -250,7 +387,8 @@ mod tests {
     use rustix::fd::AsFd;
 
     use super::{
-        NowPlayingProjection, NowPlayingWriter, STATE_IDENTITY_MAX_BYTES, STATE_MAX_BYTES,
+        NowPlayingProjection, STATE_IDENTITY_MAX_BYTES, STATE_MAX_BYTES, SessionLoad,
+        SessionSnapshot, StateStore,
     };
     use crate::app::AppState;
     use crate::config::Config;
@@ -340,12 +478,13 @@ mod tests {
     #[test]
     fn projection_is_atomic_private_and_valid_json() {
         let (root, root_file) = root();
-        let mut writer =
-            NowPlayingWriter::open(root_file.as_fd(), root.path()).expect("state writer");
+        let mut writer = StateStore::open(root_file.as_fd(), root.path()).expect("state writer");
 
         let mut projection = NowPlayingProjection::from_app(&app());
         projection.title = "quiet\u{1b}[31m".into();
-        writer.write(&projection).expect("write projection");
+        writer
+            .write_now_playing(&projection)
+            .expect("write projection");
 
         let path = root.path().join("state/now-playing.json");
         let bytes = fs::read(&path).expect("read projection");
@@ -353,7 +492,6 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON");
         assert_eq!(value["version"], 1);
         assert_eq!(value["status"], "stopped");
-        assert_eq!(value["speed_percent"], 100);
         assert_eq!(value["title"], "quiet\u{1b}[31m");
         assert_eq!(
             fs::metadata(path)
@@ -370,38 +508,38 @@ mod tests {
         let (root, root_file) = root();
         symlink("/dev/null", root.path().join("state/now-playing.json")).expect("state symlink");
 
-        let error = NowPlayingWriter::open(root_file.as_fd(), root.path())
+        let error = StateStore::open(root_file.as_fd(), root.path())
             .err()
             .expect("symlink must be refused");
 
-        assert!(error.to_string().contains("existing playback state"));
+        assert!(error.to_string().contains("existing state"));
     }
 
     #[test]
     fn oversized_projection_does_not_replace_the_last_good_state() {
         let (root, root_file) = root();
-        let mut writer =
-            NowPlayingWriter::open(root_file.as_fd(), root.path()).expect("state writer");
+        let mut writer = StateStore::open(root_file.as_fd(), root.path()).expect("state writer");
         let valid = NowPlayingProjection::from_app(&app());
-        writer.write(&valid).expect("initial projection");
+        writer
+            .write_now_playing(&valid)
+            .expect("initial projection");
         let path = root.path().join("state/now-playing.json");
         let before = fs::read(&path).expect("initial bytes");
         let mut oversized = valid;
         oversized.title = "x".repeat(20_000);
 
-        assert!(writer.write(&oversized).is_err());
+        assert!(writer.write_now_playing(&oversized).is_err());
         assert_eq!(fs::read(path).expect("retained projection"), before);
     }
 
     #[test]
     fn maximally_escaped_identity_fields_fit_the_state_document() {
         let (root, root_file) = root();
-        let mut writer =
-            NowPlayingWriter::open(root_file.as_fd(), root.path()).expect("state writer");
+        let mut writer = StateStore::open(root_file.as_fd(), root.path()).expect("state writer");
         let projection = NowPlayingProjection::from_app(&app_with_control_metadata());
 
         writer
-            .write(&projection)
+            .write_now_playing(&projection)
             .expect("worst-case app projection remains encodable");
 
         let bytes =
@@ -416,5 +554,94 @@ mod tests {
             value["creator"].as_str().map(str::len),
             Some(STATE_IDENTITY_MAX_BYTES)
         );
+    }
+
+    #[test]
+    fn resume_state_round_trips_privately_and_clears() {
+        let (root, root_file) = root();
+        let mut store = StateStore::open(root_file.as_fd(), root.path()).expect("state store");
+        let snapshot = SessionSnapshot::new(vec![11, 22, 11], 1, 93_250);
+
+        store.write_session(&snapshot).expect("write resume state");
+
+        assert_eq!(
+            store
+                .read_session(&Config::default().queue)
+                .expect("read resume state"),
+            SessionLoad::Loaded(snapshot)
+        );
+        let path = root.path().join("state/session.json");
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("resume metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        store.clear_session().expect("clear resume state");
+        assert_eq!(
+            store
+                .read_session(&Config::default().queue)
+                .expect("missing resume state"),
+            SessionLoad::Missing
+        );
+    }
+
+    #[test]
+    fn maximum_configured_queue_fits_the_resume_document_budget() {
+        let (root, root_file) = root();
+        let config = Config::default();
+        let mut store = StateStore::open(root_file.as_fd(), root.path()).expect("state store");
+        let snapshot = SessionSnapshot::new(
+            vec![u64::MAX; config.queue.max_items],
+            config.queue.max_items - 1,
+            1,
+        );
+
+        store
+            .write_session(&snapshot)
+            .expect("maximum queue checkpoint");
+
+        let bytes = fs::read(root.path().join("state/session.json")).expect("resume bytes");
+        assert!(
+            bytes.len() <= super::SESSION_MAX_BYTES,
+            "{} bytes",
+            bytes.len()
+        );
+        assert!(matches!(
+            store.read_session(&config.queue).expect("read maximum queue"),
+            SessionLoad::Loaded(loaded) if loaded == snapshot
+        ));
+    }
+
+    #[test]
+    fn malformed_resume_state_is_bounded_and_ignored() {
+        let (root, root_file) = root();
+        let path = root.path().join("state/session.json");
+        fs::write(&path, br#"{"version":1,"queue_entry_ids":[1]}"#)
+            .expect("malformed resume fixture");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("private resume permissions");
+        let store = StateStore::open(root_file.as_fd(), root.path()).expect("state store");
+
+        assert!(matches!(
+            store
+                .read_session(&Config::default().queue)
+                .expect("read malformed resume state"),
+            SessionLoad::Ignored(reason) if reason.contains("not valid JSON")
+        ));
+    }
+
+    #[test]
+    fn unsafe_existing_resume_state_is_refused() {
+        let (root, root_file) = root();
+        symlink("/dev/null", root.path().join("state/session.json")).expect("state symlink");
+
+        let error = StateStore::open(root_file.as_fd(), root.path())
+            .err()
+            .expect("resume symlink must be refused");
+
+        assert!(error.to_string().contains("session.json"));
     }
 }

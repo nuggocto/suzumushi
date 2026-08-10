@@ -9,8 +9,7 @@ expression: "snapshot(80, 24)"
 ║                  ║│                                      ││                  │
 ║                  ║│            State: Stopped            ││                  │
 ║                  ║│              Volume 100%             ││                  │
-║                  ║│  Speed 1.0x  Shuffle off  Repeat off ││                  │
-║                  ║│                                      ││                  │
+║                  ║│        Shuffle off  Repeat off       ││                  │
 ║                  ║│                                      ││                  │
 ║                  ║│                                      ││                  │
 ║                  ║│                                      ││                  │
@@ -26,3 +25,4 @@ expression: "snapshot(80, 24)"
 ║                  ║│                                      ││                  │
 ╚══════════════════╝└──────────────────────────────────────┘└──────────────────┘
  q quit  Tab focus   / search  Up/Down move  Enter add/play  Ready: 0 tracks, 0
+ Space play/pause  s stop  n next  p previous  x shuffle  r repeat

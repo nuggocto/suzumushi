@@ -15,8 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added basic `1.0x` play, pause, stop, next, previous, and automatic queue advancement.
 - Added one isolated Symphonia decoder, one CPAL output path, a lock-free PCM ring, and deterministic fake-device tests.
 - Added verified MP3, FLAC, WAV/PCM, and Ogg/Vorbis compatibility fixtures and a bounded decoder fuzz target.
-- Added volume, mute, five-second seeking, progress, shuffle, repeat off/all/one, and pitch-preserving `0.5x` through `2.0x` playback.
-- Added a bounded, private, versioned `state/now-playing.json` projection for later status integrations.
+- Added volume, mute, five-second seeking, progress, shuffle, and repeat off/queue/one.
+- Added a bounded, private, versioned `state/now-playing.json` playback projection.
+- Added bounded automatic restoration of the last Queue, current track, and playback position in a paused state.
 
 ### Changed
 
@@ -26,8 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Reduced configuration to behavior that exists today; later phases will add settings with their features.
 - Consolidated the product contract, safety notes, verification rules, and roadmap into `PROJECT.md` and `AGENTS.md`.
 - Renamed the root mutation lease to the root writer lease to match its remaining state and logging role.
-- Completed the Player panel with title, creator, progress, elapsed and total time, volume, mute, playback state, speed, shuffle, and repeat.
+- Completed the Player panel with title, creator, progress, elapsed and total time, volume, mute, playback state, shuffle, and repeat.
 - Made Enter start a newly queued selection when playback is idle while retaining normal append behavior during playback.
+- Made next, previous, shuffle, and repeat controls permanently visible in the terminal footer.
+- Made repeat control permanently visible and named whole-Queue repetition `queue`.
 
 ### Fixed
 
@@ -35,7 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Published a final stopped state after event-loop failures whenever the state directory remains writable.
 - Discarded decoder preroll on seeks and ordered reliable restart events against coalesced position updates.
 - Preserved shuffle history across queue edits and started new shuffled playlists at their first selected track without skipping the rest.
-- Honored playback speed for sub-window clips, kept long timeline text visible at 80 columns, and removed a scheduler-dependent PTY assertion.
+- Kept long timeline text visible at 80 columns and removed a scheduler-dependent PTY assertion.
 
 ### Removed
 

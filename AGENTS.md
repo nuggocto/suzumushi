@@ -20,7 +20,8 @@
 - The filesystem is the library. Use folders below `audio/library/` and
   immediate child folders below `audio/playlists/`. Do not add SQLite, playlist
   files, or inotify in v1.
-- Keep MPRIS/media keys and all three status outputs: Waybar, tmux, and Zellij.
+- Keep MPRIS and global media-key support. Do not add status renderers or
+  desktop notifications.
 - Keep the mascot and future `suzumushi-front` website separate from this Rust
   repository.
 - Publish only `suzumushi-bin` to AUR from verified release artifacts.
@@ -72,8 +73,8 @@
   shutdown.
 - The real-time audio callback never allocates, blocks, logs, performs D-Bus
   work, takes locks, or sends on a blocking channel.
-- Waybar, tmux, and Zellij read one bounded versioned
-  `state/now-playing.json`. They never scan, start the TUI, or initialize audio.
+- MPRIS routes D-Bus requests through the existing app-owned actions. It does
+  not create a second playback state.
 
 ## Filesystem and parser safety
 
@@ -89,8 +90,8 @@
   Embedded cover reading stays disabled.
 - Mutable TUI mode takes the verified per-UID active lock and root writer lock.
   Do not use `/tmp` or blindly delete stale locks.
-- Sanitize and bound terminal, JSON, Waybar/Pango, tmux, Zellij, notification,
-  and file URI output for their own formatting languages.
+- Validate and bound terminal, JSON, D-Bus, and file URI values for their own
+  destinations.
 
 ## Tests
 

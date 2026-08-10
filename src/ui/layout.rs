@@ -4,7 +4,7 @@
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
-/// Rectangles for the three panels and one bottom status line.
+/// Rectangles for the three panels and two bottom help/status lines.
 pub struct PanelLayout {
     pub library: Rect,
     pub player: Rect,
@@ -16,7 +16,7 @@ pub struct PanelLayout {
 pub fn panels(area: Rect) -> PanelLayout {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .constraints([Constraint::Min(1), Constraint::Length(2)])
         .split(area);
     let columns = Layout::default()
         .direction(Direction::Horizontal)

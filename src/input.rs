@@ -33,9 +33,6 @@ pub enum AppAction {
     ToggleMute,
     ToggleShuffle,
     CycleRepeat,
-    SpeedDown,
-    SpeedUp,
-    SpeedNormal,
     PalettePlaceholder,
 }
 
@@ -136,9 +133,6 @@ impl InputState {
             KeyCode::Char('m') if key.modifiers.is_empty() => Some(AppAction::ToggleMute),
             KeyCode::Char('x') if key.modifiers.is_empty() => Some(AppAction::ToggleShuffle),
             KeyCode::Char('r') if key.modifiers.is_empty() => Some(AppAction::CycleRepeat),
-            KeyCode::Char('[') if key.modifiers.is_empty() => Some(AppAction::SpeedDown),
-            KeyCode::Char(']') if key.modifiers.is_empty() => Some(AppAction::SpeedUp),
-            KeyCode::Char('0') if key.modifiers.is_empty() => Some(AppAction::SpeedNormal),
             KeyCode::Char(' ') if key.modifiers.is_empty() => {
                 self.leader_started = Some(now);
                 None
@@ -268,9 +262,6 @@ mod tests {
             (key(KeyCode::Char('m')), AppAction::ToggleMute),
             (key(KeyCode::Char('x')), AppAction::ToggleShuffle),
             (key(KeyCode::Char('r')), AppAction::CycleRepeat),
-            (key(KeyCode::Char('[')), AppAction::SpeedDown),
-            (key(KeyCode::Char(']')), AppAction::SpeedUp),
-            (key(KeyCode::Char('0')), AppAction::SpeedNormal),
         ];
         for (event, expected) in cases {
             assert_eq!(input.key(event, Duration::ZERO), Some(expected));

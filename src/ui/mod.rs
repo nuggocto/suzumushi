@@ -92,8 +92,7 @@ fn render_player(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         format!("Volume {}%", app.volume_percent)
     };
     let modes = format!(
-        "Speed {}  Shuffle {}  Repeat {}",
-        app.speed.label(),
+        "Shuffle {}  Repeat {}",
         if app.shuffle { "on" } else { "off" },
         app.repeat.label(),
     );

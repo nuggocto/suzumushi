@@ -15,13 +15,14 @@ library, search, queue browser, and playback controls to its safe root,
 scanner, metadata, terminal, logging, test, fuzz, and CI foundation.
 
 ```text
-+------------------+------------------------------------+------------------+
-|     Library      |               Player               |      Queue       |
-| folders, tracks  | title, creator, progress, time     | ordered tracks   |
-| playlists/search | volume, speed, playback state      | and queue edits  |
-+------------------+------------------------------------+------------------+
-| q quit   Tab focus   / search   Enter add   Up/Down move                 |
-+--------------------------------------------------------------------------+
++------------------+----------------------------------------+------------------+
+|     Library      |                 Player                 |      Queue       |
+| folders, tracks  |     title, creator, progress, time     |  ordered tracks  |
+| playlists/search |          volume, playback state        | and queue edits  |
++------------------+----------------------------------------+------------------+
+| q quit   Tab focus   / search   Enter add   Up/Down move                     |
+| Space play/pause  s stop  n next  p previous  x shuffle  r repeat             |
++------------------------------------------------------------------------------+
 ```
 
 The complete local player is implemented. The next work is Phase 7.
@@ -36,9 +37,10 @@ The complete local player is implemented. The next work is Phase 7.
 - Copied files and file symlinks in playlists.
 - Library browsing, local search, and a bounded queue.
 - Play, pause, stop, next, previous, seek, volume, mute, shuffle, and repeat.
-- Pitch-preserving playback speed from `0.5x` through `2.0x`, including `1.0x`.
-- MPRIS, desktop media keys, and text-only track notifications.
-- Fast status commands for Waybar, tmux, and Zellij. All three are supported.
+- Automatic restoration of the last non-empty queue, current track, and
+  playback position. Restored sessions remain paused until the user presses
+  Space.
+- MPRIS and global media-key support.
 - A direct local install command, verified GitHub release binaries, and the
   `suzumushi-bin` AUR package.
 - The canonical `suzumushi` executable. Packages may add a relative
@@ -53,7 +55,8 @@ The complete local player is implemented. The next work is Phase 7.
 - Lyrics, streaming services, RSS, downloads, accounts, cloud sync, remote
   control, and any IPv4 or IPv6 runtime access.
 - SQLite, playlist files, and live filesystem watching in v1.
-- A custom Zellij plugin. The normal status command is enough.
+- Waybar, tmux, and Zellij status renderers.
+- Desktop notifications.
 
 The mascot remains part of the project identity. It belongs in release assets
 and the future landing page, not in the terminal playback path.
@@ -86,6 +89,14 @@ not read or write them. Their released configuration is read through a narrow
 migration that discards only the retired prototype fields. New configuration is
 versioned and remains strict.
 
+`state/session.json` is the single private, bounded, versioned resume
+checkpoint. It stores stable entry identifiers rather than media paths. Queue
+changes are checkpointed immediately, playback position is checkpointed at a
+bounded interval and on shutdown, and clearing the Queue removes the
+checkpoint. Missing entries are skipped after the next scan; malformed,
+oversized, or unsupported safe checkpoint files are ignored with a visible
+warning. Unsafe file identities still fail closed.
+
 The scanner performs one deterministic descriptor-rooted traversal per request.
 It never follows directory symlinks. File symlinks are opened with Linux secure
 resolution and no weaker path fallback. Audio extensions are discovery hints,
@@ -116,10 +127,8 @@ query text; `Esc` closes search and `Ctrl+c` quits globally.
 - The session retains the selected root descriptor and filesystem identity.
   Config, locking, scanning, logging, and state files are opened relative
   to that descriptor.
-- `waybar`, `tmux`, and `zellij` will be read-only renderers of the bounded,
-  versioned `state/now-playing.json`. A live unchanged session refreshes it at
-  least every five seconds so those renderers can detect stale state. They never
-  scan or start audio.
+- The future MPRIS adapter will route D-Bus requests into the existing app-owned
+  playback actions. It will not create a second playback state.
 - `src/main.rs` remains thin. Behavior exposed to integration tests lives in
   the library target. A module is added only with its first real behavior.
 
@@ -139,8 +148,8 @@ expensive work.
   no-follow access where identity matters.
 - The current-UID active TUI lock lives below verified `$XDG_RUNTIME_DIR`.
   There is no `/tmp` fallback and stale files are never blindly deleted.
-- Terminal, Waybar/Pango, tmux, Zellij, notification, JSON, and file URI output
-  each receive their own bounded escaping rules when implemented.
+- Terminal, JSON, file URI, and later D-Bus values each receive bounded
+  validation or escaping appropriate to their destination.
 - Known dependency advisories are denied. `RUSTSEC-2024-0436` is temporarily
   accepted because it reports unmaintained `paste 1.0.15`, reached only through
   Lofty, not a vulnerability. Review or remove the exception by 2026-11-09.
@@ -233,52 +242,43 @@ against the local PipeWire-backed Linux output device.
 **Status:** complete
 
 - [x] Add volume, mute, seek, progress, elapsed time, shuffle, and repeat.
-- [x] Add pitch-preserving speeds across `0.5x..=2.0x`. This is required, not an
-  optional spoken-audio extra.
 - [x] Fill the Player panel with title, creator, progress, elapsed and duration,
-  volume, mute, state, and speed.
+  volume, mute, state, shuffle, and repeat.
 - [x] Write the bounded, versioned `state/now-playing.json` projection.
+- [x] Restore the last queue, current track, and position without starting
+  playback automatically.
 
 Done when the terminal is a complete local player and position remains correct
-through pause, seek, speed changes, next, previous, and end of track.
+through pause, seek, next, previous, end of track, and a clean close/reopen
+cycle.
 
 Verified with app-owned control, shuffle-history, repeat, generation, and
 cross-lane ordering tests; preroll-free accurate seeking through every verified
 container; deterministic fake-device gain, restart, position, and drain tests;
-WSOLA pitch and duration checks at `0.5x` and `2.0x`, including sub-window clips;
 bounded escaped-state, atomic replacement, heartbeat, and failure-cleanup tests;
+bounded resume-state parsing, stale-entry recovery, clear-state, and
+resume-position tests;
 reviewed 80x24 and 120x32 snapshots; the full `mise run ci` sequence; a PTY
-search, queue, and state-file journey; and the real Linux audio-device PTY check.
+search, queue, state-file, and close/reopen journey; and the real Linux
+audio-device PTY check.
 
 **Milestone:** playable core, planned `0.3.0`.
 
-### Phase 7: Waybar, tmux, and Zellij
+### Phase 7: MPRIS and global media keys
 
 **Status:** next
 
-- Add all three fast renderer commands from the same state file.
-- Keep outputs single-line, bounded, stale-aware, and specific to each
-  formatting language.
-- Provide working snippets for Waybar, tmux, and `zjstatus`.
-
-Done when every renderer works without starting the TUI, scanning, or opening
-an audio device.
-
-### Phase 8: MPRIS and media keys
-
-**Status:** not started
-
 - Add one MPRIS identity on the winning terminal session.
-- Route media keys and `playerctl` through normal app actions.
+- Route global media keys and `playerctl` through normal app actions.
 - Validate stale track IDs and playback generations for seeking.
-- Publish text metadata only. Notifications are text only.
+- Publish bounded text metadata only.
 
 Done when play, pause, stop, next, previous, seek, volume, and metadata work
-through MPRIS without a second playback state.
+through MPRIS and global media keys without a second playback state.
 
-**Milestone:** desktop and status integrations, planned `0.4.0`.
+**Milestone:** desktop controls, planned `0.4.0`.
 
-### Phase 9: terminal polish and local installation
+### Phase 8: terminal polish and local installation
 
 **Status:** not started
 
@@ -295,7 +295,7 @@ through MPRIS without a second playback state.
 Done when a friend can clone the repository, run one install command, initialize
 a root, and use the player without reading project internals.
 
-### Phase 10: Linux release and AUR
+### Phase 9: Linux release and AUR
 
 **Status:** not started
 
