@@ -11,9 +11,9 @@ into the player and reacts only to playback state.
 
 ## Current status
 
-Version `0.2.0` is released. The development branch adds the complete local
-library, search, queue browser, and playback controls to its safe root,
-scanner, metadata, terminal, logging, test, fuzz, and CI foundation.
+Version `0.3.0` is released. It contains the complete local library, search,
+queue browser, and playback controls on the safe root, scanner, metadata,
+terminal, logging, test, fuzz, and CI foundation.
 
 ```text
 +------------------+----------------------------------------+------------------+
@@ -283,7 +283,7 @@ Suzu cycle, 80x24, and 120x32 snapshots; the full `mise run ci` sequence; a PTY
 search, queue, state-file, and close/reopen journey; and the real Linux
 audio-device PTY check.
 
-**Milestone:** playable core, planned `0.3.0`.
+**Milestone:** playable core, released `0.3.0`.
 
 ### Phase 7: MPRIS and global media keys
 
@@ -357,7 +357,7 @@ No website or Node dependency belongs in this repository.
 ## Versioning
 
 `CHANGELOG.md` holds user-visible changes. Git tags use a `v` prefix while Cargo
-and changelog versions do not. `v0.2.0` is the released terminal foundation.
-The next planned milestones are `0.3.0`, `0.4.0`, and `1.0.0` as described
-above. A version is tagged only after local CI, real executable QA, and the
-exact pushed commit are green.
+and changelog versions do not. `v0.2.0` is the released terminal foundation and
+`v0.3.0` is the released playable core. The next planned milestones are `0.4.0`
+and `1.0.0` as described above. A version is tagged only after local CI, real
+executable QA, and the exact pushed commit are green.

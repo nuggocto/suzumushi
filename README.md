@@ -108,9 +108,8 @@ automatic resampling are not current support claims.
 
 ## Status
 
-Version `0.2.0` is the released terminal foundation. The current development
-checkout contains the complete local library and player. The remaining work is
-MPRIS with global media keys, terminal polish with local installation, then the
-verified Linux release and `suzumushi-bin` AUR package.
+Version `0.3.0` is the released complete local library and player. The remaining
+work is MPRIS with global media keys, terminal polish with local installation,
+then the verified Linux release and `suzumushi-bin` AUR package.
 
 The full contract and roadmap live in [PROJECT.md](PROJECT.md).
