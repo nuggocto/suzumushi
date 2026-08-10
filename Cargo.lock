@@ -1332,6 +1332,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "wsola",
 ]
 
 [[package]]
@@ -1900,6 +1901,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "wsola"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "542a5d4e1f44b1af2eeef27a918d15d117ce326af641153efbfe436b586418f5"
+dependencies = [
+ "thiserror 2.0.20",
 ]
 
 [[package]]

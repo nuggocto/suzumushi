@@ -5,12 +5,13 @@
 use std::ffi::OsStr;
 use std::io;
 use std::mem::size_of;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::audio::{AudioEvent, AudioFormat};
+use crate::audio::{AudioEvent, AudioFormat, AudioPosition, PlaybackSettings, PlaybackSpeed};
 use crate::config::{Config, UI_STATE_SCRATCH_BYTES};
 use crate::display::{bounded_text, terminal_safe};
 use crate::errors::{AppError, AppResult};
@@ -21,7 +22,7 @@ use crate::model::{
 };
 use crate::paths::SelectedRoot;
 
-const TUI_STARTUP_OPEN_FILES_PEAK: usize = 5;
+const TUI_STARTUP_OPEN_FILES_PEAK: usize = 6;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Focus {
@@ -101,19 +102,71 @@ pub enum PlaybackStatus {
     Error,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RepeatMode {
+    Off,
+    All,
+    One,
+}
+
+impl RepeatMode {
+    fn next(self) -> Self {
+        match self {
+            Self::Off => Self::All,
+            Self::All => Self::One,
+            Self::One => Self::Off,
+        }
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::All => "all",
+            Self::One => "one",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum PlaybackIntent {
-    Load { generation: u64, item: QueueItem },
-    Pause { generation: u64 },
-    Resume { generation: u64 },
-    Stop { generation: u64 },
+    Load {
+        generation: u64,
+        item: QueueItem,
+        settings: PlaybackSettings,
+    },
+    Pause {
+        generation: u64,
+    },
+    Resume {
+        generation: u64,
+    },
+    Stop {
+        generation: u64,
+    },
+    SetGain {
+        generation: u64,
+        volume_percent: u8,
+        muted: bool,
+    },
+    Seek {
+        generation: u64,
+        position: Duration,
+    },
+    SetSpeed {
+        generation: u64,
+        speed: PlaybackSpeed,
+    },
 }
 
 #[derive(Debug)]
 struct PlaybackState {
     current: Option<QueueItem>,
     position_hint: usize,
+    timeline_revision: u64,
     format: Option<AudioFormat>,
+    position: Duration,
+    duration: Option<Duration>,
 }
 
 impl PlaybackState {
@@ -121,7 +174,10 @@ impl PlaybackState {
         Self {
             current: None,
             position_hint: 0,
+            timeline_revision: 0,
             format: None,
+            position: Duration::ZERO,
+            duration: None,
         }
     }
 }
@@ -155,10 +211,18 @@ pub struct AppState {
     pub queue_generation: u64,
     pub playback_generation: u64,
     pub playback_status: PlaybackStatus,
+    pub volume_percent: u8,
+    pub muted: bool,
+    pub speed: PlaybackSpeed,
+    pub shuffle: bool,
+    pub repeat: RepeatMode,
     queue_max_items: usize,
     queue_max_bytes: usize,
     status_text_max_bytes: usize,
     next_queue_item_id: u64,
+    shuffle_order: Vec<u64>,
+    shuffle_cursor: Option<usize>,
+    shuffle_seed: u64,
     playback: PlaybackState,
 }
 
@@ -192,9 +256,19 @@ impl AppState {
                 AppError::Resource("library browser byte reservation overflow".into())
             })?;
         let search_bytes = search_reservation_bytes(config)?;
-        if browser_bytes.saturating_add(search_bytes) > UI_STATE_SCRATCH_BYTES {
+        let shuffle_bytes = config
+            .queue
+            .max_items
+            .checked_mul(size_of::<u64>())
+            .ok_or_else(|| AppError::Resource("shuffle reservation overflow".into()))?;
+        if browser_bytes
+            .saturating_add(search_bytes)
+            .saturating_add(shuffle_bytes)
+            > UI_STATE_SCRATCH_BYTES
+        {
             return Err(AppError::InvalidConfig(
-                "library browser and search reservations exceed the UI/state scratch budget".into(),
+                "library browser, search, and shuffle reservations exceed the UI/state scratch budget"
+                    .into(),
             ));
         }
 
@@ -206,30 +280,9 @@ impl AppState {
             .position(|row| matches!(row, BrowserRow::Track { .. }))
             .unwrap_or(0);
 
-        let mut query = String::new();
-        query
-            .try_reserve_exact(config.search.max_query_bytes)
-            .map_err(|error| AppError::Resource(format!("cannot reserve search query: {error}")))?;
-        let mut results = Vec::new();
-        reserve_exact(&mut results, config.search.max_results, "search results")?;
-        let mut prefix_table: Vec<usize> = Vec::new();
-        reserve_exact(
-            &mut prefix_table,
-            config.search.max_query_bytes,
-            "search prefix table",
-        )?;
-
-        let mut queue = Vec::new();
-        reserve_exact(&mut queue, config.queue.max_items, "queue")?;
-        let queue_bytes = queue
-            .capacity()
-            .checked_mul(size_of::<QueueItem>())
-            .ok_or_else(|| AppError::Resource("queue byte reservation overflow".into()))?;
-        if queue_bytes > config.queue.max_bytes {
-            return Err(AppError::InvalidConfig(
-                "reserved queue capacity exceeds queue.max_bytes".into(),
-            ));
-        }
+        let search = allocate_search(config, library_selection)?;
+        let (queue, shuffle_order) = allocate_queue(config)?;
+        let shuffle_seed = random_seed();
 
         let status_message = if index.complete {
             format!(
@@ -255,24 +308,24 @@ impl AppState {
             index,
             browser_rows,
             library_selection,
-            search: SearchState {
-                active: false,
-                query,
-                results,
-                prefix_table,
-                saved_selection: library_selection,
-                max_results: config.search.max_results,
-                max_query_bytes: config.search.max_query_bytes,
-            },
+            search,
             queue,
             queue_selection: 0,
             queue_generation: 0,
             playback_generation: 0,
             playback_status: PlaybackStatus::Stopped,
+            volume_percent: 100,
+            muted: false,
+            speed: PlaybackSpeed::NORMAL,
+            shuffle: false,
+            repeat: RepeatMode::Off,
             queue_max_items: config.queue.max_items,
             queue_max_bytes: config.queue.max_bytes,
             status_text_max_bytes: config.runtime.status_text_max_bytes,
             next_queue_item_id: 1,
+            shuffle_order,
+            shuffle_cursor: None,
+            shuffle_seed,
             playback: PlaybackState::new(),
         })
     }
@@ -284,8 +337,7 @@ impl AppState {
             return None;
         }
         if self.search.active {
-            self.search_key(key);
-            None
+            self.search_key(key)
         } else if let Some(action) = self.input.key(key, now) {
             self.apply(action)
         } else {
@@ -303,7 +355,7 @@ impl AppState {
             AppAction::MoveNext => self.move_selection(true),
             AppAction::MoveFirst => self.move_to_edge(false),
             AppAction::MoveLast => self.move_to_edge(true),
-            AppAction::Activate => self.activate(),
+            AppAction::Activate => return self.activate(),
             AppAction::SearchOpen => self.open_search(),
             AppAction::QueueRemove => self.remove_queue_item(),
             AppAction::QueueClear => self.clear_queue(),
@@ -313,6 +365,16 @@ impl AppState {
             AppAction::Stop => return self.stop_playback(),
             AppAction::Next => return self.next_track(),
             AppAction::Previous => return self.previous_track(),
+            AppAction::SeekBackward => return self.seek(false),
+            AppAction::SeekForward => return self.seek(true),
+            AppAction::VolumeDown => return self.change_volume(false),
+            AppAction::VolumeUp => return self.change_volume(true),
+            AppAction::ToggleMute => return self.toggle_mute(),
+            AppAction::ToggleShuffle => self.toggle_shuffle(),
+            AppAction::CycleRepeat => self.cycle_repeat(),
+            AppAction::SpeedDown => return self.change_speed(self.speed.slower()),
+            AppAction::SpeedUp => return self.change_speed(self.speed.faster()),
+            AppAction::SpeedNormal => return self.change_speed(PlaybackSpeed::NORMAL),
             AppAction::PalettePlaceholder => {
                 self.set_status("The command palette is not available yet");
             }
@@ -411,8 +473,76 @@ impl AppState {
     }
 
     #[must_use]
+    pub(crate) fn state_identity(&self, max_bytes: usize) -> (String, String) {
+        let Some(item) = self.playback.current else {
+            return ("Nothing playing".into(), String::new());
+        };
+        let Some((entry, asset)) = self.media_for_item(item) else {
+            return ("Stale track".into(), String::new());
+        };
+        let title = asset.tags.title.as_deref().map_or_else(
+            || {
+                let filename = entry
+                    .display_path
+                    .file_stem()
+                    .map_or(&[][..], OsStr::as_bytes);
+                bounded_text(&String::from_utf8_lossy(filename), max_bytes)
+            },
+            |title| bounded_text(title, max_bytes),
+        );
+        let creator = asset
+            .tags
+            .artist
+            .as_deref()
+            .or(asset.tags.album_artist.as_deref())
+            .map_or_else(
+                || "Unknown creator".into(),
+                |creator| bounded_text(creator, max_bytes),
+            );
+        (title, creator)
+    }
+
+    #[must_use]
     pub(crate) fn playback_format(&self) -> Option<AudioFormat> {
         self.playback.format
+    }
+
+    #[must_use]
+    pub(crate) const fn playback_position(&self) -> Duration {
+        self.playback.position
+    }
+
+    #[must_use]
+    pub(crate) const fn playback_duration(&self) -> Option<Duration> {
+        self.playback.duration
+    }
+
+    #[must_use]
+    pub(crate) fn queue_position(&self) -> Option<usize> {
+        self.current_queue_index().map(|index| index + 1)
+    }
+
+    pub(crate) fn audio_position(&mut self, update: AudioPosition) {
+        if update.generation != self.playback_generation
+            || self.playback.current.is_none()
+            || matches!(
+                self.playback_status,
+                PlaybackStatus::Stopped | PlaybackStatus::Error
+            )
+            || update.timeline_revision < self.playback.timeline_revision
+        {
+            return;
+        }
+        self.playback.timeline_revision = update.timeline_revision;
+        self.playback.position = update.position;
+        if update.duration.is_some() {
+            self.playback.duration = update.duration;
+        }
+    }
+
+    pub(crate) fn session_stopped(&mut self) {
+        self.playback_status = PlaybackStatus::Stopped;
+        self.playback.format = None;
     }
 
     pub(crate) fn audio_event(&mut self, event: AudioEvent) -> Option<PlaybackIntent> {
@@ -421,6 +551,8 @@ impl AppState {
             | AudioEvent::Paused { generation }
             | AudioEvent::Resumed { generation }
             | AudioEvent::Stopped { generation }
+            | AudioEvent::Seeked { generation, .. }
+            | AudioEvent::SpeedChanged { generation, .. }
             | AudioEvent::Finished { generation }
             | AudioEvent::Failed { generation, .. } => *generation,
         };
@@ -428,9 +560,17 @@ impl AppState {
             return None;
         }
         match event {
-            AudioEvent::Started { format, .. } => {
+            AudioEvent::Started {
+                timeline_revision,
+                format,
+                duration,
+                position,
+                ..
+            } => {
                 self.set_playback_status(PlaybackStatus::Playing);
                 self.playback.format = Some(format);
+                self.playback.duration = duration;
+                self.apply_event_position(timeline_revision, position);
                 self.set_status("Playing");
                 None
             }
@@ -447,7 +587,28 @@ impl AppState {
             AudioEvent::Stopped { .. } => {
                 self.set_playback_status(PlaybackStatus::Stopped);
                 self.playback.format = None;
+                self.playback.position = Duration::ZERO;
                 self.set_status("Stopped");
+                None
+            }
+            AudioEvent::Seeked {
+                timeline_revision,
+                position,
+                ..
+            } => {
+                self.apply_event_position(timeline_revision, position);
+                self.set_status("Seeked");
+                None
+            }
+            AudioEvent::SpeedChanged {
+                timeline_revision,
+                speed,
+                position,
+                ..
+            } => {
+                self.speed = speed;
+                self.apply_event_position(timeline_revision, position);
+                self.set_status(&format!("Speed: {}", speed.label()));
                 None
             }
             AudioEvent::Finished { .. } => self.advance_after_finish(),
@@ -483,14 +644,14 @@ impl AppState {
             .map(|asset_index| &self.index.assets[asset_index])
     }
 
-    fn search_key(&mut self, key: KeyEvent) {
+    fn search_key(&mut self, key: KeyEvent) -> Option<PlaybackIntent> {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Esc => {
                 self.close_search();
                 self.set_status("Search closed");
             }
-            KeyCode::Enter => self.activate_search_result(),
+            KeyCode::Enter => return self.activate_search_result(),
             KeyCode::Up => self.move_library_selection(false),
             KeyCode::Down => self.move_library_selection(true),
             KeyCode::Char('p') if control => self.move_library_selection(false),
@@ -517,6 +678,7 @@ impl AppState {
             }
             _ => {}
         }
+        None
     }
 
     fn open_search(&mut self) {
@@ -539,13 +701,14 @@ impl AppState {
             .min(self.browser_rows.len().saturating_sub(1));
     }
 
-    fn activate_search_result(&mut self) {
+    fn activate_search_result(&mut self) -> Option<PlaybackIntent> {
         let selected = self.selected_entry_index();
         self.close_search();
         if let Some(entry_index) = selected {
-            self.queue_entry(entry_index);
+            self.queue_entry(entry_index)
         } else {
             self.set_status("No search result selected");
+            None
         }
     }
 
@@ -607,20 +770,22 @@ impl AppState {
         }
     }
 
-    fn activate(&mut self) {
+    fn activate(&mut self) -> Option<PlaybackIntent> {
         if self.focus != Focus::Library {
-            return;
+            return None;
         }
         match self.library_row(self.library_selection) {
             Some(BrowserRow::Track { entry_index, .. }) => self.queue_entry(entry_index),
             Some(BrowserRow::Playlist { playlist_index }) => {
-                self.queue_playlist(playlist_index, self.library_selection);
+                self.queue_playlist(playlist_index, self.library_selection)
             }
             Some(BrowserRow::Folder { .. }) => {
                 self.set_status("Folder tracks are shown below");
+                None
             }
             Some(BrowserRow::LibraryRoot | BrowserRow::PlaylistsRoot) | None => {
                 self.set_status("Select a track or playlist to add it to the queue");
+                None
             }
         }
     }
@@ -652,7 +817,7 @@ impl AppState {
                     self.set_status("Queue a track before starting playback");
                     None
                 } else {
-                    self.start_queue_index(self.queue_selection.min(self.queue.len() - 1))
+                    self.start_new_shuffle_round(self.queue_selection.min(self.queue.len() - 1))
                 }
             }
         }
@@ -680,8 +845,7 @@ impl AppState {
         if self.queue.is_empty() {
             return self.stop_playback();
         }
-        let next = self.next_queue_index();
-        if next < self.queue.len() {
+        if let Some(next) = self.next_queue_index(self.repeat == RepeatMode::All) {
             self.queue_selection = next;
             self.start_queue_index(next)
         } else if matches!(
@@ -705,19 +869,29 @@ impl AppState {
             return self.stop_playback();
         }
         let current = self.current_queue_index().unwrap_or(self.queue_selection);
-        let previous = current.saturating_sub(1).min(self.queue.len() - 1);
+        let previous = self
+            .previous_queue_index(self.repeat == RepeatMode::All)
+            .unwrap_or(current)
+            .min(self.queue.len() - 1);
         self.queue_selection = previous;
         self.start_queue_index(previous)
     }
 
     fn advance_after_finish(&mut self) -> Option<PlaybackIntent> {
-        let next = self.next_queue_index();
-        if next < self.queue.len() {
+        if self.repeat == RepeatMode::One
+            && let Some(current) = self.current_queue_index()
+        {
+            return self.start_queue_index(current);
+        }
+        if let Some(next) = self.next_queue_index(self.repeat == RepeatMode::All) {
             self.queue_selection = next;
             self.start_queue_index(next)
         } else {
             self.set_playback_status(PlaybackStatus::Stopped);
             self.playback.format = None;
+            if let Some(duration) = self.playback.duration {
+                self.playback.position = duration;
+            }
             self.set_status("Queue finished");
             None
         }
@@ -732,11 +906,32 @@ impl AppState {
         self.playback_generation = generation;
         self.playback.current = Some(item);
         self.playback.position_hint = index;
+        if self.shuffle {
+            self.shuffle_cursor = self
+                .shuffle_order
+                .iter()
+                .position(|candidate| *candidate == item.instance_id);
+        }
+        self.playback.timeline_revision = 0;
         self.playback.format = None;
+        self.playback.position = Duration::ZERO;
+        self.playback.duration = None;
         self.set_playback_status(PlaybackStatus::Loading);
         let title = self.queue_item_title(item, self.status_text_max_bytes);
         self.set_status(&format!("Loading: {title}"));
-        Some(PlaybackIntent::Load { generation, item })
+        Some(PlaybackIntent::Load {
+            generation,
+            item,
+            settings: self.playback_settings(),
+        })
+    }
+
+    fn start_new_shuffle_round(&mut self, index: usize) -> Option<PlaybackIntent> {
+        let intent = self.start_queue_index(index);
+        if intent.is_some() {
+            self.refresh_shuffle_order();
+        }
+        intent
     }
 
     fn current_queue_index(&self) -> Option<usize> {
@@ -746,11 +941,263 @@ impl AppState {
             .position(|item| item.instance_id == current.instance_id)
     }
 
-    fn next_queue_index(&self) -> usize {
-        self.current_queue_index().map_or_else(
+    fn apply_event_position(&mut self, timeline_revision: u64, position: Duration) {
+        if timeline_revision > self.playback.timeline_revision {
+            self.playback.timeline_revision = timeline_revision;
+            self.playback.position = position;
+        }
+    }
+
+    fn next_queue_index(&self, wrap: bool) -> Option<usize> {
+        if self.queue.is_empty() {
+            return None;
+        }
+        if self.shuffle {
+            let current = self.playback.current.map(|item| item.instance_id);
+            let position = current.and_then(|id| {
+                self.shuffle_order
+                    .iter()
+                    .position(|candidate| *candidate == id)
+            });
+            let position = position.or(self.shuffle_cursor);
+            let next = position.map_or(0, |position| position.saturating_add(1));
+            let order_index = if next < self.shuffle_order.len() {
+                next
+            } else if wrap {
+                0
+            } else {
+                return None;
+            };
+            let instance_id = *self.shuffle_order.get(order_index)?;
+            return self
+                .queue
+                .iter()
+                .position(|item| item.instance_id == instance_id);
+        }
+        let next = self.current_queue_index().map_or_else(
             || self.playback.position_hint.min(self.queue.len()),
             |index| index.saturating_add(1),
-        )
+        );
+        if next < self.queue.len() {
+            Some(next)
+        } else if wrap {
+            Some(0)
+        } else {
+            None
+        }
+    }
+
+    fn previous_queue_index(&self, wrap: bool) -> Option<usize> {
+        if self.queue.is_empty() {
+            return None;
+        }
+        if self.shuffle {
+            let current = self.playback.current.map(|item| item.instance_id)?;
+            let position = self
+                .shuffle_order
+                .iter()
+                .position(|candidate| *candidate == current);
+            let order_index = if let Some(position) = position {
+                if let Some(previous) = position.checked_sub(1) {
+                    previous
+                } else if wrap {
+                    self.shuffle_order.len().checked_sub(1)?
+                } else {
+                    return None;
+                }
+            } else if let Some(previous) = self.shuffle_cursor {
+                previous
+            } else if wrap {
+                self.shuffle_order.len().checked_sub(1)?
+            } else {
+                return None;
+            };
+            let instance_id = self.shuffle_order[order_index];
+            return self
+                .queue
+                .iter()
+                .position(|item| item.instance_id == instance_id);
+        }
+        let current = self.current_queue_index().unwrap_or(self.queue_selection);
+        current
+            .checked_sub(1)
+            .or_else(|| wrap.then(|| self.queue.len() - 1))
+    }
+
+    const fn playback_settings(&self) -> PlaybackSettings {
+        PlaybackSettings {
+            volume_percent: self.volume_percent,
+            muted: self.muted,
+            speed: self.speed,
+        }
+    }
+
+    fn change_volume(&mut self, increase: bool) -> Option<PlaybackIntent> {
+        self.volume_percent = if increase {
+            self.volume_percent.saturating_add(5).min(100)
+        } else {
+            self.volume_percent.saturating_sub(5)
+        };
+        self.set_status(&format!("Volume: {}%", self.volume_percent));
+        self.gain_intent()
+    }
+
+    fn toggle_mute(&mut self) -> Option<PlaybackIntent> {
+        self.muted = !self.muted;
+        self.set_status(if self.muted { "Muted" } else { "Unmuted" });
+        self.gain_intent()
+    }
+
+    fn gain_intent(&self) -> Option<PlaybackIntent> {
+        self.playback.current.filter(|_| self.worker_has_track())?;
+        Some(PlaybackIntent::SetGain {
+            generation: self.playback_generation,
+            volume_percent: self.volume_percent,
+            muted: self.muted,
+        })
+    }
+
+    fn seek(&mut self, forward: bool) -> Option<PlaybackIntent> {
+        if !matches!(
+            self.playback_status,
+            PlaybackStatus::Playing | PlaybackStatus::Paused
+        ) {
+            self.set_status("Nothing seekable is playing");
+            return None;
+        }
+        let step = Duration::from_secs(5);
+        let position = if forward {
+            self.playback.position.saturating_add(step)
+        } else {
+            self.playback.position.saturating_sub(step)
+        };
+        let position = self
+            .playback
+            .duration
+            .map_or(position, |duration| position.min(duration));
+        self.playback.position = position;
+        self.set_status(if forward {
+            "Seek forward 5 seconds"
+        } else {
+            "Seek backward 5 seconds"
+        });
+        Some(PlaybackIntent::Seek {
+            generation: self.playback_generation,
+            position,
+        })
+    }
+
+    fn change_speed(&mut self, speed: PlaybackSpeed) -> Option<PlaybackIntent> {
+        self.speed = speed;
+        self.set_status(&format!("Speed: {}", speed.label()));
+        if self.worker_has_track() {
+            Some(PlaybackIntent::SetSpeed {
+                generation: self.playback_generation,
+                speed,
+            })
+        } else {
+            None
+        }
+    }
+
+    fn worker_has_track(&self) -> bool {
+        self.playback.current.is_some()
+            && matches!(
+                self.playback_status,
+                PlaybackStatus::Loading | PlaybackStatus::Playing | PlaybackStatus::Paused
+            )
+    }
+
+    fn toggle_shuffle(&mut self) {
+        self.shuffle = !self.shuffle;
+        self.refresh_shuffle_order();
+        self.set_status(if self.shuffle {
+            "Shuffle: on"
+        } else {
+            "Shuffle: off"
+        });
+    }
+
+    fn cycle_repeat(&mut self) {
+        self.repeat = self.repeat.next();
+        self.set_status(&format!("Repeat: {}", self.repeat.label()));
+    }
+
+    fn refresh_shuffle_order(&mut self) {
+        let current = self
+            .worker_has_track()
+            .then_some(self.playback.current)
+            .flatten();
+        self.shuffle_order.clear();
+        self.shuffle_cursor = None;
+        if !self.shuffle {
+            return;
+        }
+        self.shuffle_order
+            .extend(self.queue.iter().map(|item| item.instance_id));
+        for right in (1..self.shuffle_order.len()).rev() {
+            let left = usize::try_from(self.next_random() % (right as u64 + 1))
+                .expect("shuffle index is bounded by usize");
+            self.shuffle_order.swap(left, right);
+        }
+        if let Some(current) = current
+            && let Some(position) = self
+                .shuffle_order
+                .iter()
+                .position(|candidate| *candidate == current.instance_id)
+        {
+            self.shuffle_order.swap(0, position);
+            self.shuffle_cursor = Some(0);
+        }
+    }
+
+    fn extend_shuffle_order(&mut self, queue_start: usize) {
+        if !self.shuffle {
+            return;
+        }
+        let suffix_start = self
+            .shuffle_cursor
+            .map_or(0, |cursor| cursor.saturating_add(1))
+            .min(self.shuffle_order.len());
+        self.shuffle_order.extend(
+            self.queue[queue_start.min(self.queue.len())..]
+                .iter()
+                .map(|item| item.instance_id),
+        );
+        for right in (suffix_start.saturating_add(1)..self.shuffle_order.len()).rev() {
+            let width = right - suffix_start + 1;
+            let offset = usize::try_from(self.next_random() % width as u64)
+                .expect("shuffle suffix index is bounded by usize");
+            self.shuffle_order.swap(suffix_start + offset, right);
+        }
+    }
+
+    fn remove_from_shuffle_order(&mut self, instance_id: u64) {
+        if !self.shuffle {
+            return;
+        }
+        let Some(position) = self
+            .shuffle_order
+            .iter()
+            .position(|candidate| *candidate == instance_id)
+        else {
+            return;
+        };
+        self.shuffle_order.remove(position);
+        if let Some(cursor) = self.shuffle_cursor
+            && position <= cursor
+        {
+            self.shuffle_cursor = cursor.checked_sub(1);
+        }
+    }
+
+    fn next_random(&mut self) -> u64 {
+        let mut value = self.shuffle_seed;
+        value ^= value << 13;
+        value ^= value >> 7;
+        value ^= value << 17;
+        self.shuffle_seed = value;
+        value
     }
 
     fn reconcile_playback_position(&mut self) {
@@ -765,14 +1212,16 @@ impl AppState {
         self.playback_status = status;
     }
 
-    fn queue_entry(&mut self, entry_index: usize) {
+    fn queue_entry(&mut self, entry_index: usize) -> Option<PlaybackIntent> {
         let Some(entry_id) = self.index.entries.get(entry_index).map(|entry| entry.id) else {
             self.set_status("The selected track is no longer available");
-            return;
+            return None;
         };
         if !self.can_append_queue(1) {
-            return;
+            return None;
         }
+        let start_now = !self.worker_has_track();
+        let queue_index = self.queue.len();
         let title = self.entry_title(entry_index);
         self.queue.push(QueueItem {
             instance_id: self.next_queue_item_id,
@@ -783,9 +1232,20 @@ impl AppState {
         self.next_queue_item_id += 1;
         self.queue_generation += 1;
         self.set_status(&format!("Queued: {title}"));
+        if start_now {
+            self.queue_selection = queue_index;
+            self.start_new_shuffle_round(queue_index)
+        } else {
+            self.extend_shuffle_order(queue_index);
+            None
+        }
     }
 
-    fn queue_playlist(&mut self, playlist_index: usize, browser_position: usize) {
+    fn queue_playlist(
+        &mut self,
+        playlist_index: usize,
+        browser_position: usize,
+    ) -> Option<PlaybackIntent> {
         let Some(playlist_name) = self
             .index
             .playlists
@@ -793,7 +1253,7 @@ impl AppState {
             .map(|playlist| playlist.name.clone())
         else {
             self.set_status("The selected playlist is no longer available");
-            return;
+            return None;
         };
         let start = browser_position
             .saturating_add(1)
@@ -808,7 +1268,7 @@ impl AppState {
             .count();
         if track_count == 0 {
             self.set_status("Playlist is empty");
-            return;
+            return None;
         }
         if self.browser_rows[start..end].iter().any(|row| {
             matches!(
@@ -818,11 +1278,13 @@ impl AppState {
             )
         }) {
             self.set_status("The playlist contains a stale track");
-            return;
+            return None;
         }
         if !self.can_append_queue(track_count) {
-            return;
+            return None;
         }
+        let start_now = !self.worker_has_track();
+        let first_index = self.queue.len();
         for position in start..end {
             if let BrowserRow::Track { entry_index, .. } = self.browser_rows[position] {
                 let entry = &self.index.entries[entry_index];
@@ -840,6 +1302,13 @@ impl AppState {
         self.set_status(&format!(
             "Queued playlist: {playlist_name} ({track_count} {track_label})"
         ));
+        if start_now {
+            self.queue_selection = first_index;
+            self.start_new_shuffle_round(first_index)
+        } else {
+            self.extend_shuffle_order(first_index);
+            None
+        }
     }
 
     fn remove_queue_item(&mut self) {
@@ -852,6 +1321,7 @@ impl AppState {
         let removed = self.queue[self.queue_selection];
         let title = self.entry_title(removed.entry_index);
         self.queue.remove(self.queue_selection);
+        self.remove_from_shuffle_order(removed.instance_id);
         self.queue_selection = self.queue_selection.min(self.queue.len().saturating_sub(1));
         self.reconcile_playback_position();
         self.queue_generation += 1;
@@ -866,6 +1336,8 @@ impl AppState {
             return;
         }
         self.queue.clear();
+        self.shuffle_order.clear();
+        self.shuffle_cursor = None;
         self.queue_selection = 0;
         self.reconcile_playback_position();
         self.queue_generation += 1;
@@ -940,6 +1412,63 @@ fn reserve_exact<T>(items: &mut Vec<T>, capacity: usize, name: &str) -> AppResul
     items
         .try_reserve_exact(capacity)
         .map_err(|error| AppError::Resource(format!("cannot reserve {name}: {error}")))
+}
+
+fn allocate_search(config: &Config, saved_selection: usize) -> AppResult<SearchState> {
+    let mut query = String::new();
+    query
+        .try_reserve_exact(config.search.max_query_bytes)
+        .map_err(|error| AppError::Resource(format!("cannot reserve search query: {error}")))?;
+    let mut results = Vec::new();
+    reserve_exact(&mut results, config.search.max_results, "search results")?;
+    let mut prefix_table = Vec::new();
+    reserve_exact(
+        &mut prefix_table,
+        config.search.max_query_bytes,
+        "search prefix table",
+    )?;
+    Ok(SearchState {
+        active: false,
+        query,
+        results,
+        prefix_table,
+        saved_selection,
+        max_results: config.search.max_results,
+        max_query_bytes: config.search.max_query_bytes,
+    })
+}
+
+fn allocate_queue(config: &Config) -> AppResult<(Vec<QueueItem>, Vec<u64>)> {
+    let mut queue = Vec::new();
+    reserve_exact(&mut queue, config.queue.max_items, "queue")?;
+    let queue_bytes = queue
+        .capacity()
+        .checked_mul(size_of::<QueueItem>())
+        .ok_or_else(|| AppError::Resource("queue byte reservation overflow".into()))?;
+    if queue_bytes > config.queue.max_bytes {
+        return Err(AppError::InvalidConfig(
+            "reserved queue capacity exceeds queue.max_bytes".into(),
+        ));
+    }
+    let mut shuffle_order = Vec::new();
+    reserve_exact(&mut shuffle_order, config.queue.max_items, "shuffle order")?;
+    Ok((queue, shuffle_order))
+}
+
+fn random_seed() -> u64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .to_le_bytes();
+    let mut low = [0_u8; size_of::<u64>()];
+    low.copy_from_slice(&nanos[..size_of::<u64>()]);
+    let seed = u64::from_le_bytes(low) ^ u64::from(std::process::id());
+    if seed == 0 {
+        0x9e37_79b9_7f4a_7c15
+    } else {
+        seed
+    }
 }
 
 fn search_reservation_bytes(config: &Config) -> AppResult<usize> {
@@ -1200,7 +1729,7 @@ pub fn run(root: &SelectedRoot, config: &Config) -> AppResult<()> {
     let logging = crate::logging::initialize_from(root.descriptor(), &root.path, &config.logging)?;
     tracing::info!("terminal session starting");
     let result = crate::scan::scan_from(root.descriptor(), &root.path, config, 1)
-        .and_then(|index| crate::terminal::run(root.descriptor(), config, index));
+        .and_then(|index| crate::terminal::run(root.descriptor(), &root.path, config, index));
     if result.is_ok() {
         tracing::info!("terminal session stopped cleanly");
     } else {
@@ -1239,10 +1768,10 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::{
-        AppState, BrowserRow, ColorMode, Focus, PlaybackIntent, PlaybackStatus,
+        AppState, BrowserRow, ColorMode, Focus, PlaybackIntent, PlaybackStatus, RepeatMode,
         contains_ascii_case_insensitive, rebuild_ascii_case_prefix, reserve_startup_open_files,
     };
-    use crate::audio::{AudioEvent, AudioFormat};
+    use crate::audio::{AudioEvent, AudioFormat, AudioPosition};
     use crate::config::Config;
     use crate::input::AppAction;
     use crate::model::{
@@ -1439,8 +1968,8 @@ mod tests {
 
     #[test]
     fn terminal_open_file_reservation_accepts_the_exact_peak() {
-        assert!(reserve_startup_open_files(5).is_ok());
-        assert!(reserve_startup_open_files(4).is_err());
+        assert!(reserve_startup_open_files(6).is_ok());
+        assert!(reserve_startup_open_files(5).is_err());
     }
 
     #[test]
@@ -1580,13 +2109,16 @@ mod tests {
             .position(|row| matches!(row, BrowserRow::Playlist { playlist_index: 0 }))
             .expect("fixture playlist has a browser row");
 
-        app.apply(AppAction::Activate);
+        let start = app.apply(AppAction::Activate);
 
         assert_eq!(app.queue.len(), 2);
         assert_eq!(app.queue[0].entry_id, TrackEntryId(40));
         assert_eq!(app.queue[1].entry_id, TrackEntryId(50));
         assert_eq!(app.queue_generation, 1);
-        assert_eq!(app.status_message, "Queued playlist: Favorites (2 tracks)");
+        assert!(
+            matches!(start, Some(PlaybackIntent::Load { item, .. }) if item.entry_id == TrackEntryId(40))
+        );
+        assert_eq!(app.status_message, "Loading: Night Song");
 
         let mut config = Config::default();
         config.queue.max_items = 1;
@@ -1643,14 +2175,16 @@ mod tests {
     fn playback_generations_and_queue_navigation_stay_in_the_app_loop() {
         let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
         select_entry(&mut app, 0);
-        app.apply(AppAction::Activate);
+        let first = app
+            .apply(AppAction::Activate)
+            .expect("idle activation starts the selected track");
         select_entry(&mut app, 1);
         app.apply(AppAction::Activate);
 
-        let first = app.apply(AppAction::PlayPause).expect("start first track");
         let PlaybackIntent::Load {
             generation: first_generation,
             item: first_item,
+            ..
         } = first
         else {
             panic!("play must load the selected queue item");
@@ -1661,10 +2195,13 @@ mod tests {
 
         app.audio_event(AudioEvent::Started {
             generation: first_generation,
+            timeline_revision: 1,
             format: AudioFormat {
                 sample_rate: 48_000,
                 channels: 2,
             },
+            duration: Some(Duration::from_secs(10)),
+            position: Duration::ZERO,
         });
         assert_eq!(app.playback_status, PlaybackStatus::Playing);
         assert!(matches!(
@@ -1683,7 +2220,8 @@ mod tests {
             second,
             PlaybackIntent::Load {
                 generation: 2,
-                item
+                item,
+                ..
             } if item.entry_id == TrackEntryId(20)
         ));
         app.audio_event(AudioEvent::Finished { generation: 1 });
@@ -1700,7 +2238,8 @@ mod tests {
             previous,
             PlaybackIntent::Load {
                 generation: 3,
-                item
+                item,
+                ..
             } if item.entry_id == TrackEntryId(10)
         ));
         let automatic = app
@@ -1710,7 +2249,8 @@ mod tests {
             automatic,
             PlaybackIntent::Load {
                 generation: 4,
-                item
+                item,
+                ..
             } if item.entry_id == TrackEntryId(20)
         ));
         assert!(
@@ -1728,7 +2268,6 @@ mod tests {
         app.apply(AppAction::Activate);
         select_entry(&mut app, 1);
         app.apply(AppAction::Activate);
-        app.apply(AppAction::PlayPause).expect("start first track");
 
         app.focus = Focus::Queue;
         app.queue_selection = 0;
@@ -1748,7 +2287,6 @@ mod tests {
         let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
         select_entry(&mut app, 0);
         app.apply(AppAction::Activate);
-        app.apply(AppAction::PlayPause).expect("start track");
         app.audio_event(AudioEvent::Failed {
             generation: 1,
             message: "fixture failure".into(),
@@ -1757,5 +2295,240 @@ mod tests {
         assert!(app.apply(AppAction::Stop).is_none());
         assert_eq!(app.playback_status, PlaybackStatus::Stopped);
         assert_eq!(app.status_message, "Stopped");
+    }
+
+    #[test]
+    fn playback_controls_are_bounded_and_keep_position_in_app_state() {
+        let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+        select_entry(&mut app, 0);
+        app.apply(AppAction::Activate)
+            .expect("idle Enter starts playback");
+        app.audio_event(AudioEvent::Started {
+            generation: 1,
+            timeline_revision: 1,
+            format: AudioFormat {
+                sample_rate: 48_000,
+                channels: 2,
+            },
+            duration: Some(Duration::from_secs(30)),
+            position: Duration::ZERO,
+        });
+        app.audio_position(AudioPosition {
+            generation: 1,
+            timeline_revision: 1,
+            position: Duration::from_secs(10),
+            duration: Some(Duration::from_secs(30)),
+        });
+
+        assert!(matches!(
+            app.apply(AppAction::SeekBackward),
+            Some(PlaybackIntent::Seek { position, .. }) if position == Duration::from_secs(5)
+        ));
+        assert!(matches!(
+            app.apply(AppAction::SeekForward),
+            Some(PlaybackIntent::Seek { position, .. }) if position == Duration::from_secs(10)
+        ));
+        assert!(matches!(
+            app.apply(AppAction::VolumeDown),
+            Some(PlaybackIntent::SetGain {
+                volume_percent: 95,
+                muted: false,
+                ..
+            })
+        ));
+        assert!(matches!(
+            app.apply(AppAction::ToggleMute),
+            Some(PlaybackIntent::SetGain {
+                volume_percent: 95,
+                muted: true,
+                ..
+            })
+        ));
+        assert!(matches!(
+            app.apply(AppAction::SpeedUp),
+            Some(PlaybackIntent::SetSpeed {
+                speed,
+                ..
+            }) if speed.percent() == 125
+        ));
+    }
+
+    #[test]
+    fn timing_revisions_prevent_cross_lane_position_regressions() {
+        let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+        select_entry(&mut app, 0);
+        app.apply(AppAction::Activate)
+            .expect("idle Enter starts playback");
+        app.audio_position(AudioPosition {
+            generation: 1,
+            timeline_revision: 1,
+            position: Duration::from_secs(2),
+            duration: Some(Duration::from_secs(30)),
+        });
+
+        app.audio_event(AudioEvent::Started {
+            generation: 1,
+            timeline_revision: 1,
+            format: AudioFormat {
+                sample_rate: 48_000,
+                channels: 2,
+            },
+            duration: Some(Duration::from_secs(30)),
+            position: Duration::ZERO,
+        });
+        assert_eq!(app.playback_position(), Duration::from_secs(2));
+
+        app.audio_position(AudioPosition {
+            generation: 1,
+            timeline_revision: 2,
+            position: Duration::from_secs(12),
+            duration: Some(Duration::from_secs(30)),
+        });
+        app.audio_event(AudioEvent::Seeked {
+            generation: 1,
+            timeline_revision: 2,
+            position: Duration::from_secs(5),
+        });
+        app.audio_position(AudioPosition {
+            generation: 1,
+            timeline_revision: 1,
+            position: Duration::from_secs(20),
+            duration: Some(Duration::from_secs(30)),
+        });
+        assert_eq!(app.playback_position(), Duration::from_secs(12));
+
+        app.audio_event(AudioEvent::Stopped { generation: 1 });
+        app.audio_position(AudioPosition {
+            generation: 1,
+            timeline_revision: 2,
+            position: Duration::from_secs(20),
+            duration: Some(Duration::from_secs(30)),
+        });
+        assert_eq!(app.playback_position(), Duration::ZERO);
+    }
+
+    #[test]
+    fn shuffle_is_a_permutation_and_repeat_modes_choose_in_the_app_loop() {
+        let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+        app.shuffle_seed = 1;
+        select_entry(&mut app, 0);
+        app.apply(AppAction::Activate);
+        select_entry(&mut app, 1);
+        app.apply(AppAction::Activate);
+        select_entry(&mut app, 2);
+        app.apply(AppAction::Activate);
+
+        app.apply(AppAction::ToggleShuffle);
+        let mut expected: Vec<_> = app.queue.iter().map(|item| item.instance_id).collect();
+        let mut actual = app.shuffle_order.clone();
+        expected.sort_unstable();
+        actual.sort_unstable();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            app.shuffle_order.first().copied(),
+            app.playback.current.map(|item| item.instance_id),
+            "enabling shuffle keeps the current track at the head of the round"
+        );
+
+        app.apply(AppAction::CycleRepeat);
+        assert_eq!(app.repeat, RepeatMode::All);
+        app.apply(AppAction::CycleRepeat);
+        assert_eq!(app.repeat, RepeatMode::One);
+        let current = app.current_queue_index().expect("current queue item");
+        let repeated = app
+            .audio_event(AudioEvent::Finished { generation: 1 })
+            .expect("repeat one reloads the same queue item");
+        assert!(matches!(
+            repeated,
+            PlaybackIntent::Load { item, .. } if item.instance_id == app.queue[current].instance_id
+        ));
+
+        app.apply(AppAction::CycleRepeat);
+        assert_eq!(app.repeat, RepeatMode::Off);
+    }
+
+    #[test]
+    fn shuffled_playlist_starts_at_its_first_track_without_skipping_the_round() {
+        let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+        app.shuffle = true;
+        app.shuffle_seed = 2;
+        app.library_selection = app
+            .browser_rows
+            .iter()
+            .position(|row| matches!(row, BrowserRow::Playlist { playlist_index: 0 }))
+            .expect("fixture playlist has a browser row");
+
+        let first = app.apply(AppAction::Activate).expect("playlist starts");
+        let PlaybackIntent::Load {
+            generation,
+            item: first,
+            ..
+        } = first
+        else {
+            panic!("playlist activation must load its first track");
+        };
+        assert_eq!(first.entry_id, TrackEntryId(40));
+        assert_eq!(app.shuffle_order.first(), Some(&first.instance_id));
+
+        let second = app
+            .audio_event(AudioEvent::Finished { generation })
+            .expect("shuffle round retains the other playlist track");
+        let PlaybackIntent::Load {
+            generation,
+            item: second,
+            ..
+        } = second
+        else {
+            panic!("the remaining playlist track must load");
+        };
+        assert_ne!(second.instance_id, first.instance_id);
+        assert!(
+            app.audio_event(AudioEvent::Finished { generation })
+                .is_none()
+        );
+        assert_eq!(app.playback_status, PlaybackStatus::Stopped);
+    }
+
+    #[test]
+    fn queue_edits_preserve_the_played_shuffle_prefix() {
+        let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+        app.shuffle_seed = 1;
+        for entry_index in 0..3 {
+            select_entry(&mut app, entry_index);
+            app.apply(AppAction::Activate);
+        }
+        app.apply(AppAction::ToggleShuffle);
+        app.apply(AppAction::Next).expect("advance within shuffle");
+        let cursor = app.shuffle_cursor.expect("shuffle cursor");
+        assert!(cursor > 0);
+        let played_prefix = app.shuffle_order[..=cursor].to_vec();
+
+        select_entry(&mut app, 3);
+        app.apply(AppAction::Activate);
+        assert_eq!(&app.shuffle_order[..=cursor], played_prefix.as_slice());
+
+        let order_before_reorder = app.shuffle_order.clone();
+        app.focus = Focus::Queue;
+        app.queue_selection = 0;
+        app.apply(AppAction::QueueMoveDown);
+        assert_eq!(app.shuffle_order, order_before_reorder);
+
+        let unplayed = app.shuffle_order[cursor + 1];
+        app.queue_selection = app
+            .queue
+            .iter()
+            .position(|item| item.instance_id == unplayed)
+            .expect("unplayed item remains queued");
+        app.apply(AppAction::QueueRemove);
+        assert_eq!(&app.shuffle_order[..=cursor], played_prefix.as_slice());
+
+        let previous = app
+            .apply(AppAction::Previous)
+            .expect("shuffle history remains");
+        assert!(matches!(
+            previous,
+            PlaybackIntent::Load { item, .. }
+                if item.instance_id == played_prefix[played_prefix.len() - 2]
+        ));
     }
 }

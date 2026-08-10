@@ -19,8 +19,10 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         ])
     } else {
         let keys = match app.focus {
-            crate::app::Focus::Library => " / search  Up/Down move  Enter add  ",
-            crate::app::Focus::Player => " Space action  ",
+            crate::app::Focus::Library => " / search  Up/Down move  Enter add/play  ",
+            crate::app::Focus::Player => {
+                " Space play/pause  Left/Right seek  -/+ volume  m mute  [/ ] speed  "
+            }
             crate::app::Focus::Queue => " Up/Down select  J/K reorder  d remove  c clear  ",
         };
         Line::from(vec![

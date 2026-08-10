@@ -19,7 +19,7 @@ pub const MAX_CONFIG_BYTES: usize = 65_536;
 pub(crate) const SCAN_PARSER_SCRATCH_BYTES: usize = 32 * 1_048_576;
 pub(crate) const UI_STATE_SCRATCH_BYTES: usize = 8 * 1_048_576;
 pub(crate) const TERMINAL_BUFFER_BYTES: usize = 8 * 1_048_576;
-pub(crate) const AUDIO_WORKER_BYTES: usize = 2 * 1_048_576;
+pub(crate) const AUDIO_WORKER_BYTES: usize = 6 * 1_048_576;
 pub(crate) const MAX_LOG_FILES: usize = 5;
 const QUEUE_ITEM_ACCOUNTING_BYTES: usize = 32;
 

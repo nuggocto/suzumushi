@@ -79,22 +79,79 @@ fn render_player(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         PlaybackStatus::Paused => "Paused",
         PlaybackStatus::Error => "Error",
     };
-    let content = if creator.is_empty() {
-        format!("{title}\n\nState: {state}")
-    } else if let Some(format) = app.playback_format() {
-        format!(
-            "{title}\n{creator}\n\nState: {state}\n1.0x  {} Hz  {} ch",
-            format.sample_rate, format.channels
-        )
+    let position = app.playback_position();
+    let duration = app.playback_duration();
+    let timeline = player_timeline(
+        position,
+        duration,
+        usize::from(area.width.saturating_sub(2)),
+    );
+    let volume = if app.muted {
+        format!("Muted ({}%)", app.volume_percent)
     } else {
-        format!("{title}\n{creator}\n\nState: {state}\n1.0x")
+        format!("Volume {}%", app.volume_percent)
     };
+    let modes = format!(
+        "Speed {}  Shuffle {}  Repeat {}",
+        app.speed.label(),
+        if app.shuffle { "on" } else { "off" },
+        app.repeat.label(),
+    );
+    let format = app.playback_format().map_or_else(String::new, |format| {
+        format!("\n{} Hz  {} ch", format.sample_rate, format.channels)
+    });
+    let creator = if creator.is_empty() {
+        String::new()
+    } else {
+        format!("\n{creator}")
+    };
+    let content =
+        format!("{title}{creator}\n\n{timeline}\n\nState: {state}\n{volume}\n{modes}{format}");
     frame.render_widget(
         Paragraph::new(content)
             .alignment(Alignment::Center)
             .block(panel_block("Player", Focus::Player, app)),
         area,
     );
+}
+
+fn player_timeline(
+    position: std::time::Duration,
+    duration: Option<std::time::Duration>,
+    width: usize,
+) -> String {
+    let position_text = format_time(position);
+    let duration_text = duration.map_or_else(|| "--:--".into(), format_time);
+    let times = format!("{position_text} / {duration_text}");
+    let bar_width = width
+        .saturating_sub(times.len().saturating_add(4))
+        .clamp(4, 28);
+    format!("{}  {times}", progress_bar(position, duration, bar_width))
+}
+
+fn format_time(duration: std::time::Duration) -> String {
+    let seconds = duration.as_secs();
+    let minutes = seconds / 60;
+    let seconds = seconds % 60;
+    format!("{minutes}:{seconds:02}")
+}
+
+fn progress_bar(
+    position: std::time::Duration,
+    duration: Option<std::time::Duration>,
+    width: usize,
+) -> String {
+    let filled = duration.map_or(0, |duration| {
+        if duration.is_zero() {
+            0
+        } else {
+            let numerator = position.as_millis().min(duration.as_millis());
+            usize::try_from(numerator.saturating_mul(width as u128) / duration.as_millis())
+                .unwrap_or(width)
+                .min(width)
+        }
+    });
+    format!("[{}{}]", "=".repeat(filled), "-".repeat(width - filled))
 }
 
 fn render_queue(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
@@ -213,6 +270,8 @@ fn selection_style(app: &AppState, focus: Focus) -> Style {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::layout::Position;
@@ -266,5 +325,14 @@ mod tests {
     #[test]
     fn undersized_terminal_has_a_keyboard_accessible_fallback() {
         insta::assert_snapshot!("terminal_small", snapshot(40, 10));
+    }
+
+    #[test]
+    fn supported_width_keeps_long_elapsed_and_duration_text_visible() {
+        let timeline =
+            super::player_timeline(Duration::from_mins(10), Some(Duration::from_mins(20)), 38);
+
+        assert!(timeline.len() <= 38, "{timeline:?}");
+        assert!(timeline.ends_with("10:00 / 20:00"), "{timeline:?}");
     }
 }

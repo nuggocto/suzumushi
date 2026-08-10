@@ -11,7 +11,7 @@ service, or network feature.
 ## Current status
 
 Version `0.2.0` is released. The development branch adds the complete local
-library, search, queue browser, and basic local playback to its safe root,
+library, search, queue browser, and playback controls to its safe root,
 scanner, metadata, terminal, logging, test, fuzz, and CI foundation.
 
 ```text
@@ -20,11 +20,11 @@ scanner, metadata, terminal, logging, test, fuzz, and CI foundation.
 | folders, tracks  | title, creator, progress, time     | ordered tracks   |
 | playlists/search | volume, speed, playback state      | and queue edits  |
 +------------------+------------------------------------+------------------+
-| q quit   Tab focus   / search   Enter add   arrows move                  |
+| q quit   Tab focus   / search   Enter add   Up/Down move                 |
 +--------------------------------------------------------------------------+
 ```
 
-Basic `1.0x` playback is implemented. The next work is Phase 6.
+The complete local player is implemented. The next work is Phase 7.
 
 ## Product contract
 
@@ -109,14 +109,17 @@ query text; `Esc` closes search and `Ctrl+c` quits globally.
   It never chooses the next queue item.
 - Workers use bounded messages, explicit cancellation, and awaited shutdown.
 - Reliable controls and state updates use a bounded lane. Position is a
-  capacity-one latest-value update.
+  capacity-one latest-value update, and timeline revisions prevent the two
+  lanes from applying playback positions out of order.
 - The real-time audio callback never allocates, blocks, logs, touches D-Bus,
   takes a lock, or sends on a blocking channel.
 - The session retains the selected root descriptor and filesystem identity.
-  Config, locking, scanning, logging, and later state files are opened relative
+  Config, locking, scanning, logging, and state files are opened relative
   to that descriptor.
-- `waybar`, `tmux`, and `zellij` will be read-only renderers of one bounded,
-  versioned `state/now-playing.json`. They never scan or start audio.
+- `waybar`, `tmux`, and `zellij` will be read-only renderers of the bounded,
+  versioned `state/now-playing.json`. A live unchanged session refreshes it at
+  least every five seconds so those renderers can detect stale state. They never
+  scan or start audio.
 - `src/main.rs` remains thin. Behavior exposed to integration tests lives in
   the library target. A module is added only with its first real behavior.
 
@@ -227,23 +230,31 @@ against the local PipeWire-backed Linux output device.
 
 ### Phase 6: complete playback controls
 
-**Status:** next
+**Status:** complete
 
-- Add volume, mute, seek, progress, elapsed time, shuffle, and repeat.
-- Add pitch-preserving speeds across `0.5x..=2.0x`. This is required, not an
+- [x] Add volume, mute, seek, progress, elapsed time, shuffle, and repeat.
+- [x] Add pitch-preserving speeds across `0.5x..=2.0x`. This is required, not an
   optional spoken-audio extra.
-- Fill the Player panel with title, creator, progress, elapsed and duration,
+- [x] Fill the Player panel with title, creator, progress, elapsed and duration,
   volume, mute, state, and speed.
-- Write the bounded, versioned `state/now-playing.json` projection.
+- [x] Write the bounded, versioned `state/now-playing.json` projection.
 
 Done when the terminal is a complete local player and position remains correct
 through pause, seek, speed changes, next, previous, and end of track.
+
+Verified with app-owned control, shuffle-history, repeat, generation, and
+cross-lane ordering tests; preroll-free accurate seeking through every verified
+container; deterministic fake-device gain, restart, position, and drain tests;
+WSOLA pitch and duration checks at `0.5x` and `2.0x`, including sub-window clips;
+bounded escaped-state, atomic replacement, heartbeat, and failure-cleanup tests;
+reviewed 80x24 and 120x32 snapshots; the full `mise run ci` sequence; a PTY
+search, queue, and state-file journey; and the real Linux audio-device PTY check.
 
 **Milestone:** playable core, planned `0.3.0`.
 
 ### Phase 7: Waybar, tmux, and Zellij
 
-**Status:** not started
+**Status:** next
 
 - Add all three fast renderer commands from the same state file.
 - Keep outputs single-line, bounded, stale-aware, and specific to each

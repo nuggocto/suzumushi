@@ -8,12 +8,15 @@ Suzumushi uses one pipeline:
 
 ```text
 verified file descriptor -> Symphonia 0.6.0 helper -> bounded f32 PCM ->
-owned worker -> rtrb 0.3.4 -> CPAL 0.18.1 -> Linux audio device
+owned worker -> optional WSOLA 0.1.0 tempo -> rtrb 0.3.4 ->
+CPAL 0.18.1 -> Linux audio device
 ```
 
 Symphonia is pure Rust and covers the four formats wanted for the first
 playable build without system codec libraries. CPAL gives Suzumushi direct
 control of the realtime callback. Rodio is not kept as a second path.
+Pitch-preserving speed uses the small pure-Rust WSOLA worker-side processor.
+It does not run in the decoder helper or realtime callback.
 
 The decoder receives the already verified media descriptor as standard input.
 It never receives or reopens a pathname. It is a child process because a
@@ -38,10 +41,20 @@ code hang.
   output device must support the source sample rate. No hidden resampler or
   second fallback pipeline exists.
 - The output ring is fixed at 262,144 samples. The callback only pops samples,
-  writes silence on underrun, converts sample types, and updates atomics. It
-  does not allocate, block, log, take a lock, or send a message.
+  applies one atomic gain, writes silence on underrun, converts sample types,
+  and updates atomics. It does not allocate, block, log, take a lock, or send a
+  message.
+- Tempo input, output, and flush storage have explicit sample limits inside the
+  worker's six MiB reservation. Sub-window clips retain their sample cadence
+  while still honoring the selected duration change.
+- Seeking restarts the isolated helper before the requested source timestamp,
+  then discards decoded preroll against packet presentation timestamps before
+  emitting PCM.
+- Position updates use a capacity-one latest-value lane. Timeline revisions
+  prevent reliable restart events and coalesced positions from being applied
+  out of order, and source-time accounting remains correct when speed changes.
 - The app loop owns queue choice and playback generations. The worker reports
-  completion and never chooses the next track.
+  completion and never chooses the next track, shuffle order, or repeat action.
 
 ## Verified compatibility
 
@@ -62,10 +75,11 @@ compatibility claims.
 
 ## Verification
 
-Unit tests cover the compatibility fixtures, malformed input, helper timeout
-and reaping, the malformed FLAC picture-length reproducer, verified descriptor
-reopening, deterministic fake-device transitions, device draining, stale
-generations, and queue navigation. The
+Unit tests cover the compatibility fixtures, preroll-free accurate seek through
+all four containers, malformed input, helper timeout and reaping, the malformed
+FLAC picture-length reproducer, verified descriptor reopening, deterministic
+fake-device controls, device draining, pitch and duration at the speed bounds,
+sub-window speed behavior, stale generations, and queue navigation. The
 `audio_decoder` fuzz target exercises the same Symphonia adapter with bounded
 input and decoded output. A real Linux device check remains required whenever
 the playback dependencies or output path changes.

@@ -3,7 +3,7 @@
 //! CPAL output fed by one realtime-safe SPSC ring.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{
@@ -27,6 +27,7 @@ pub(super) struct CpalOutput {
     producer: Option<Producer<f32>>,
     consumed: Arc<AtomicU64>,
     failure: Arc<AtomicU8>,
+    gain: Arc<AtomicU32>,
     written: u64,
 }
 
@@ -39,6 +40,7 @@ impl CpalOutput {
             producer: None,
             consumed: Arc::new(AtomicU64::new(0)),
             failure: Arc::new(AtomicU8::new(0)),
+            gain: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
             written: 0,
         }
     }
@@ -84,8 +86,12 @@ impl OutputStream for CpalOutput {
         let sample_format = supported.sample_format();
         let config = supported.config();
         let (producer, pcm_reader) = RingBuffer::new(PCM_RING_SAMPLES);
+        self.consumed.store(0, Ordering::Release);
+        self.failure.store(0, Ordering::Release);
+        self.written = 0;
         let frames_read = Arc::clone(&self.consumed);
         let failure = Arc::clone(&self.failure);
+        let gain = Arc::clone(&self.gain);
         let stream = build_stream(
             &device,
             &config,
@@ -93,11 +99,21 @@ impl OutputStream for CpalOutput {
             pcm_reader,
             frames_read,
             failure,
+            gain,
         )?;
         self.source = Some(source);
         self.producer = Some(producer);
         self.stream = Some(stream);
         Ok(())
+    }
+
+    fn set_gain(&mut self, volume_percent: u8, muted: bool) {
+        let gain = if muted {
+            0.0
+        } else {
+            f32::from(volume_percent.min(100)) * 0.01
+        };
+        self.gain.store(gain.to_bits(), Ordering::Relaxed);
     }
 
     fn write(&mut self, samples: &[f32]) -> Result<usize, String> {
@@ -188,6 +204,14 @@ impl OutputStream for CpalOutput {
         pause_error.map_or(Ok(()), Err)
     }
 
+    fn consumed_frames(&self) -> u64 {
+        let channels = u64::try_from(self.output_channels).unwrap_or(u64::MAX);
+        self.consumed
+            .load(Ordering::Acquire)
+            .checked_div(channels)
+            .unwrap_or(0)
+    }
+
     fn drained(&self) -> bool {
         self.consumed.load(Ordering::Acquire) >= self.written
     }
@@ -205,20 +229,45 @@ fn build_stream(
     pcm_reader: Consumer<f32>,
     frames_read: Arc<AtomicU64>,
     failure: Arc<AtomicU8>,
+    gain: Arc<AtomicU32>,
 ) -> Result<Stream, String> {
     match format {
-        SampleFormat::I8 => typed_stream::<i8>(device, config, pcm_reader, frames_read, failure),
-        SampleFormat::I16 => typed_stream::<i16>(device, config, pcm_reader, frames_read, failure),
-        SampleFormat::I24 => typed_stream::<I24>(device, config, pcm_reader, frames_read, failure),
-        SampleFormat::I32 => typed_stream::<i32>(device, config, pcm_reader, frames_read, failure),
-        SampleFormat::I64 => typed_stream::<i64>(device, config, pcm_reader, frames_read, failure),
-        SampleFormat::U8 => typed_stream::<u8>(device, config, pcm_reader, frames_read, failure),
-        SampleFormat::U16 => typed_stream::<u16>(device, config, pcm_reader, frames_read, failure),
-        SampleFormat::U24 => typed_stream::<U24>(device, config, pcm_reader, frames_read, failure),
-        SampleFormat::U32 => typed_stream::<u32>(device, config, pcm_reader, frames_read, failure),
-        SampleFormat::U64 => typed_stream::<u64>(device, config, pcm_reader, frames_read, failure),
-        SampleFormat::F32 => typed_stream::<f32>(device, config, pcm_reader, frames_read, failure),
-        SampleFormat::F64 => typed_stream::<f64>(device, config, pcm_reader, frames_read, failure),
+        SampleFormat::I8 => {
+            typed_stream::<i8>(device, config, pcm_reader, frames_read, failure, gain)
+        }
+        SampleFormat::I16 => {
+            typed_stream::<i16>(device, config, pcm_reader, frames_read, failure, gain)
+        }
+        SampleFormat::I24 => {
+            typed_stream::<I24>(device, config, pcm_reader, frames_read, failure, gain)
+        }
+        SampleFormat::I32 => {
+            typed_stream::<i32>(device, config, pcm_reader, frames_read, failure, gain)
+        }
+        SampleFormat::I64 => {
+            typed_stream::<i64>(device, config, pcm_reader, frames_read, failure, gain)
+        }
+        SampleFormat::U8 => {
+            typed_stream::<u8>(device, config, pcm_reader, frames_read, failure, gain)
+        }
+        SampleFormat::U16 => {
+            typed_stream::<u16>(device, config, pcm_reader, frames_read, failure, gain)
+        }
+        SampleFormat::U24 => {
+            typed_stream::<U24>(device, config, pcm_reader, frames_read, failure, gain)
+        }
+        SampleFormat::U32 => {
+            typed_stream::<u32>(device, config, pcm_reader, frames_read, failure, gain)
+        }
+        SampleFormat::U64 => {
+            typed_stream::<u64>(device, config, pcm_reader, frames_read, failure, gain)
+        }
+        SampleFormat::F32 => {
+            typed_stream::<f32>(device, config, pcm_reader, frames_read, failure, gain)
+        }
+        SampleFormat::F64 => {
+            typed_stream::<f64>(device, config, pcm_reader, frames_read, failure, gain)
+        }
         _ => Err(format!("unsupported output sample format {format}")),
     }
 }
@@ -229,6 +278,7 @@ fn typed_stream<T>(
     mut pcm_reader: Consumer<f32>,
     frames_read: Arc<AtomicU64>,
     failure: Arc<AtomicU8>,
+    gain: Arc<AtomicU32>,
 ) -> Result<Stream, String>
 where
     T: SizedSample + FromSample<f32>,
@@ -238,9 +288,10 @@ where
             *config,
             move |output: &mut [T], _: &OutputCallbackInfo| {
                 let mut read = 0_u64;
+                let gain = f32::from_bits(gain.load(Ordering::Relaxed));
                 for sample in output {
                     if let Ok(value) = pcm_reader.pop() {
-                        *sample = T::from_sample(value);
+                        *sample = T::from_sample(finite_or_silence(value * gain));
                         read += 1;
                     } else {
                         *sample = T::from_sample(0.0);

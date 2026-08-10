@@ -13,7 +13,7 @@ const MAX_POLL: Duration = Duration::from_millis(100);
 #[derive(Clone, Copy, Debug)]
 pub enum AppEvent {
     Key(KeyEvent, Duration),
-    Resize(u16, u16),
+    Resize(u16, u16, Duration),
     Tick(Duration),
 }
 
@@ -52,7 +52,7 @@ impl EventSource {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 AppEvent::Key(key, now)
             }
-            Event::Resize(width, height) => AppEvent::Resize(width, height),
+            Event::Resize(width, height) => AppEvent::Resize(width, height, now),
             _ => AppEvent::Tick(now),
         })
     }

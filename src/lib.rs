@@ -17,6 +17,7 @@ pub mod metadata;
 pub mod model;
 pub mod paths;
 pub mod scan;
+pub mod state;
 pub mod terminal;
 pub mod ui;
 

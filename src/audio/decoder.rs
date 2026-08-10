@@ -12,14 +12,18 @@ use std::time::Duration;
 
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::process::{Pid, Resource, Rlimit, Signal, setrlimit};
+use symphonia::core::audio::GenericAudioBufferRef;
 use symphonia::core::codecs::audio::AudioDecoderOptions;
 use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::{FormatOptions, FormatReader, TrackType};
+use symphonia::core::formats::{
+    FormatOptions, FormatReader, SeekMode, SeekTo, SeekedTo, TrackType,
+};
 use symphonia::core::io::{MediaSource, MediaSourceStream, MediaSourceStreamOptions};
+use symphonia::core::units::{Time as MediaTime, TimeBase, Timestamp};
 
-use super::{AudioFormat, DecoderPoll, DecoderStream};
+use super::{AudioFormat, DecodedInfo, DecoderPoll, DecoderStream};
 
-const READY_MAGIC: &[u8; 8] = b"SUZPCM01";
+const READY_MAGIC: &[u8; 8] = b"SUZPCM02";
 const ERROR_MAGIC: &[u8; 8] = b"SUZERR01";
 const ERROR_FRAME: u32 = u32::MAX;
 const DECODER_MESSAGES: usize = 2;
@@ -29,6 +33,8 @@ const MAX_CONSECUTIVE_DECODE_ERRORS: usize = 32;
 const MAX_FLAC_METADATA_BLOCKS: usize = 1_024;
 const HELPER_NO_PROGRESS: Duration = Duration::from_secs(3);
 const FUZZ_SAMPLE_LIMIT: u64 = 1_000_000;
+const UNKNOWN_DURATION_MICROS: u64 = u64::MAX;
+const MAX_TRACK_DURATION: Duration = Duration::from_hours(366 * 24);
 
 pub(super) struct HelperDecoder {
     child: Option<Child>,
@@ -37,11 +43,13 @@ pub(super) struct HelperDecoder {
 }
 
 impl HelperDecoder {
-    pub(super) fn start(file: &File) -> Result<Self, String> {
+    pub(super) fn start(file: &File, position: Duration) -> Result<Self, String> {
         let executable = std::env::current_exe()
             .map_err(|error| format!("cannot locate the decoder helper: {error}"))?;
         let mut command = Command::new(executable);
-        command.arg("__audio-decode-helper");
+        command
+            .arg("__audio-decode-helper")
+            .arg(position.as_micros().min(u128::from(u64::MAX)).to_string());
         Self::start_with(command, file, HELPER_NO_PROGRESS)
     }
 
@@ -154,7 +162,7 @@ fn read_protocol_inner(
     if &magic != READY_MAGIC {
         return Err("decoder helper returned an unknown protocol header".into());
     }
-    let mut header = [0_u8; 8];
+    let mut header = [0_u8; 24];
     read_exact_with_progress(stdout, &mut header, timeout)?;
     let format = AudioFormat {
         sample_rate: u32::from_le_bytes(header[0..4].try_into().expect("four-byte rate")),
@@ -163,8 +171,25 @@ fn read_protocol_inner(
     if header[6..8] != [0, 0] {
         return Err("decoder helper format header has non-zero reserved bytes".into());
     }
+    let duration_micros =
+        u64::from_le_bytes(header[8..16].try_into().expect("eight-byte duration"));
+    let position_micros =
+        u64::from_le_bytes(header[16..24].try_into().expect("eight-byte position"));
+    let duration = (duration_micros != UNKNOWN_DURATION_MICROS)
+        .then(|| Duration::from_micros(duration_micros));
+    if duration.is_some_and(|value| value > MAX_TRACK_DURATION) {
+        return Err("decoder helper reported a track longer than one year".into());
+    }
+    let position = Duration::from_micros(position_micros);
+    if position > MAX_TRACK_DURATION || duration.is_some_and(|value| position > value) {
+        return Err("decoder helper reported an invalid playback position".into());
+    }
     messages
-        .send(DecoderPoll::Ready(format))
+        .send(DecoderPoll::Ready(DecodedInfo {
+            format,
+            duration,
+            position,
+        }))
         .map_err(|_| "decoder consumer stopped".to_owned())?;
 
     loop {
@@ -253,7 +278,7 @@ fn read_error(reader: &mut ChildStdout, timeout: Duration) -> Result<String, Str
 
 /// Runs the internal decoder helper on its inherited standard input descriptor.
 #[must_use]
-pub fn helper_main() -> i32 {
+pub fn helper_main(position_micros: u64) -> i32 {
     let mut sink = ProtocolSink::new(std::io::stdout().lock());
     if let Err(error) = apply_helper_limits() {
         let _ = sink.error(&error);
@@ -268,7 +293,12 @@ pub fn helper_main() -> i32 {
         }
     };
     let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        decode_source(File::from(fd), &mut sink, None)
+        decode_source(
+            File::from(fd),
+            &mut sink,
+            None,
+            Duration::from_micros(position_micros),
+        )
     }));
     let result = match decoded {
         Ok(Ok(())) => sink.finish(),
@@ -303,7 +333,7 @@ fn apply_helper_limits() -> Result<(), String> {
 }
 
 trait PcmSink {
-    fn ready(&mut self, format: AudioFormat) -> Result<(), String>;
+    fn ready(&mut self, info: DecodedInfo) -> Result<(), String>;
     fn samples(&mut self, samples: &[f32]) -> Result<(), String>;
 }
 
@@ -492,6 +522,7 @@ fn decode_source<S: MediaSource + 'static>(
     source: S,
     sink: &mut dyn PcmSink,
     sample_limit: Option<u64>,
+    position: Duration,
 ) -> Result<(), String> {
     let mut format = open_format(source)?;
     let track = format
@@ -506,7 +537,24 @@ fn decode_source<S: MediaSource + 'static>(
         .make_audio_decoder(params, &AudioDecoderOptions::default())
         .map_err(|error| format!("cannot create audio decoder: {error}"))?;
     let track_id = track.id;
+    let time_base = track.time_base;
+    let duration = track_duration(track)?;
+    let position = duration.map_or(position, |duration| position.min(duration));
+    if position > MAX_TRACK_DURATION {
+        return Err("requested playback position is longer than one year".into());
+    }
+    let seeked_to = if position.is_zero() {
+        None
+    } else {
+        let seeked_to = seek_source(&mut *format, track_id, position)?;
+        if seeked_to.actual_ts > seeked_to.required_ts {
+            return Err("accurate seek returned a position after its target".into());
+        }
+        decoder.reset();
+        Some(seeked_to)
+    };
     let mut active_format = None;
+    let mut seek_target = seeked_to.map(|seeked_to| seeked_to.required_ts);
     let mut scratch = Vec::<f32>::new();
     let mut total_samples = 0_u64;
     let mut decode_errors = 0_usize;
@@ -517,6 +565,7 @@ fn decode_source<S: MediaSource + 'static>(
         if packet.track_id != track_id {
             continue;
         }
+        let packet_timestamp = packet.pts;
         let audio = match decoder.decode(&packet) {
             Ok(audio) => {
                 decode_errors = 0;
@@ -530,26 +579,14 @@ fn decode_source<S: MediaSource + 'static>(
             }
             Err(error) => return Err(format!("cannot decode audio packet: {error}")),
         };
-        let channels = u16::try_from(audio.spec().channels().count())
-            .map_err(|_| "decoded channel count does not fit the protocol".to_owned())?;
-        let current = AudioFormat {
-            sample_rate: audio.spec().rate(),
-            channels,
-        };
-        if channels == 0 || channels > 2 {
-            return Err(format!(
-                "decoded audio has {channels} channels; this build supports mono and stereo"
-            ));
-        }
-        if current.sample_rate < 8_000 || current.sample_rate > 192_000 {
-            return Err(format!(
-                "decoded sample rate {} Hz is outside 8000..=192000 Hz",
-                current.sample_rate
-            ));
-        }
+        let current = validated_audio_format(&audio)?;
         match active_format {
             None => {
-                sink.ready(current)?;
+                sink.ready(DecodedInfo {
+                    format: current,
+                    duration,
+                    position,
+                })?;
                 active_format = Some(current);
             }
             Some(expected) if expected != current => {
@@ -563,7 +600,14 @@ fn decode_source<S: MediaSource + 'static>(
             .map_err(|error| format!("cannot reserve decoded PCM scratch: {error}"))?;
         scratch.resize(audio.samples_interleaved(), 0.0);
         audio.copy_to_slice_interleaved(&mut scratch);
-        for block in scratch.chunks(MAX_PCM_BLOCK_SAMPLES) {
+        let skip_samples = seek_sample_offset(
+            &mut seek_target,
+            packet_timestamp,
+            time_base,
+            current,
+            scratch.len(),
+        )?;
+        for block in scratch[skip_samples..].chunks(MAX_PCM_BLOCK_SAMPLES) {
             total_samples = total_samples
                 .checked_add(
                     u64::try_from(block.len())
@@ -580,6 +624,124 @@ fn decode_source<S: MediaSource + 'static>(
         return Err("track contained no decodable audio samples".into());
     }
     Ok(())
+}
+
+fn validated_audio_format(audio: &GenericAudioBufferRef<'_>) -> Result<AudioFormat, String> {
+    let channels = u16::try_from(audio.spec().channels().count())
+        .map_err(|_| "decoded channel count does not fit the protocol".to_owned())?;
+    if channels == 0 || channels > 2 {
+        return Err(format!(
+            "decoded audio has {channels} channels; this build supports mono and stereo"
+        ));
+    }
+    let sample_rate = audio.spec().rate();
+    if !(8_000..=192_000).contains(&sample_rate) {
+        return Err(format!(
+            "decoded sample rate {sample_rate} Hz is outside 8000..=192000 Hz"
+        ));
+    }
+    Ok(AudioFormat {
+        sample_rate,
+        channels,
+    })
+}
+
+fn seek_sample_offset(
+    target: &mut Option<Timestamp>,
+    packet_timestamp: Timestamp,
+    time_base: Option<TimeBase>,
+    format: AudioFormat,
+    sample_count: usize,
+) -> Result<usize, String> {
+    let available_frames = sample_count / usize::from(format.channels);
+    let requested_skip = target
+        .map(|target| {
+            frames_before_timestamp(packet_timestamp, target, time_base, format.sample_rate)
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let available_frames_u64 = u64::try_from(available_frames).unwrap_or(u64::MAX);
+    let skip_frames = usize::try_from(requested_skip.min(available_frames_u64))
+        .map_err(|_| "seek discard count does not fit memory bounds".to_owned())?;
+    if requested_skip < available_frames_u64 {
+        *target = None;
+    }
+    skip_frames
+        .checked_mul(usize::from(format.channels))
+        .ok_or_else(|| "seek discard sample count overflow".to_owned())
+}
+
+fn seek_source(
+    format: &mut dyn FormatReader,
+    track_id: u32,
+    position: Duration,
+) -> Result<SeekedTo, String> {
+    format
+        .seek(
+            SeekMode::Accurate,
+            SeekTo::Time {
+                time: MediaTime::from_micros_u64(duration_micros(position)),
+                track_id: Some(track_id),
+            },
+        )
+        .map_err(|error| format!("cannot seek audio source: {error}"))
+}
+
+fn frames_before_timestamp(
+    packet_timestamp: Timestamp,
+    target: Timestamp,
+    time_base: Option<TimeBase>,
+    sample_rate: u32,
+) -> Result<u64, String> {
+    let Some(ticks) = target
+        .get()
+        .checked_sub(packet_timestamp.get())
+        .filter(|ticks| *ticks > 0)
+    else {
+        return Ok(0);
+    };
+    let ticks = u128::try_from(ticks).map_err(|_| "seek timestamp is negative".to_owned())?;
+    let time_base = time_base.ok_or_else(|| "audio track has no seek time base".to_owned())?;
+    let numerator = ticks
+        .checked_mul(u128::from(time_base.numer.get()))
+        .and_then(|value| value.checked_mul(u128::from(sample_rate)))
+        .ok_or_else(|| "seek discard frame count overflow".to_owned())?;
+    let denominator = u128::from(time_base.denom.get());
+    let frames = numerator
+        .checked_add(denominator.saturating_sub(1))
+        .ok_or_else(|| "seek discard frame count overflow".to_owned())?
+        / denominator;
+    u64::try_from(frames).map_err(|_| "seek discard frame count is too large".to_owned())
+}
+
+fn track_duration(track: &symphonia::core::formats::Track) -> Result<Option<Duration>, String> {
+    let calculated = track
+        .time_base
+        .zip(track.duration)
+        .and_then(|(time_base, duration)| {
+            i64::try_from(duration.get())
+                .ok()
+                .and_then(|value| time_base.calc_time(value.into()))
+        })
+        .and_then(|time| u64::try_from(time.as_micros()).ok())
+        .map(Duration::from_micros)
+        .or_else(|| {
+            let sample_rate = track
+                .codec_params
+                .as_ref()
+                .and_then(|params| params.audio())
+                .and_then(|params| params.sample_rate)?;
+            let frames = track.num_frames?;
+            let micros = u128::from(frames)
+                .checked_mul(1_000_000)?
+                .checked_div(u128::from(sample_rate))?;
+            u64::try_from(micros).ok().map(Duration::from_micros)
+        });
+    if calculated.is_some_and(|duration| duration > MAX_TRACK_DURATION) {
+        Err("audio track duration exceeds one year".into())
+    } else {
+        Ok(calculated)
+    }
 }
 
 fn open_format<S: MediaSource + 'static>(source: S) -> Result<Box<dyn FormatReader>, String> {
@@ -654,15 +816,28 @@ impl<W: Write> ProtocolSink<W> {
 }
 
 impl<W: Write> PcmSink for ProtocolSink<W> {
-    fn ready(&mut self, format: AudioFormat) -> Result<(), String> {
+    fn ready(&mut self, info: DecodedInfo) -> Result<(), String> {
         if self.ready {
             return Err("decoder attempted to send two format headers".into());
         }
         self.writer
             .write_all(READY_MAGIC)
-            .and_then(|()| self.writer.write_all(&format.sample_rate.to_le_bytes()))
-            .and_then(|()| self.writer.write_all(&format.channels.to_le_bytes()))
+            .and_then(|()| {
+                self.writer
+                    .write_all(&info.format.sample_rate.to_le_bytes())
+            })
+            .and_then(|()| self.writer.write_all(&info.format.channels.to_le_bytes()))
             .and_then(|()| self.writer.write_all(&[0, 0]))
+            .and_then(|()| {
+                let duration = info
+                    .duration
+                    .map_or(UNKNOWN_DURATION_MICROS, duration_micros);
+                self.writer.write_all(&duration.to_le_bytes())
+            })
+            .and_then(|()| {
+                let position = duration_micros(info.position);
+                self.writer.write_all(&position.to_le_bytes())
+            })
             .map_err(|error| format!("cannot write decoder format: {error}"))?;
         self.ready = true;
         Ok(())
@@ -689,6 +864,10 @@ impl<W: Write> PcmSink for ProtocolSink<W> {
     }
 }
 
+fn duration_micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
 fn bounded_error(message: &str) -> String {
     let mut bounded = String::new();
     for character in message.chars() {
@@ -708,7 +887,7 @@ fn bounded_error(message: &str) -> String {
 pub fn fuzz_decode(input: &[u8]) {
     struct CountingSink;
     impl PcmSink for CountingSink {
-        fn ready(&mut self, _format: AudioFormat) -> Result<(), String> {
+        fn ready(&mut self, _info: DecodedInfo) -> Result<(), String> {
             Ok(())
         }
 
@@ -718,7 +897,12 @@ pub fn fuzz_decode(input: &[u8]) {
     }
 
     let source = Cursor::new(input.to_vec());
-    let _ = decode_source(source, &mut CountingSink, Some(FUZZ_SAMPLE_LIMIT));
+    let _ = decode_source(
+        source,
+        &mut CountingSink,
+        Some(FUZZ_SAMPLE_LIMIT),
+        Duration::ZERO,
+    );
 }
 
 #[cfg(test)]
@@ -729,23 +913,29 @@ mod tests {
     use std::process::Command;
     use std::time::Duration;
 
-    use super::{AudioFormat, DecoderPoll, DecoderStream, HelperDecoder, PcmSink, decode_source};
+    use super::{
+        AudioFormat, DecodedInfo, DecoderPoll, DecoderStream, HelperDecoder, PcmSink, decode_source,
+    };
 
     #[derive(Default)]
     struct CollectSink {
         format: Option<AudioFormat>,
-        samples: usize,
+        duration: Option<Duration>,
+        position: Duration,
+        samples: Vec<f32>,
     }
 
     impl PcmSink for CollectSink {
-        fn ready(&mut self, format: AudioFormat) -> Result<(), String> {
-            self.format = Some(format);
+        fn ready(&mut self, info: DecodedInfo) -> Result<(), String> {
+            self.format = Some(info.format);
+            self.duration = info.duration;
+            self.position = info.position;
             Ok(())
         }
 
         fn samples(&mut self, samples: &[f32]) -> Result<(), String> {
             assert!(samples.iter().all(|sample| sample.is_finite()));
-            self.samples += samples.len();
+            self.samples.extend_from_slice(samples);
             Ok(())
         }
     }
@@ -773,7 +963,7 @@ mod tests {
 
         for (combination, bytes) in fixtures {
             let mut sink = CollectSink::default();
-            decode_source(Cursor::new(bytes.to_vec()), &mut sink, None)
+            decode_source(Cursor::new(bytes.to_vec()), &mut sink, None, Duration::ZERO)
                 .unwrap_or_else(|error| panic!("{combination} failed: {error}"));
             assert_eq!(
                 sink.format,
@@ -784,10 +974,63 @@ mod tests {
                 "{combination} format"
             );
             assert!(
-                (20_000..=30_000).contains(&sink.samples),
+                (20_000..=30_000).contains(&sink.samples.len()),
                 "{combination} emitted {} samples",
-                sink.samples
+                sink.samples.len()
             );
+            assert!(
+                sink.duration
+                    .is_some_and(|duration| duration > Duration::ZERO)
+            );
+            assert_eq!(sink.position, Duration::ZERO);
+        }
+    }
+
+    #[test]
+    fn accurate_seek_discards_preroll_for_every_verified_container() {
+        let fixtures: BTreeMap<&str, &[u8]> = BTreeMap::from([
+            (
+                "FLAC",
+                include_bytes!("../../tests/fixtures/audio/tone.flac").as_slice(),
+            ),
+            (
+                "MP3",
+                include_bytes!("../../tests/fixtures/audio/tone.mp3").as_slice(),
+            ),
+            (
+                "Ogg",
+                include_bytes!("../../tests/fixtures/audio/tone.ogg").as_slice(),
+            ),
+            (
+                "WAV",
+                include_bytes!("../../tests/fixtures/audio/tone.wav").as_slice(),
+            ),
+        ]);
+        let requested = Duration::from_millis(100);
+
+        for (container, bytes) in fixtures {
+            let mut full = CollectSink::default();
+            decode_source(Cursor::new(bytes.to_vec()), &mut full, None, Duration::ZERO)
+                .unwrap_or_else(|error| panic!("decode complete {container} fixture: {error}"));
+            let mut sought = CollectSink::default();
+            decode_source(Cursor::new(bytes.to_vec()), &mut sought, None, requested)
+                .unwrap_or_else(|error| panic!("seek within {container} fixture: {error}"));
+
+            assert_eq!(sought.position, requested, "{container}");
+            assert_eq!(sought.duration, full.duration, "{container}");
+            let requested_samples = 4_800 * 2;
+            assert_eq!(
+                sought.samples.len(),
+                full.samples.len().saturating_sub(requested_samples),
+                "{container} sample count"
+            );
+            if container == "WAV" {
+                assert_eq!(
+                    &sought.samples[..64],
+                    &full.samples[requested_samples..requested_samples + 64],
+                    "WAV first emitted frame must be the requested frame"
+                );
+            }
         }
     }
 
@@ -795,12 +1038,17 @@ mod tests {
     fn malformed_input_is_refused_without_announcing_pcm() {
         let mut sink = CollectSink::default();
 
-        let error = decode_source(Cursor::new(vec![0_u8; 4_096]), &mut sink, None)
-            .expect_err("malformed media must be refused");
+        let error = decode_source(
+            Cursor::new(vec![0_u8; 4_096]),
+            &mut sink,
+            None,
+            Duration::ZERO,
+        )
+        .expect_err("malformed media must be refused");
 
         assert!(error.contains("supported container"), "{error}");
         assert_eq!(sink.format, None);
-        assert_eq!(sink.samples, 0);
+        assert!(sink.samples.is_empty());
     }
 
     #[test]
@@ -810,12 +1058,17 @@ mod tests {
         let reproducer = b"fLaC\x06fLaC\x06\x00\xff\xff\xff\x00\xff\xff\xff\xff";
         let mut sink = CollectSink::default();
 
-        let error = decode_source(Cursor::new(reproducer.to_vec()), &mut sink, None)
-            .expect_err("truncated FLAC metadata must be refused");
+        let error = decode_source(
+            Cursor::new(reproducer.to_vec()),
+            &mut sink,
+            None,
+            Duration::ZERO,
+        )
+        .expect_err("truncated FLAC metadata must be refused");
 
         assert!(error.contains("FLAC metadata header"), "{error}");
         assert_eq!(sink.format, None);
-        assert_eq!(sink.samples, 0);
+        assert!(sink.samples.is_empty());
     }
 
     #[test]

@@ -19,7 +19,7 @@ use tempfile::TempDir;
 
 const FOCUSED_PLAYER: &[u8] = b"\x1b[7m\x1b[1m\x1b[38;5;6;49mPlayer";
 const FOCUSED_QUEUE: &[u8] = b"\x1b[7m\x1b[1m\x1b[38;5;6;49mQueue";
-const FIRST_QUEUE_ITEM: &[u8] = b"\xe2\x94\x82\xe2\x94\x821.";
+const FIRST_QUEUE_ITEM: &[u8] = b"1. Night";
 
 #[test]
 fn help_succeeds_and_names_the_canonical_command() {
@@ -62,10 +62,15 @@ fn internal_audio_helper_decodes_only_its_inherited_descriptor() {
 
     assert!(output.status.success(), "helper status: {}", output.status);
     assert!(output.stderr.is_empty());
-    assert!(output.stdout.starts_with(b"SUZPCM01"));
+    assert!(output.stdout.starts_with(b"SUZPCM02"));
     assert_eq!(&output.stdout[8..12], &48_000_u32.to_le_bytes());
     assert_eq!(&output.stdout[12..14], &2_u16.to_le_bytes());
     assert_eq!(&output.stdout[14..16], &[0, 0]);
+    assert!(u64::from_le_bytes(output.stdout[16..24].try_into().expect("duration")) > 0);
+    assert_eq!(
+        u64::from_le_bytes(output.stdout[24..32].try_into().expect("position")),
+        0
+    );
     assert_eq!(&output.stdout[output.stdout.len() - 4..], &[0, 0, 0, 0]);
     assert!(output.stdout.len() < 128 * 1_024);
 }
@@ -199,9 +204,9 @@ fn terminal_user_can_search_and_build_a_queue_without_audio() {
     master
         .write_all(b"/Night\r")
         .expect("search for and queue the track");
-    transcript.extend(read_pty_until(&mut master, &mut child, b"Queued: Night"));
-    resize_terminal(&master, &child, 81, 24);
     transcript.extend(read_pty_until(&mut master, &mut child, FIRST_QUEUE_ITEM));
+    resize_terminal(&master, &child, 81, 24);
+    transcript.extend(read_pty_until(&mut master, &mut child, b"Queue"));
 
     master.write_all(b"\t\t").expect("focus the queue");
     transcript.extend(read_pty_until(&mut master, &mut child, FOCUSED_QUEUE));
@@ -213,6 +218,12 @@ fn terminal_user_can_search_and_build_a_queue_without_audio() {
     assert!(byte_contains(&transcript, b"JDR"));
     assert!(byte_contains(&transcript, b"Campaign"));
     assert!(byte_contains(&transcript, b"\x1b[?1049l"));
+    let state: serde_json::Value = serde_json::from_slice(
+        &fs::read(root.join("state/now-playing.json")).expect("read final playback state"),
+    )
+    .expect("playback state is valid JSON");
+    assert_eq!(state["version"], 1);
+    assert_eq!(state["status"], "stopped");
 }
 
 #[test]
@@ -243,9 +254,9 @@ fn terminal_user_can_play_a_queued_file_on_the_real_device() {
         .spawn()
         .expect("start terminal session");
     let mut transcript = read_pty_until(&mut master, &mut child, b"tone");
-    master.write_all(b"\r").expect("queue selected track");
-    transcript.extend(read_pty_until(&mut master, &mut child, b"Queued: tone"));
-    master.write_all(b" ").expect("start playback");
+    master
+        .write_all(b"\r")
+        .expect("queue and start the selected track");
     transcript.extend(read_pty_until(&mut master, &mut child, b"4800"));
     master.write_all(b"q").expect("quit terminal");
     transcript.extend(read_pty_to_exit(&mut master, &mut child));
@@ -384,7 +395,7 @@ fn terminal_startup_reserves_its_open_file_peak_before_opening() {
     let config_path = root.join("config.toml");
     let config = fs::read_to_string(&config_path)
         .expect("read fixture config")
-        .replacen("max_open_files = 64", "max_open_files = 4", 1);
+        .replacen("max_open_files = 64", "max_open_files = 5", 1);
     fs::write(&config_path, config).expect("lower open-file limit");
     let runtime = temp.path().join("runtime");
     fs::create_dir(&runtime).expect("create runtime directory");
@@ -397,7 +408,7 @@ fn terminal_startup_reserves_its_open_file_peak_before_opening() {
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).expect("UTF-8 resource error");
     assert!(stderr.contains("runtime.max_open_files"), "{stderr}");
-    assert!(stderr.contains("at least 5"), "{stderr}");
+    assert!(stderr.contains("at least 6"), "{stderr}");
     assert!(
         !runtime.join("suzumushi").exists(),
         "preflight must run before the active lease creates storage"

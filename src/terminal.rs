@@ -4,6 +4,8 @@
 
 use std::io::{self, Stdout, Write};
 use std::os::fd::BorrowedFd;
+use std::path::Path;
+use std::time::Duration;
 
 use crossterm::cursor::{Hide, Show};
 use crossterm::execute;
@@ -23,15 +25,63 @@ use crate::errors::{AppError, AppResult};
 use crate::event::{AppEvent, EventSource};
 use crate::model::ScanIndex;
 
+const STATE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Runs one terminal session and restores terminal modes on every unwind path.
 ///
 /// # Errors
 ///
 /// Returns a terminal, drawing, or event-stream error.
-pub fn run(root: BorrowedFd<'_>, config: &Config, index: ScanIndex) -> AppResult<()> {
+pub fn run(
+    root: BorrowedFd<'_>,
+    root_path: &Path,
+    config: &Config,
+    index: ScanIndex,
+) -> AppResult<()> {
     let initial_area = current_terminal_area()?;
     let mut app = AppState::new(config, index)?;
+    let mut state_writer = crate::state::NowPlayingWriter::open(root, root_path)?;
+    let mut state_sync = StateSynchronizer::default();
+    state_sync.sync(&app, &mut state_writer, Duration::ZERO)?;
     let audio = AudioRuntime::start()?;
+    let session_result = run_terminal_session(
+        root,
+        initial_area,
+        &mut app,
+        &audio,
+        &mut state_writer,
+        &mut state_sync,
+    );
+    let audio_result = audio.shutdown();
+    finish_session(
+        &mut app,
+        &mut state_writer,
+        &mut state_sync,
+        session_result,
+        audio_result,
+    )
+}
+
+fn finish_session(
+    app: &mut AppState,
+    state_writer: &mut crate::state::NowPlayingWriter,
+    state_sync: &mut StateSynchronizer,
+    session_result: AppResult<()>,
+    audio_result: AppResult<()>,
+) -> AppResult<()> {
+    app.session_stopped();
+    let state_result = state_sync.force(app, state_writer);
+    combine_results(combine_results(session_result, audio_result), state_result)
+}
+
+fn run_terminal_session(
+    root: BorrowedFd<'_>,
+    initial_area: Rect,
+    app: &mut AppState,
+    audio: &AudioRuntime,
+    state_writer: &mut crate::state::NowPlayingWriter,
+    state_sync: &mut StateSynchronizer,
+) -> AppResult<()> {
     let stdout = io::stdout();
     enable_raw_mode().map_err(|error| AppError::io("enable raw mode", "terminal", error))?;
     let mut guard = TerminalGuard::new(CrosstermControl { stdout });
@@ -40,35 +90,94 @@ pub fn run(root: BorrowedFd<'_>, config: &Config, index: ScanIndex) -> AppResult
     let mut terminal = create_terminal(initial_area)?;
 
     let events = EventSource::new();
+    let mut event_time = Duration::ZERO;
 
     while !app.should_quit {
-        drain_audio_events(&mut app, root, &audio)?;
+        drain_audio_events(app, root, audio)?;
+        state_sync.sync(app, state_writer, event_time)?;
         terminal
             .draw(|frame| {
                 app.terminal_size = (frame.area().width, frame.area().height);
-                crate::ui::render(frame, &app);
+                crate::ui::render(frame, app);
             })
             .map_err(|error| AppError::io("draw terminal", "terminal", error))?;
         let leader_deadline = app.input.deadline();
         let event = events.next(leader_deadline)?;
-        if let AppEvent::Resize(width, height) = event {
+        event_time = event_time_for(event);
+        if let AppEvent::Resize(width, height, _) = event {
             let area = validate_terminal_area(width, height, TERMINAL_BUFFER_BYTES)?;
             drop(terminal);
             execute!(guard.output_mut(), Clear(ClearType::All))
                 .map_err(|error| AppError::io("clear resized terminal", "terminal", error))?;
             terminal = create_terminal(area)?;
         }
-        if let Some(intent) = apply_event(&mut app, event) {
-            dispatch_playback(&mut app, root, &audio, intent)?;
+        if let Some(intent) = apply_event(app, event) {
+            dispatch_playback(app, root, audio, intent)?;
         }
+        state_sync.sync(app, state_writer, event_time)?;
     }
 
     terminal
         .show_cursor()
         .map_err(|error| AppError::io("show terminal cursor", "terminal", error))?;
     drop(terminal);
-    guard.restore()?;
-    audio.shutdown()
+    guard.restore()
+}
+
+#[derive(Default)]
+struct StateSynchronizer {
+    previous: Option<crate::state::NowPlayingProjection>,
+    last_write: Option<Duration>,
+}
+
+impl StateSynchronizer {
+    fn sync(
+        &mut self,
+        app: &AppState,
+        writer: &mut crate::state::NowPlayingWriter,
+        now: Duration,
+    ) -> AppResult<()> {
+        let projection = crate::state::NowPlayingProjection::from_app(app);
+        let changed = self.previous.as_ref() != Some(&projection);
+        let heartbeat_due = self
+            .last_write
+            .is_none_or(|last| now.saturating_sub(last) >= STATE_HEARTBEAT_INTERVAL);
+        if !changed && !heartbeat_due {
+            return Ok(());
+        }
+        writer.write(&projection)?;
+        self.previous = Some(projection);
+        self.last_write = Some(now);
+        Ok(())
+    }
+
+    fn force(
+        &mut self,
+        app: &AppState,
+        writer: &mut crate::state::NowPlayingWriter,
+    ) -> AppResult<()> {
+        let projection = crate::state::NowPlayingProjection::from_app(app);
+        writer.write(&projection)?;
+        self.previous = Some(projection);
+        Ok(())
+    }
+}
+
+fn combine_results(primary: AppResult<()>, secondary: AppResult<()>) -> AppResult<()> {
+    match (primary, secondary) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(primary), Err(secondary)) => Err(AppError::Multiple {
+            primary: Box::new(primary),
+            secondary: Box::new(secondary),
+        }),
+    }
+}
+
+const fn event_time_for(event: AppEvent) -> Duration {
+    match event {
+        AppEvent::Key(_, now) | AppEvent::Resize(_, _, now) | AppEvent::Tick(now) => now,
+    }
 }
 
 fn current_terminal_area() -> AppResult<Rect> {
@@ -117,7 +226,7 @@ fn validate_terminal_area(width: u16, height: u16, budget: usize) -> AppResult<R
 fn apply_event(app: &mut AppState, event: AppEvent) -> Option<PlaybackIntent> {
     match event {
         AppEvent::Key(key, now) => app.key(key, now),
-        AppEvent::Resize(width, height) => {
+        AppEvent::Resize(width, height, _) => {
             app.terminal_size = (width, height);
             None
         }
@@ -136,6 +245,9 @@ fn drain_audio_events(
     root: BorrowedFd<'_>,
     audio: &AudioRuntime,
 ) -> AppResult<()> {
+    while let Some(position) = audio.try_position()? {
+        app.audio_position(position);
+    }
     while let Some(event) = audio.try_event()? {
         if let Some(intent) = app.audio_event(event) {
             dispatch_playback(app, root, audio, intent)?;
@@ -151,13 +263,21 @@ fn dispatch_playback(
     intent: PlaybackIntent,
 ) -> AppResult<()> {
     let command = match intent {
-        PlaybackIntent::Load { generation, item } => {
+        PlaybackIntent::Load {
+            generation,
+            item,
+            settings,
+        } => {
             let opened = app
                 .media_for_item(item)
                 .ok_or_else(|| AppError::Audio("queued track became stale; rescan required".into()))
                 .and_then(|(entry, asset)| crate::audio::open_verified_media(root, entry, asset));
             match opened {
-                Ok(file) => AudioCommand::Play { generation, file },
+                Ok(file) => AudioCommand::Play {
+                    generation,
+                    file,
+                    settings,
+                },
                 Err(error) => {
                     let _ = app.audio_event(AudioEvent::Failed {
                         generation,
@@ -170,6 +290,25 @@ fn dispatch_playback(
         PlaybackIntent::Pause { generation } => AudioCommand::Pause { generation },
         PlaybackIntent::Resume { generation } => AudioCommand::Resume { generation },
         PlaybackIntent::Stop { generation } => AudioCommand::Stop { generation },
+        PlaybackIntent::SetGain {
+            generation,
+            volume_percent,
+            muted,
+        } => AudioCommand::SetGain {
+            generation,
+            volume_percent,
+            muted,
+        },
+        PlaybackIntent::Seek {
+            generation,
+            position,
+        } => AudioCommand::Seek {
+            generation,
+            position,
+        },
+        PlaybackIntent::SetSpeed { generation, speed } => {
+            AudioCommand::SetSpeed { generation, speed }
+        }
     };
     audio.send(command)
 }
@@ -269,13 +408,22 @@ impl<C: TerminalControl> Drop for TerminalGuard<C> {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::fs;
     use std::io::{self, Write};
+    use std::os::unix::fs::PermissionsExt;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::rc::Rc;
+    use std::time::Duration;
 
-    use super::{TerminalControl, TerminalGuard, apply_event, validate_terminal_area};
-    use crate::app::AppState;
+    use rustix::fd::AsFd;
+
+    use super::{
+        STATE_HEARTBEAT_INTERVAL, StateSynchronizer, TerminalControl, TerminalGuard, apply_event,
+        finish_session, validate_terminal_area,
+    };
+    use crate::app::{AppState, PlaybackStatus};
     use crate::config::Config;
+    use crate::errors::AppError;
     use crate::event::AppEvent;
     use crate::model::{ScanCounters, ScanIndex};
 
@@ -295,9 +443,71 @@ mod tests {
     fn app_events_record_resize() {
         let mut app =
             AppState::new(&Config::default(), empty_index()).expect("app state reservation");
-        apply_event(&mut app, AppEvent::Resize(120, 32));
+        apply_event(&mut app, AppEvent::Resize(120, 32, Duration::ZERO));
         assert_eq!(app.terminal_size, (120, 32));
         assert!(!app.should_quit);
+    }
+
+    fn state_writer() -> (
+        tempfile::TempDir,
+        std::fs::File,
+        crate::state::NowPlayingWriter,
+    ) {
+        let root = tempfile::tempdir().expect("temporary root");
+        fs::create_dir(root.path().join("state")).expect("state directory");
+        fs::set_permissions(root.path().join("state"), fs::Permissions::from_mode(0o700))
+            .expect("private state permissions");
+        let root_file = std::fs::File::open(root.path()).expect("open root");
+        let writer = crate::state::NowPlayingWriter::open(root_file.as_fd(), root.path())
+            .expect("state writer");
+        (root, root_file, writer)
+    }
+
+    #[test]
+    fn unchanged_state_is_refreshed_on_the_bounded_heartbeat() {
+        let (_root, _root_file, mut writer) = state_writer();
+        let app = AppState::new(&Config::default(), empty_index()).expect("app state");
+        let mut sync = StateSynchronizer::default();
+
+        sync.sync(&app, &mut writer, Duration::ZERO)
+            .expect("initial state");
+        sync.sync(
+            &app,
+            &mut writer,
+            STATE_HEARTBEAT_INTERVAL.saturating_sub(Duration::from_millis(1)),
+        )
+        .expect("state before heartbeat");
+        assert_eq!(sync.last_write, Some(Duration::ZERO));
+
+        sync.sync(&app, &mut writer, STATE_HEARTBEAT_INTERVAL)
+            .expect("heartbeat state");
+        assert_eq!(sync.last_write, Some(STATE_HEARTBEAT_INTERVAL));
+    }
+
+    #[test]
+    fn event_loop_errors_still_publish_stopped_state() {
+        let (root, _root_file, mut writer) = state_writer();
+        let mut app = AppState::new(&Config::default(), empty_index()).expect("app state");
+        app.playback_status = PlaybackStatus::Playing;
+        let mut sync = StateSynchronizer::default();
+        sync.sync(&app, &mut writer, Duration::ZERO)
+            .expect("active state");
+
+        let error = finish_session(
+            &mut app,
+            &mut writer,
+            &mut sync,
+            Err(AppError::Resource("event loop fixture".into())),
+            Ok(()),
+        )
+        .expect_err("original session error remains visible");
+
+        assert!(error.to_string().contains("event loop fixture"));
+        let state: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.path().join("state/now-playing.json")).expect("final state"),
+        )
+        .expect("valid final state");
+        assert_eq!(state["status"], "stopped");
     }
 
     #[test]

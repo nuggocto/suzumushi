@@ -5,11 +5,11 @@ expression: "snapshot(120, 32)"
 ╔══════════Library═══════════╗┌──────────────────────────Player──────────────────────────┐┌───────────Queue────────────┐
 ║Library/                    ║│                      Nothing playing                     ││Queue is empty              │
 ║Playlists/                  ║│                                                          ││                            │
+║                            ║│       [----------------------------]  0:00 / --:--       ││                            │
+║                            ║│                                                          ││                            │
 ║                            ║│                      State: Stopped                      ││                            │
-║                            ║│                                                          ││                            │
-║                            ║│                                                          ││                            │
-║                            ║│                                                          ││                            │
-║                            ║│                                                          ││                            │
+║                            ║│                        Volume 100%                       ││                            │
+║                            ║│            Speed 1.0x  Shuffle off  Repeat off           ││                            │
 ║                            ║│                                                          ││                            │
 ║                            ║│                                                          ││                            │
 ║                            ║│                                                          ││                            │
@@ -33,4 +33,4 @@ expression: "snapshot(120, 32)"
 ║                            ║│                                                          ││                            │
 ║                            ║│                                                          ││                            │
 ╚════════════════════════════╝└──────────────────────────────────────────────────────────┘└────────────────────────────┘
- q quit  Tab focus   / search  Up/Down move  Enter add  Ready: 0 tracks, 0 playlists
+ q quit  Tab focus   / search  Up/Down move  Enter add/play  Ready: 0 tracks, 0 playlists

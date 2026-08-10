@@ -42,7 +42,14 @@ pub fn command() -> Command {
         )
         .subcommand(Command::new("diagnose").about("Scan a root and report its local media"))
         .subcommand(Command::new("__metadata-helper").hide(true))
-        .subcommand(Command::new("__audio-decode-helper").hide(true))
+        .subcommand(
+            Command::new("__audio-decode-helper").hide(true).arg(
+                Arg::new("position-micros")
+                    .hide(true)
+                    .value_parser(clap::value_parser!(u64))
+                    .default_value("0"),
+            ),
+        )
 }
 
 /// Runs the process arguments and returns an application result.
@@ -84,11 +91,12 @@ where
             Err(AppError::MetadataHelper("helper reported an error".into()))
         };
     }
-    if matches
-        .subcommand_matches("__audio-decode-helper")
-        .is_some()
-    {
-        return if audio::decoder_helper_main() == 0 {
+    if let Some(helper) = matches.subcommand_matches("__audio-decode-helper") {
+        let position_micros = helper
+            .get_one::<u64>("position-micros")
+            .copied()
+            .unwrap_or(0);
+        return if audio::decoder_helper_main(position_micros) == 0 {
             Ok(())
         } else {
             Err(AppError::Audio("decoder helper reported an error".into()))
