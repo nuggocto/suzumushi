@@ -19,6 +19,7 @@ pub const MAX_CONFIG_BYTES: usize = 65_536;
 pub(crate) const SCAN_PARSER_SCRATCH_BYTES: usize = 32 * 1_048_576;
 pub(crate) const UI_STATE_SCRATCH_BYTES: usize = 8 * 1_048_576;
 pub(crate) const TERMINAL_BUFFER_BYTES: usize = 8 * 1_048_576;
+pub(crate) const AUDIO_WORKER_BYTES: usize = 2 * 1_048_576;
 pub(crate) const MAX_LOG_FILES: usize = 5;
 const QUEUE_ITEM_ACCOUNTING_BYTES: usize = 32;
 
@@ -495,13 +496,14 @@ impl Config {
                 .checked_add(self.logging.queue_max_bytes)
                 .and_then(|value| value.checked_add(UI_STATE_SCRATCH_BYTES))
                 .and_then(|value| value.checked_add(TERMINAL_BUFFER_BYTES))
+                .and_then(|value| value.checked_add(AUDIO_WORKER_BYTES))
                 .and_then(|value| value.checked_add(self.queue.max_bytes))
                 .ok_or_else(|| {
                     AppError::InvalidConfig("application reservation overflow".into())
                 })?;
         if reserved_app > r.process_memory_budget_bytes {
             return Err(AppError::InvalidConfig(
-                "indexes, scan/parser scratch, queues, terminal buffers, and UI/state scratch exceed process_memory_budget_bytes".into(),
+                "indexes, scan/parser scratch, queues, terminal buffers, audio buffers, and UI/state scratch exceed process_memory_budget_bytes".into(),
             ));
         }
         Ok(())

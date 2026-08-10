@@ -12,7 +12,7 @@ use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph, Wrap};
 
-use crate::app::{AppState, BrowserRow, ColorMode, Focus, normal_component};
+use crate::app::{AppState, BrowserRow, ColorMode, Focus, PlaybackStatus, normal_component};
 use crate::display::{bounded_text, terminal_safe};
 
 const MIN_WIDTH: u16 = 80;
@@ -69,7 +69,26 @@ fn render_library(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
 }
 
 fn render_player(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
-    let content = "Nothing playing\n\nPlayback arrives in the next phase.";
+    let max_bytes = row_text_max_bytes(area);
+    let title = app.player_title(max_bytes);
+    let creator = app.player_creator(max_bytes);
+    let state = match app.playback_status {
+        PlaybackStatus::Stopped => "Stopped",
+        PlaybackStatus::Loading => "Loading",
+        PlaybackStatus::Playing => "Playing",
+        PlaybackStatus::Paused => "Paused",
+        PlaybackStatus::Error => "Error",
+    };
+    let content = if creator.is_empty() {
+        format!("{title}\n\nState: {state}")
+    } else if let Some(format) = app.playback_format() {
+        format!(
+            "{title}\n{creator}\n\nState: {state}\n1.0x  {} Hz  {} ch",
+            format.sample_rate, format.channels
+        )
+    } else {
+        format!("{title}\n{creator}\n\nState: {state}\n1.0x")
+    };
     frame.render_widget(
         Paragraph::new(content)
             .alignment(Alignment::Center)

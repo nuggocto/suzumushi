@@ -3,6 +3,7 @@
 //! Terminal entry, event-loop ownership, and best-effort restoration.
 
 use std::io::{self, Stdout, Write};
+use std::os::fd::BorrowedFd;
 
 use crossterm::cursor::{Hide, Show};
 use crossterm::execute;
@@ -15,7 +16,8 @@ use ratatui::buffer::Cell;
 use ratatui::layout::Rect;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
-use crate::app::AppState;
+use crate::app::{AppState, PlaybackIntent};
+use crate::audio::{AudioCommand, AudioEvent, AudioRuntime};
 use crate::config::{Config, TERMINAL_BUFFER_BYTES};
 use crate::errors::{AppError, AppResult};
 use crate::event::{AppEvent, EventSource};
@@ -26,9 +28,10 @@ use crate::model::ScanIndex;
 /// # Errors
 ///
 /// Returns a terminal, drawing, or event-stream error.
-pub fn run(config: &Config, index: ScanIndex) -> AppResult<()> {
+pub fn run(root: BorrowedFd<'_>, config: &Config, index: ScanIndex) -> AppResult<()> {
     let initial_area = current_terminal_area()?;
     let mut app = AppState::new(config, index)?;
+    let audio = AudioRuntime::start()?;
     let stdout = io::stdout();
     enable_raw_mode().map_err(|error| AppError::io("enable raw mode", "terminal", error))?;
     let mut guard = TerminalGuard::new(CrosstermControl { stdout });
@@ -39,6 +42,7 @@ pub fn run(config: &Config, index: ScanIndex) -> AppResult<()> {
     let events = EventSource::new();
 
     while !app.should_quit {
+        drain_audio_events(&mut app, root, &audio)?;
         terminal
             .draw(|frame| {
                 app.terminal_size = (frame.area().width, frame.area().height);
@@ -54,14 +58,17 @@ pub fn run(config: &Config, index: ScanIndex) -> AppResult<()> {
                 .map_err(|error| AppError::io("clear resized terminal", "terminal", error))?;
             terminal = create_terminal(area)?;
         }
-        apply_event(&mut app, event);
+        if let Some(intent) = apply_event(&mut app, event) {
+            dispatch_playback(&mut app, root, &audio, intent)?;
+        }
     }
 
     terminal
         .show_cursor()
         .map_err(|error| AppError::io("show terminal cursor", "terminal", error))?;
     drop(terminal);
-    guard.restore()
+    guard.restore()?;
+    audio.shutdown()
 }
 
 fn current_terminal_area() -> AppResult<Rect> {
@@ -107,18 +114,64 @@ fn validate_terminal_area(width: u16, height: u16, budget: usize) -> AppResult<R
     Ok(Rect::new(0, 0, width, height))
 }
 
-fn apply_event(app: &mut AppState, event: AppEvent) {
+fn apply_event(app: &mut AppState, event: AppEvent) -> Option<PlaybackIntent> {
     match event {
-        AppEvent::Key(key, now) => {
-            app.key(key, now);
+        AppEvent::Key(key, now) => app.key(key, now),
+        AppEvent::Resize(width, height) => {
+            app.terminal_size = (width, height);
+            None
         }
-        AppEvent::Resize(width, height) => app.terminal_size = (width, height),
         AppEvent::Tick(now) => {
             if let Some(action) = app.input.tick(now) {
-                app.apply(action);
+                app.apply(action)
+            } else {
+                None
             }
         }
     }
+}
+
+fn drain_audio_events(
+    app: &mut AppState,
+    root: BorrowedFd<'_>,
+    audio: &AudioRuntime,
+) -> AppResult<()> {
+    while let Some(event) = audio.try_event()? {
+        if let Some(intent) = app.audio_event(event) {
+            dispatch_playback(app, root, audio, intent)?;
+        }
+    }
+    Ok(())
+}
+
+fn dispatch_playback(
+    app: &mut AppState,
+    root: BorrowedFd<'_>,
+    audio: &AudioRuntime,
+    intent: PlaybackIntent,
+) -> AppResult<()> {
+    let command = match intent {
+        PlaybackIntent::Load { generation, item } => {
+            let opened = app
+                .media_for_item(item)
+                .ok_or_else(|| AppError::Audio("queued track became stale; rescan required".into()))
+                .and_then(|(entry, asset)| crate::audio::open_verified_media(root, entry, asset));
+            match opened {
+                Ok(file) => AudioCommand::Play { generation, file },
+                Err(error) => {
+                    let _ = app.audio_event(AudioEvent::Failed {
+                        generation,
+                        message: error.to_string(),
+                    });
+                    return Ok(());
+                }
+            }
+        }
+        PlaybackIntent::Pause { generation } => AudioCommand::Pause { generation },
+        PlaybackIntent::Resume { generation } => AudioCommand::Resume { generation },
+        PlaybackIntent::Stop { generation } => AudioCommand::Stop { generation },
+    };
+    audio.send(command)
 }
 
 trait TerminalControl {

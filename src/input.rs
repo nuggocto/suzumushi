@@ -22,7 +22,10 @@ pub enum AppAction {
     QueueClear,
     QueueMoveUp,
     QueueMoveDown,
-    PlayPausePlaceholder,
+    PlayPause,
+    Stop,
+    Next,
+    Previous,
     PalettePlaceholder,
 }
 
@@ -50,13 +53,11 @@ impl InputState {
             if now < started.saturating_add(self.leader_timeout) && key.modifiers.is_empty() {
                 match key.code {
                     KeyCode::Char('/') => return Some(AppAction::PalettePlaceholder),
-                    KeyCode::Char(' ') => return Some(AppAction::PlayPausePlaceholder),
+                    KeyCode::Char(' ') => return Some(AppAction::PlayPause),
                     _ => {}
                 }
             }
-            return self
-                .resolve_plain(key, now)
-                .or(Some(AppAction::PlayPausePlaceholder));
+            return self.resolve_plain(key, now).or(Some(AppAction::PlayPause));
         }
         self.resolve_plain(key, now)
     }
@@ -66,7 +67,7 @@ impl InputState {
         let started = self.leader_started?;
         if now >= started.saturating_add(self.leader_timeout) {
             self.leader_started = None;
-            Some(AppAction::PlayPausePlaceholder)
+            Some(AppAction::PlayPause)
         } else {
             None
         }
@@ -113,6 +114,9 @@ impl InputState {
             KeyCode::Char('J') if key.modifiers.is_empty() || shifted => {
                 Some(AppAction::QueueMoveDown)
             }
+            KeyCode::Char('s') if key.modifiers.is_empty() => Some(AppAction::Stop),
+            KeyCode::Char('n') if key.modifiers.is_empty() => Some(AppAction::Next),
+            KeyCode::Char('p') if key.modifiers.is_empty() => Some(AppAction::Previous),
             KeyCode::Char(' ') if key.modifiers.is_empty() => {
                 self.leader_started = Some(now);
                 None
@@ -143,7 +147,7 @@ mod tests {
             input.tick(timeout.saturating_sub(Duration::from_millis(1))),
             None
         );
-        assert_eq!(input.tick(timeout), Some(AppAction::PlayPausePlaceholder));
+        assert_eq!(input.tick(timeout), Some(AppAction::PlayPause));
 
         assert!(
             input
@@ -192,7 +196,7 @@ mod tests {
                 KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT),
                 Duration::from_secs(1) + Duration::from_millis(1)
             ),
-            Some(AppAction::PlayPausePlaceholder)
+            Some(AppAction::PlayPause)
         );
     }
 
@@ -203,7 +207,7 @@ mod tests {
         assert!(input.key(key(KeyCode::Char(' ')), Duration::ZERO).is_none());
         assert_eq!(
             input.key(key(KeyCode::Char(' ')), Duration::from_millis(1)),
-            Some(AppAction::PlayPausePlaceholder)
+            Some(AppAction::PlayPause)
         );
         assert_eq!(input.tick(timeout + Duration::from_millis(1)), None);
     }

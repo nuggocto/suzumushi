@@ -11,8 +11,8 @@ service, or network feature.
 ## Current status
 
 Version `0.2.0` is released. The development branch adds the complete local
-library, search, and queue browser to its safe root, scanner, metadata, terminal,
-logging, test, fuzz, and CI foundation.
+library, search, queue browser, and basic local playback to its safe root,
+scanner, metadata, terminal, logging, test, fuzz, and CI foundation.
 
 ```text
 +------------------+------------------------------------+------------------+
@@ -24,7 +24,7 @@ logging, test, fuzz, and CI foundation.
 +--------------------------------------------------------------------------+
 ```
 
-Playback is not implemented yet. The next work is Phase 5.
+Basic `1.0x` playback is implemented. The next work is Phase 6.
 
 ## Product contract
 
@@ -173,8 +173,8 @@ mise run ci
 ```
 
 `mise run ci` runs those checks in that order. CI uses one workflow that calls
-the same task. The four current fuzz targets cover path classification, config,
-the metadata adapter, and terminal-safe text.
+the same task. The five current fuzz targets cover path classification, config,
+the metadata adapter, audio decoding, and terminal-safe text.
 
 Tests stay behavior-focused and deterministic. No sleeps, retry-to-green, or
 coverage targets. Audio behavior must run in CI with a fake device. Real device
@@ -204,22 +204,28 @@ journey over a synthetic nested `JDR` library.
 
 ### Phase 5: one audio pipeline
 
-**Status:** next
+**Status:** complete
 
-- Run a short compatibility spike and choose one production decode and output
+- [x] Run a short compatibility spike and choose one production decode and output
   path. Do not keep two pipelines.
-- Advertise only container and codec combinations verified through that exact
+- [x] Advertise only container and codec combinations verified through that exact
   path.
-- Add one owned audio worker with bounded commands and fake-device tests.
-- Implement play, pause, stop, next, and previous at `1.0x`.
-- Keep queue navigation and generation allocation in the app loop.
+- [x] Add one owned audio worker with bounded commands and fake-device tests.
+- [x] Implement play, pause, stop, next, and previous at `1.0x`.
+- [x] Keep queue navigation and generation allocation in the app loop.
 
 Done when a queued local file plays through the selected pipeline and every
 basic transition is deterministic under fake-device tests and real-device QA.
 
+Verified with MP3, FLAC, WAV/PCM, and Ogg/Vorbis fixtures through Symphonia
+0.6.0; helper crash, timeout, malformed-input, and descriptor-revalidation
+tests; deterministic fake-device state and drain tests; the bounded decoder
+fuzz target; the full `mise run ci` sequence; and an ignored PTY journey run
+against the local PipeWire-backed Linux output device.
+
 ### Phase 6: complete playback controls
 
-**Status:** not started
+**Status:** next
 
 - Add volume, mute, seek, progress, elapsed time, shuffle, and repeat.
 - Add pitch-preserving speeds across `0.5x..=2.0x`. This is required, not an
@@ -293,6 +299,16 @@ all install and run the same tested application.
 **Milestone:** `1.0.0`.
 
 ## Website and mascot
+
+The mascot is **Suzu**, a small, round, calm bell cricket who sings your music
+into the night. Suzu is plump and glossy, with soft charcoal-green coloring,
+warm amber underwings, long gentle antennae, and a tiny brass hand-bell. The
+character is quiet, cozy, and unhurried, usually pictured on a windowsill or a
+curled leaf beneath a low warm lamp.
+
+Suzu belongs to the project's identity, release assets, and website. The mascot
+does not add artwork, animation, a visualizer, or decorative image behavior to
+the terminal player.
 
 After v1, create `suzumushi-front` as a separate static Astro repository for
 `suzumushi.org`, deployed on Cloudflare Pages. Keep the mascot and the calm

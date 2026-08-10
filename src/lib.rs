@@ -3,6 +3,7 @@
 //! Suzumushi terminal shell, root, configuration, locking, and scanner library.
 
 pub mod app;
+pub mod audio;
 pub mod cli;
 pub mod config;
 pub mod display;

@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use crate::audio::{AudioEvent, AudioFormat};
 use crate::config::{Config, UI_STATE_SCRATCH_BYTES};
 use crate::display::{bounded_text, terminal_safe};
 use crate::errors::{AppError, AppResult};
@@ -85,9 +86,44 @@ pub(crate) enum BrowserRow {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct QueueItem {
+    pub instance_id: u64,
     pub entry_index: usize,
     pub entry_id: TrackEntryId,
     pub scan_generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlaybackStatus {
+    Stopped,
+    Loading,
+    Playing,
+    Paused,
+    Error,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PlaybackIntent {
+    Load { generation: u64, item: QueueItem },
+    Pause { generation: u64 },
+    Resume { generation: u64 },
+    Stop { generation: u64 },
+}
+
+#[derive(Debug)]
+struct PlaybackState {
+    current: Option<QueueItem>,
+    position_hint: usize,
+    format: Option<AudioFormat>,
+}
+
+impl PlaybackState {
+    const fn new() -> Self {
+        Self {
+            current: None,
+            position_hint: 0,
+            format: None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -117,9 +153,13 @@ pub struct AppState {
     pub(crate) queue: Vec<QueueItem>,
     pub(crate) queue_selection: usize,
     pub queue_generation: u64,
+    pub playback_generation: u64,
+    pub playback_status: PlaybackStatus,
     queue_max_items: usize,
     queue_max_bytes: usize,
     status_text_max_bytes: usize,
+    next_queue_item_id: u64,
+    playback: PlaybackState,
 }
 
 impl AppState {
@@ -227,27 +267,34 @@ impl AppState {
             queue,
             queue_selection: 0,
             queue_generation: 0,
+            playback_generation: 0,
+            playback_status: PlaybackStatus::Stopped,
             queue_max_items: config.queue.max_items,
             queue_max_bytes: config.queue.max_bytes,
             status_text_max_bytes: config.runtime.status_text_max_bytes,
+            next_queue_item_id: 1,
+            playback: PlaybackState::new(),
         })
     }
 
     /// Resolves a key against the active search mode or normal key map.
-    pub fn key(&mut self, key: KeyEvent, now: Duration) {
+    pub(crate) fn key(&mut self, key: KeyEvent, now: Duration) -> Option<PlaybackIntent> {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.should_quit = true;
-            return;
+            return None;
         }
         if self.search.active {
             self.search_key(key);
+            None
         } else if let Some(action) = self.input.key(key, now) {
-            self.apply(action);
+            self.apply(action)
+        } else {
+            None
         }
     }
 
     /// Applies one resolved non-modal action without sharing state across threads.
-    pub fn apply(&mut self, action: AppAction) {
+    pub(crate) fn apply(&mut self, action: AppAction) -> Option<PlaybackIntent> {
         match action {
             AppAction::Quit => self.should_quit = true,
             AppAction::FocusNext => self.focus = self.focus.next(),
@@ -262,13 +309,15 @@ impl AppState {
             AppAction::QueueClear => self.clear_queue(),
             AppAction::QueueMoveUp => self.move_queue_item(false),
             AppAction::QueueMoveDown => self.move_queue_item(true),
-            AppAction::PlayPausePlaceholder => {
-                self.set_status("Playback arrives in the next phase");
-            }
+            AppAction::PlayPause => return self.play_pause(),
+            AppAction::Stop => return self.stop_playback(),
+            AppAction::Next => return self.next_track(),
+            AppAction::Previous => return self.previous_track(),
             AppAction::PalettePlaceholder => {
                 self.set_status("The command palette is not available yet");
             }
         }
+        None
     }
 
     #[must_use]
@@ -332,6 +381,98 @@ impl AppState {
         } else {
             self.entry_title_bounded(item.entry_index, max_bytes)
         }
+    }
+
+    #[must_use]
+    pub(crate) fn player_title(&self, max_bytes: usize) -> String {
+        self.playback.current.map_or_else(
+            || "Nothing playing".into(),
+            |item| self.queue_item_title(item, max_bytes),
+        )
+    }
+
+    #[must_use]
+    pub(crate) fn player_creator(&self, max_bytes: usize) -> String {
+        let Some(item) = self.playback.current else {
+            return String::new();
+        };
+        self.media_for_item(item)
+            .and_then(|(_, asset)| {
+                asset
+                    .tags
+                    .artist
+                    .as_deref()
+                    .or(asset.tags.album_artist.as_deref())
+            })
+            .map_or_else(
+                || "Unknown creator".into(),
+                |creator| terminal_safe(creator.as_bytes(), max_bytes),
+            )
+    }
+
+    #[must_use]
+    pub(crate) fn playback_format(&self) -> Option<AudioFormat> {
+        self.playback.format
+    }
+
+    pub(crate) fn audio_event(&mut self, event: AudioEvent) -> Option<PlaybackIntent> {
+        let generation = match &event {
+            AudioEvent::Started { generation, .. }
+            | AudioEvent::Paused { generation }
+            | AudioEvent::Resumed { generation }
+            | AudioEvent::Stopped { generation }
+            | AudioEvent::Finished { generation }
+            | AudioEvent::Failed { generation, .. } => *generation,
+        };
+        if generation != self.playback_generation || self.playback.current.is_none() {
+            return None;
+        }
+        match event {
+            AudioEvent::Started { format, .. } => {
+                self.set_playback_status(PlaybackStatus::Playing);
+                self.playback.format = Some(format);
+                self.set_status("Playing");
+                None
+            }
+            AudioEvent::Paused { .. } => {
+                self.set_playback_status(PlaybackStatus::Paused);
+                self.set_status("Paused");
+                None
+            }
+            AudioEvent::Resumed { .. } => {
+                self.set_playback_status(PlaybackStatus::Playing);
+                self.set_status("Playing");
+                None
+            }
+            AudioEvent::Stopped { .. } => {
+                self.set_playback_status(PlaybackStatus::Stopped);
+                self.playback.format = None;
+                self.set_status("Stopped");
+                None
+            }
+            AudioEvent::Finished { .. } => self.advance_after_finish(),
+            AudioEvent::Failed { message, .. } => {
+                self.set_playback_status(PlaybackStatus::Error);
+                self.playback.format = None;
+                let message = terminal_safe(message.as_bytes(), self.status_text_max_bytes);
+                self.set_status(&format!("Playback error: {message}"));
+                None
+            }
+        }
+    }
+
+    pub(crate) fn media_for_item(
+        &self,
+        item: QueueItem,
+    ) -> Option<(&TrackEntry, &crate::model::MediaAsset)> {
+        if item.scan_generation != self.index.generation {
+            return None;
+        }
+        let entry = self.index.entries.get(item.entry_index)?;
+        if entry.id != item.entry_id {
+            return None;
+        }
+        Some((entry, self.asset(entry.asset_id)?))
     }
 
     fn asset(&self, id: MediaAssetId) -> Option<&crate::model::MediaAsset> {
@@ -494,6 +635,136 @@ impl AppState {
         }
     }
 
+    fn play_pause(&mut self) -> Option<PlaybackIntent> {
+        match self.playback_status {
+            PlaybackStatus::Playing => Some(PlaybackIntent::Pause {
+                generation: self.playback_generation,
+            }),
+            PlaybackStatus::Paused => Some(PlaybackIntent::Resume {
+                generation: self.playback_generation,
+            }),
+            PlaybackStatus::Loading => {
+                self.set_status("Track is still loading");
+                None
+            }
+            PlaybackStatus::Stopped | PlaybackStatus::Error => {
+                if self.queue.is_empty() {
+                    self.set_status("Queue a track before starting playback");
+                    None
+                } else {
+                    self.start_queue_index(self.queue_selection.min(self.queue.len() - 1))
+                }
+            }
+        }
+    }
+
+    fn stop_playback(&mut self) -> Option<PlaybackIntent> {
+        if self.playback.current.is_none()
+            || matches!(self.playback_status, PlaybackStatus::Stopped)
+        {
+            self.set_status("Nothing is playing");
+            return None;
+        }
+        if self.playback_status == PlaybackStatus::Error {
+            self.set_playback_status(PlaybackStatus::Stopped);
+            self.playback.format = None;
+            self.set_status("Stopped");
+            return None;
+        }
+        Some(PlaybackIntent::Stop {
+            generation: self.playback_generation,
+        })
+    }
+
+    fn next_track(&mut self) -> Option<PlaybackIntent> {
+        if self.queue.is_empty() {
+            return self.stop_playback();
+        }
+        let next = self.next_queue_index();
+        if next < self.queue.len() {
+            self.queue_selection = next;
+            self.start_queue_index(next)
+        } else if matches!(
+            self.playback_status,
+            PlaybackStatus::Loading | PlaybackStatus::Playing | PlaybackStatus::Paused
+        ) {
+            self.set_status("End of queue");
+            Some(PlaybackIntent::Stop {
+                generation: self.playback_generation,
+            })
+        } else {
+            self.set_playback_status(PlaybackStatus::Stopped);
+            self.playback.format = None;
+            self.set_status("End of queue");
+            None
+        }
+    }
+
+    fn previous_track(&mut self) -> Option<PlaybackIntent> {
+        if self.queue.is_empty() {
+            return self.stop_playback();
+        }
+        let current = self.current_queue_index().unwrap_or(self.queue_selection);
+        let previous = current.saturating_sub(1).min(self.queue.len() - 1);
+        self.queue_selection = previous;
+        self.start_queue_index(previous)
+    }
+
+    fn advance_after_finish(&mut self) -> Option<PlaybackIntent> {
+        let next = self.next_queue_index();
+        if next < self.queue.len() {
+            self.queue_selection = next;
+            self.start_queue_index(next)
+        } else {
+            self.set_playback_status(PlaybackStatus::Stopped);
+            self.playback.format = None;
+            self.set_status("Queue finished");
+            None
+        }
+    }
+
+    fn start_queue_index(&mut self, index: usize) -> Option<PlaybackIntent> {
+        let item = self.queue.get(index).copied()?;
+        let Some(generation) = self.playback_generation.checked_add(1) else {
+            self.set_status("Playback generation exhausted");
+            return None;
+        };
+        self.playback_generation = generation;
+        self.playback.current = Some(item);
+        self.playback.position_hint = index;
+        self.playback.format = None;
+        self.set_playback_status(PlaybackStatus::Loading);
+        let title = self.queue_item_title(item, self.status_text_max_bytes);
+        self.set_status(&format!("Loading: {title}"));
+        Some(PlaybackIntent::Load { generation, item })
+    }
+
+    fn current_queue_index(&self) -> Option<usize> {
+        let current = self.playback.current?;
+        self.queue
+            .iter()
+            .position(|item| item.instance_id == current.instance_id)
+    }
+
+    fn next_queue_index(&self) -> usize {
+        self.current_queue_index().map_or_else(
+            || self.playback.position_hint.min(self.queue.len()),
+            |index| index.saturating_add(1),
+        )
+    }
+
+    fn reconcile_playback_position(&mut self) {
+        if let Some(index) = self.current_queue_index() {
+            self.playback.position_hint = index;
+        } else {
+            self.playback.position_hint = self.playback.position_hint.min(self.queue.len());
+        }
+    }
+
+    fn set_playback_status(&mut self, status: PlaybackStatus) {
+        self.playback_status = status;
+    }
+
     fn queue_entry(&mut self, entry_index: usize) {
         let Some(entry_id) = self.index.entries.get(entry_index).map(|entry| entry.id) else {
             self.set_status("The selected track is no longer available");
@@ -504,10 +775,12 @@ impl AppState {
         }
         let title = self.entry_title(entry_index);
         self.queue.push(QueueItem {
+            instance_id: self.next_queue_item_id,
             entry_index,
             entry_id,
             scan_generation: self.index.generation,
         });
+        self.next_queue_item_id += 1;
         self.queue_generation += 1;
         self.set_status(&format!("Queued: {title}"));
     }
@@ -554,10 +827,12 @@ impl AppState {
             if let BrowserRow::Track { entry_index, .. } = self.browser_rows[position] {
                 let entry = &self.index.entries[entry_index];
                 self.queue.push(QueueItem {
+                    instance_id: self.next_queue_item_id,
                     entry_index,
                     entry_id: entry.id,
                     scan_generation: self.index.generation,
                 });
+                self.next_queue_item_id += 1;
             }
         }
         self.queue_generation += 1;
@@ -578,6 +853,7 @@ impl AppState {
         let title = self.entry_title(removed.entry_index);
         self.queue.remove(self.queue_selection);
         self.queue_selection = self.queue_selection.min(self.queue.len().saturating_sub(1));
+        self.reconcile_playback_position();
         self.queue_generation += 1;
         self.set_status(&format!("Removed: {title}"));
     }
@@ -591,6 +867,7 @@ impl AppState {
         }
         self.queue.clear();
         self.queue_selection = 0;
+        self.reconcile_playback_position();
         self.queue_generation += 1;
         self.set_status("Queue cleared");
     }
@@ -612,6 +889,7 @@ impl AppState {
         }
         self.queue.swap(self.queue_selection, destination);
         self.queue_selection = destination;
+        self.reconcile_playback_position();
         self.queue_generation += 1;
         self.set_status("Queue order changed");
     }
@@ -628,8 +906,13 @@ impl AppState {
     fn can_append_queue(&mut self, additional_items: usize) -> bool {
         let next_items = self.queue.len().checked_add(additional_items);
         let next_bytes = next_items.and_then(|items| items.checked_mul(size_of::<QueueItem>()));
+        let queue_ids_fit = u64::try_from(additional_items)
+            .ok()
+            .and_then(|additional| self.next_queue_item_id.checked_add(additional))
+            .is_some();
         if next_items.is_none_or(|items| items > self.queue_max_items)
             || next_bytes.is_none_or(|bytes| bytes > self.queue_max_bytes)
+            || !queue_ids_fit
         {
             self.set_status("Queue limit reached");
             return false;
@@ -917,7 +1200,7 @@ pub fn run(root: &SelectedRoot, config: &Config) -> AppResult<()> {
     let logging = crate::logging::initialize_from(root.descriptor(), &root.path, &config.logging)?;
     tracing::info!("terminal session starting");
     let result = crate::scan::scan_from(root.descriptor(), &root.path, config, 1)
-        .and_then(|index| crate::terminal::run(config, index));
+        .and_then(|index| crate::terminal::run(root.descriptor(), config, index));
     if result.is_ok() {
         tracing::info!("terminal session stopped cleanly");
     } else {
@@ -956,9 +1239,10 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::{
-        AppState, BrowserRow, ColorMode, Focus, contains_ascii_case_insensitive,
-        rebuild_ascii_case_prefix, reserve_startup_open_files,
+        AppState, BrowserRow, ColorMode, Focus, PlaybackIntent, PlaybackStatus,
+        contains_ascii_case_insensitive, rebuild_ascii_case_prefix, reserve_startup_open_files,
     };
+    use crate::audio::{AudioEvent, AudioFormat};
     use crate::config::Config;
     use crate::input::AppAction;
     use crate::model::{
@@ -1353,5 +1637,125 @@ mod tests {
         assert_eq!(app.queue_generation, 5);
         app.apply(AppAction::QueueClear);
         assert_eq!(app.queue_generation, 5, "an empty clear is not a mutation");
+    }
+
+    #[test]
+    fn playback_generations_and_queue_navigation_stay_in_the_app_loop() {
+        let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+        select_entry(&mut app, 0);
+        app.apply(AppAction::Activate);
+        select_entry(&mut app, 1);
+        app.apply(AppAction::Activate);
+
+        let first = app.apply(AppAction::PlayPause).expect("start first track");
+        let PlaybackIntent::Load {
+            generation: first_generation,
+            item: first_item,
+        } = first
+        else {
+            panic!("play must load the selected queue item");
+        };
+        assert_eq!(first_generation, 1);
+        assert_eq!(first_item.entry_id, TrackEntryId(10));
+        assert_eq!(app.playback_status, PlaybackStatus::Loading);
+
+        app.audio_event(AudioEvent::Started {
+            generation: first_generation,
+            format: AudioFormat {
+                sample_rate: 48_000,
+                channels: 2,
+            },
+        });
+        assert_eq!(app.playback_status, PlaybackStatus::Playing);
+        assert!(matches!(
+            app.apply(AppAction::PlayPause),
+            Some(PlaybackIntent::Pause { generation: 1 })
+        ));
+        app.audio_event(AudioEvent::Paused { generation: 1 });
+        assert_eq!(app.playback_status, PlaybackStatus::Paused);
+        assert!(matches!(
+            app.apply(AppAction::PlayPause),
+            Some(PlaybackIntent::Resume { generation: 1 })
+        ));
+
+        let second = app.apply(AppAction::Next).expect("load next track");
+        assert!(matches!(
+            second,
+            PlaybackIntent::Load {
+                generation: 2,
+                item
+            } if item.entry_id == TrackEntryId(20)
+        ));
+        app.audio_event(AudioEvent::Finished { generation: 1 });
+        assert_eq!(
+            app.playback_status,
+            PlaybackStatus::Loading,
+            "a stale completion cannot replace the newer load"
+        );
+
+        let previous = app
+            .apply(AppAction::Previous)
+            .expect("return to first track");
+        assert!(matches!(
+            previous,
+            PlaybackIntent::Load {
+                generation: 3,
+                item
+            } if item.entry_id == TrackEntryId(10)
+        ));
+        let automatic = app
+            .audio_event(AudioEvent::Finished { generation: 3 })
+            .expect("completion advances to the next queue item");
+        assert!(matches!(
+            automatic,
+            PlaybackIntent::Load {
+                generation: 4,
+                item
+            } if item.entry_id == TrackEntryId(20)
+        ));
+        assert!(
+            app.audio_event(AudioEvent::Finished { generation: 4 })
+                .is_none()
+        );
+        assert_eq!(app.playback_status, PlaybackStatus::Stopped);
+        assert_eq!(app.status_message, "Queue finished");
+    }
+
+    #[test]
+    fn removing_the_current_queue_item_keeps_the_next_position_deterministic() {
+        let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+        select_entry(&mut app, 0);
+        app.apply(AppAction::Activate);
+        select_entry(&mut app, 1);
+        app.apply(AppAction::Activate);
+        app.apply(AppAction::PlayPause).expect("start first track");
+
+        app.focus = Focus::Queue;
+        app.queue_selection = 0;
+        app.apply(AppAction::QueueRemove);
+        let next = app
+            .audio_event(AudioEvent::Finished { generation: 1 })
+            .expect("removed current item advances to its successor");
+
+        assert!(matches!(
+            next,
+            PlaybackIntent::Load { item, .. } if item.entry_id == TrackEntryId(20)
+        ));
+    }
+
+    #[test]
+    fn stop_clears_a_failed_playback_without_waiting_for_a_dead_worker_track() {
+        let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+        select_entry(&mut app, 0);
+        app.apply(AppAction::Activate);
+        app.apply(AppAction::PlayPause).expect("start track");
+        app.audio_event(AudioEvent::Failed {
+            generation: 1,
+            message: "fixture failure".into(),
+        });
+
+        assert!(app.apply(AppAction::Stop).is_none());
+        assert_eq!(app.playback_status, PlaybackStatus::Stopped);
+        assert_eq!(app.status_message, "Stopped");
     }
 }

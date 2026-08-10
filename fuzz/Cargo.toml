@@ -43,5 +43,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "audio_decoder"
+path = "fuzz_targets/audio_decoder.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]

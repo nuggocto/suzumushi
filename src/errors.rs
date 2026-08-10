@@ -36,6 +36,9 @@ pub enum AppError {
     /// A bounded helper process failed.
     #[error("metadata helper failed: {0}")]
     MetadataHelper(String),
+    /// The owned decoder or output worker failed.
+    #[error("audio failed: {0}")]
+    Audio(String),
     /// A lock cannot be acquired or stored safely.
     #[error("lock unavailable: {0}")]
     Lock(String),

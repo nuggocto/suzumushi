@@ -42,6 +42,7 @@ run = [
   "cargo +nightly-2026-07-01 fuzz run config -- -max_total_time=5 -timeout=2 -rss_limit_mb=768 -max_len=65536 -verbosity=0",
   "cargo +nightly-2026-07-01 fuzz run metadata_adapter -- -max_total_time=5 -timeout=2 -rss_limit_mb=768 -max_len=1048576 -verbosity=0",
   "cargo +nightly-2026-07-01 fuzz run terminal_safe_display -- -max_total_time=5 -timeout=2 -rss_limit_mb=768 -max_len=65536 -verbosity=0",
+  "cargo +nightly-2026-07-01 fuzz run audio_decoder -- -max_total_time=5 -timeout=2 -rss_limit_mb=768 -max_len=1048576 -verbosity=0",
 ]
 
 [tasks.fuzz-deep]
@@ -51,6 +52,7 @@ run = [
   "cargo +nightly-2026-07-01 fuzz run config -- -max_total_time=60 -timeout=2 -rss_limit_mb=768 -max_len=65536 -verbosity=0",
   "cargo +nightly-2026-07-01 fuzz run metadata_adapter -- -max_total_time=60 -timeout=2 -rss_limit_mb=768 -max_len=1048576 -verbosity=0",
   "cargo +nightly-2026-07-01 fuzz run terminal_safe_display -- -max_total_time=60 -timeout=2 -rss_limit_mb=768 -max_len=65536 -verbosity=0",
+  "cargo +nightly-2026-07-01 fuzz run audio_decoder -- -max_total_time=60 -timeout=2 -rss_limit_mb=768 -max_len=1048576 -verbosity=0",
 ]
 
 [tasks.ci]

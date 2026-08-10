@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added a nested local library and folder-playlist browser backed by the existing descriptor-rooted scan index.
 - Added bounded local search over metadata, filenames, and relative paths.
 - Added app-owned queue selection, insertion, removal, reordering, and clearing with checked item and byte limits.
+- Added basic `1.0x` play, pause, stop, next, previous, and automatic queue advancement.
+- Added one isolated Symphonia decoder, one CPAL output path, a lock-free PCM ring, and deterministic fake-device tests.
+- Added verified MP3, FLAC, WAV/PCM, and Ogg/Vorbis compatibility fixtures and a bounded decoder fuzz target.
 
 ### Changed
 
@@ -27,7 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Removed cover discovery, artwork state directories, artwork configuration, and every planned artwork cache, MPRIS art URL, and notification image requirement.
 - Removed Kitty, Sixel, and iTerm2 probing, terminal image protocol state, and the terminal capability fuzz target.
 - Removed the visualizer and tag-editing roadmap, configuration, backup tree, and mutation-journal plans.
-- Removed the standalone `docs/` set and `SECURITY.md`; their still-relevant contracts now live in the short project source of truth.
+- Removed the obsolete standalone documentation set and `SECURITY.md`; current contracts live in the project source of truth, with one focused parser-isolation decision.
 
 ## [0.2.0] - 2026-08-10
 

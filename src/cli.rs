@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use clap::{Arg, Command};
 
 use crate::app;
+use crate::audio;
 use crate::config;
 use crate::display::terminal_safe;
 use crate::errors::{AppError, AppResult};
@@ -41,6 +42,7 @@ pub fn command() -> Command {
         )
         .subcommand(Command::new("diagnose").about("Scan a root and report its local media"))
         .subcommand(Command::new("__metadata-helper").hide(true))
+        .subcommand(Command::new("__audio-decode-helper").hide(true))
 }
 
 /// Runs the process arguments and returns an application result.
@@ -80,6 +82,16 @@ where
             Ok(())
         } else {
             Err(AppError::MetadataHelper("helper reported an error".into()))
+        };
+    }
+    if matches
+        .subcommand_matches("__audio-decode-helper")
+        .is_some()
+    {
+        return if audio::decoder_helper_main() == 0 {
+            Ok(())
+        } else {
+            Err(AppError::Audio("decoder helper reported an error".into()))
         };
     }
     let explicit = matches.get_one::<PathBuf>("root").cloned();

@@ -3,11 +3,12 @@
 Suzumushi is a calm, fully local terminal audio player for Linux. The current
 development build creates its own filesystem root, scans local media safely,
 browses nested library folders and folder playlists, searches local metadata,
-and builds an ordered queue from the terminal.
+builds an ordered queue, and plays it through one local Linux audio pipeline.
 
-Playback is the next part of the roadmap. Album artwork, terminal image
-protocols, visualizers, tag editing, streaming, accounts, and network features
-are deliberately out of scope.
+Basic play, pause, stop, next, and previous work at `1.0x`. Volume, seeking,
+shuffle, repeat, progress, and pitch-preserving speed are the next playback
+work. Album artwork, terminal image protocols, visualizers, tag editing,
+streaming, accounts, and network features are deliberately out of scope.
 
 ## Run from the repository
 
@@ -30,7 +31,15 @@ The current terminal keys are:
 - `/`: search metadata, filenames, and relative paths. `Enter` accepts and `Esc`
   closes search. While search is open, `q` is query text.
 - In Queue, `J`/`K` reorder, `d` removes, and `c` clears.
+- `Space`: play or pause. `s`: stop. `n`: next. `p`: previous.
 - `q`: quit outside search. `Ctrl+c`: quit from any mode.
+
+The verified first compatibility set is MP3/MPEG Layer III, FLAC, WAV with
+signed 16-bit PCM, and Ogg/Vorbis. Tests cover 48 kHz stereo through Symphonia
+0.6.0, and real output is handled by CPAL 0.18.1. Mono and stereo sources from
+8 kHz through 192 kHz are accepted when the default output device supports the
+source rate. AAC, M4A, Opus, multichannel audio, and implicit resampling are not
+current support claims.
 
 ## Install the current checkout
 

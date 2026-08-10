@@ -7,6 +7,7 @@ use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{PermissionsExt, symlink};
+use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -48,6 +49,25 @@ fn help_succeeds_and_names_the_canonical_command() {
         "--help wrote to stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn internal_audio_helper_decodes_only_its_inherited_descriptor() {
+    let fixture = File::open("tests/fixtures/audio/tone.flac").expect("open audio fixture");
+    let output = Command::new(env!("CARGO_BIN_EXE_suzumushi"))
+        .arg("__audio-decode-helper")
+        .stdin(Stdio::from(fixture))
+        .output()
+        .expect("run internal audio helper");
+
+    assert!(output.status.success(), "helper status: {}", output.status);
+    assert!(output.stderr.is_empty());
+    assert!(output.stdout.starts_with(b"SUZPCM01"));
+    assert_eq!(&output.stdout[8..12], &48_000_u32.to_le_bytes());
+    assert_eq!(&output.stdout[12..14], &2_u16.to_le_bytes());
+    assert_eq!(&output.stdout[14..16], &[0, 0]);
+    assert_eq!(&output.stdout[output.stdout.len() - 4..], &[0, 0, 0, 0]);
+    assert!(output.stdout.len() < 128 * 1_024);
 }
 
 #[test]
@@ -192,6 +212,45 @@ fn terminal_user_can_search_and_build_a_queue_without_audio() {
     transcript.extend(read_pty_to_exit(&mut master, &mut child));
     assert!(byte_contains(&transcript, b"JDR"));
     assert!(byte_contains(&transcript, b"Campaign"));
+    assert!(byte_contains(&transcript, b"\x1b[?1049l"));
+}
+
+#[test]
+#[ignore = "requires a real Linux default audio output device"]
+fn terminal_user_can_play_a_queued_file_on_the_real_device() {
+    let temp = TempDir::new().expect("temporary directory");
+    let root = temp.path().join("root");
+    initialize_root(&root);
+    fs::copy(
+        "tests/fixtures/audio/tone.mp3",
+        root.join("audio/library/tone.mp3"),
+    )
+    .expect("copy playable fixture");
+    let runtime = temp.path().join("runtime");
+    fs::create_dir(&runtime).expect("create runtime directory");
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))
+        .expect("make runtime directory private");
+    let real_runtime = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .expect("real-device QA requires XDG_RUNTIME_DIR");
+
+    let (mut master, slave) = open_test_pty(160, 24);
+    let mut child = terminal_command(&root, &runtime)
+        .env("XDG_RUNTIME_DIR", real_runtime)
+        .stdin(Stdio::from(duplicate_file(&slave)))
+        .stdout(Stdio::from(duplicate_file(&slave)))
+        .stderr(Stdio::from(slave))
+        .spawn()
+        .expect("start terminal session");
+    let mut transcript = read_pty_until(&mut master, &mut child, b"tone");
+    master.write_all(b"\r").expect("queue selected track");
+    transcript.extend(read_pty_until(&mut master, &mut child, b"Queued: tone"));
+    master.write_all(b" ").expect("start playback");
+    transcript.extend(read_pty_until(&mut master, &mut child, b"4800"));
+    master.write_all(b"q").expect("quit terminal");
+    transcript.extend(read_pty_to_exit(&mut master, &mut child));
+
+    assert!(byte_contains(&transcript, b"4800"));
     assert!(byte_contains(&transcript, b"\x1b[?1049l"));
 }
 
