@@ -12,6 +12,9 @@ streaming, accounts, and network features are deliberately out of scope.
 
 ## Run from the repository
 
+Source builds need Rust and the ALSA development files: `alsa-lib` on Arch,
+`libasound2-dev` on Debian or Ubuntu, or `alsa-lib-devel` on Fedora.
+
 ```sh
 cargo run --locked -- init ./suzumushi
 cargo run --locked -- diagnose --root ./suzumushi

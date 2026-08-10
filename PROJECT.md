@@ -159,6 +159,8 @@ vulnerability details or secrets in a public issue.
 - License: `Apache-2.0`
 - One root package and one canonical binary
 - No Cargo features in the application
+- Source builds require the distribution's ALSA development files. CI installs
+  Ubuntu's `libasound2-dev` explicitly.
 
 `mise.toml` is the command authority:
 
