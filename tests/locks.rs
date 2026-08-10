@@ -4,17 +4,17 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
 use suzumushi::init::initialize;
-use suzumushi::locks::{ActiveTuiLease, RootMutationLease};
+use suzumushi::locks::{ActiveTuiLease, RootWriterLease};
 use tempfile::TempDir;
 
 #[test]
-fn root_mutation_lease_is_exclusive_and_stale_file_is_reused() {
+fn root_writer_lease_is_exclusive_and_stale_file_is_reused() {
     let temp = TempDir::new().expect("temporary directory");
     let root = initialize(&temp.path().join("root")).expect("initialize root");
-    let first = RootMutationLease::acquire(&root.root).expect("first lease");
-    assert!(RootMutationLease::acquire(&root.root).is_err());
+    let first = RootWriterLease::acquire(&root.root).expect("first lease");
+    assert!(RootWriterLease::acquire(&root.root).is_err());
     drop(first);
-    RootMutationLease::acquire(&root.root).expect("stale lock file is safely reused");
+    RootWriterLease::acquire(&root.root).expect("stale lock file is safely reused");
 }
 
 #[test]
@@ -30,8 +30,8 @@ fn one_runtime_lease_contends_across_sessions_roots_and_readers() {
         "second session must contend"
     );
 
-    RootMutationLease::acquire(&root_a.root).expect("different root lease remains independent");
-    RootMutationLease::acquire(&root_b.root).expect("second root lease remains independent");
+    RootWriterLease::acquire(&root_a.root).expect("different root lease remains independent");
+    RootWriterLease::acquire(&root_b.root).expect("second root lease remains independent");
     suzumushi::config::load(&root_a.root).expect("read-only config access remains concurrent");
     drop(global);
     ActiveTuiLease::acquire_in(Some(temp.path())).expect("released global lease can be reacquired");
@@ -55,10 +55,10 @@ fn mutable_session_leases_release_during_unwinding() {
 
     let unwind = std::panic::catch_unwind(|| {
         let _active = ActiveTuiLease::acquire_in(Some(temp.path())).expect("active lease");
-        let _root = RootMutationLease::acquire(&root.root).expect("root lease");
+        let _root = RootWriterLease::acquire(&root.root).expect("root lease");
         panic!("fixture unwind");
     });
     assert!(unwind.is_err());
     ActiveTuiLease::acquire_in(Some(temp.path())).expect("active lease released while unwinding");
-    RootMutationLease::acquire(&root.root).expect("root lease released while unwinding");
+    RootWriterLease::acquire(&root.root).expect("root lease released while unwinding");
 }

@@ -121,7 +121,6 @@ fn diagnose(explicit: Option<&Path>, current_dir: &Path) -> AppResult<()> {
     println!("assets: {}", index.assets.len());
     println!("tracks: {}", index.entries.len());
     println!("playlists: {}", index.playlists.len());
-    println!("artwork candidates: {}", index.artwork_candidates.len());
     println!("warnings: {}", index.warnings.len());
     for entry in &index.entries {
         let asset = index

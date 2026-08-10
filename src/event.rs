@@ -7,8 +7,6 @@ use std::time::{Duration, Instant};
 use crossterm::event::{self, Event, KeyEvent, KeyEventKind};
 
 use crate::errors::{AppError, AppResult};
-use crate::terminal_capabilities::ProbeResult;
-
 const MAX_POLL: Duration = Duration::from_millis(100);
 
 /// Events consumed by the app-owned terminal loop.
@@ -17,7 +15,6 @@ pub enum AppEvent {
     Key(KeyEvent, Duration),
     Resize(u16, u16),
     Tick(Duration),
-    Capability(ProbeResult),
 }
 
 /// Owns the monotonic origin used by leader-key deadlines.

@@ -96,12 +96,6 @@ pub struct Playlist {
     pub entries: Vec<TrackEntryId>,
 }
 
-/// An artwork path recorded without decoding image bytes.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct ArtworkCandidate {
-    pub relative_path: PathBuf,
-}
-
 /// Stable warning category emitted by a bounded scan.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -152,7 +146,6 @@ pub struct ScanIndex {
     pub assets: Vec<MediaAsset>,
     pub entries: Vec<TrackEntry>,
     pub playlists: Vec<Playlist>,
-    pub artwork_candidates: Vec<ArtworkCandidate>,
     pub warnings: Vec<ScanWarning>,
     pub counters: ScanCounters,
 }

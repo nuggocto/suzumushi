@@ -17,7 +17,6 @@ pub mod model;
 pub mod paths;
 pub mod scan;
 pub mod terminal;
-pub mod terminal_capabilities;
 pub mod ui;
 
 /// Parses the process command line and returns a conventional exit status.

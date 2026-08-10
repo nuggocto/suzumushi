@@ -13,8 +13,6 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     let line = Line::from(vec![
         Span::raw(" q quit  Tab/Shift+Tab focus  Space action  "),
         Span::raw(app.status_message),
-        Span::raw("  images: "),
-        Span::raw(app.image_protocol.label()),
     ]);
     frame.render_widget(Paragraph::new(line), area);
 }

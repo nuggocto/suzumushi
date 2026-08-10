@@ -17,9 +17,9 @@ use crate::display::terminal_safe;
 use crate::errors::{AppError, AppResult};
 use crate::metadata;
 use crate::model::{
-    ArtworkCandidate, FileIdentity, MediaAsset, MediaAssetId, Playlist, PlaylistId, ScanCounters,
-    ScanIndex, ScanWarning, ScanWarningCode, SearchFields, TrackEntry, TrackEntryId,
-    TrackEntrySource, TrackTags, stable_id,
+    FileIdentity, MediaAsset, MediaAssetId, Playlist, PlaylistId, ScanCounters, ScanIndex,
+    ScanWarning, ScanWarningCode, SearchFields, TrackEntry, TrackEntryId, TrackEntrySource,
+    TrackTags, stable_id,
 };
 
 /// Testable behavior when secure file-symlink opening is unavailable.
@@ -61,7 +61,6 @@ impl ScanObserver for NoopObserver {}
 pub enum PathClass {
     LibraryAudio,
     PlaylistAudio { playlist: Vec<u8> },
-    Artwork,
     Other,
 }
 
@@ -94,16 +93,6 @@ pub fn classify_relative_path(path: &Path) -> PathClass {
             _ => None,
         })
         .collect();
-    let artwork_context = matches!(
-        components.as_slice(),
-        [first, _, ..] if first.as_bytes() == b"library"
-    ) || matches!(
-        components.as_slice(),
-        [first, _, _, ..] if first.as_bytes() == b"playlists"
-    );
-    if is_artwork_name(path.file_name().unwrap_or_default()) && artwork_context {
-        return PathClass::Artwork;
-    }
     if !is_supported_audio_extension(path) {
         return PathClass::Other;
     }
@@ -278,7 +267,6 @@ struct Scanner<'a> {
     asset_keys: BTreeMap<(Vec<u8>, FileIdentity), (MediaAssetId, usize)>,
     entries: Vec<PendingEntry>,
     playlists: BTreeMap<Vec<u8>, Playlist>,
-    artwork: Vec<ArtworkCandidate>,
     warnings: Vec<ScanWarning>,
     counters: ScanCounters,
 }
@@ -309,7 +297,6 @@ impl<'a> Scanner<'a> {
             asset_keys: BTreeMap::new(),
             entries: Vec::new(),
             playlists: BTreeMap::new(),
-            artwork: Vec::new(),
             warnings: Vec::new(),
             counters: ScanCounters {
                 open_files_high_water: 1,
@@ -478,17 +465,6 @@ impl<'a> Scanner<'a> {
         symlink: bool,
     ) -> AppResult<()> {
         match classify_relative_path(&child) {
-            PathClass::Artwork => {
-                self.account_index(
-                    retained_path_record_bytes::<ArtworkCandidate>(&child),
-                    &child,
-                );
-                if !self.stopped {
-                    self.artwork.push(ArtworkCandidate {
-                        relative_path: child,
-                    });
-                }
-            }
             PathClass::LibraryAudio | PathClass::PlaylistAudio { .. } => {
                 if self.limits.ignore_hidden_audio && is_hidden(name) {
                     return Ok(());
@@ -503,7 +479,7 @@ impl<'a> Scanner<'a> {
                     Mode::empty(),
                 );
                 let result = match opened {
-                    Ok(fd) => self.accept_media(File::from(fd), child.clone(), symlink),
+                    Ok(fd) => self.accept_media(File::from(fd), child, symlink),
                     Err(error) => {
                         self.warn(
                             ScanWarningCode::EntryRead,
@@ -1003,8 +979,6 @@ impl<'a> Scanner<'a> {
             .map(|(rank, entry)| (entry.id, rank))
             .collect();
         self.assets.sort_by_key(|asset| asset.id);
-        self.artwork
-            .sort_by(|left, right| natural_path_cmp(&left.relative_path, &right.relative_path));
         let mut playlists: Vec<_> = self.playlists.into_values().collect();
         for playlist in &mut playlists {
             playlist
@@ -1018,7 +992,6 @@ impl<'a> Scanner<'a> {
             assets: self.assets,
             entries: contextual,
             playlists,
-            artwork_candidates: self.artwork,
             warnings: self.warnings,
             counters: self.counters,
         }
@@ -1138,12 +1111,6 @@ fn retained_entry_bytes(
         .saturating_add(metadata_bytes.saturating_mul(4))
 }
 
-fn retained_path_record_bytes<T>(path: &Path) -> usize {
-    std::mem::size_of::<T>()
-        .saturating_add(128)
-        .saturating_add(path_bytes(path).saturating_mul(2))
-}
-
 fn retained_playlist_bytes(key_bytes: usize, name_bytes: usize, path: &Path) -> usize {
     std::mem::size_of::<(Vec<u8>, Playlist)>()
         .saturating_add(256)
@@ -1167,17 +1134,6 @@ fn fields_within_limit(tags: &TrackTags, limit: usize) -> bool {
 fn is_hidden(name: &OsStr) -> bool {
     name.as_bytes().first() == Some(&b'.')
 }
-fn is_artwork_name(name: &OsStr) -> bool {
-    [
-        b"cover.jpg".as_slice(),
-        b"cover.png",
-        b"folder.jpg",
-        b"folder.png",
-    ]
-    .iter()
-    .any(|expected| name.as_bytes().eq_ignore_ascii_case(expected))
-}
-
 fn natural_path_cmp(left: &Path, right: &Path) -> std::cmp::Ordering {
     let mut left_components = left.components();
     let mut right_components = right.components();

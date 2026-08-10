@@ -43,12 +43,5 @@ test = false
 doc = false
 bench = false
 
-[[bin]]
-name = "terminal_capability"
-path = "fuzz_targets/terminal_capability.rs"
-test = false
-doc = false
-bench = false
-
 [workspace]
 members = ["."]

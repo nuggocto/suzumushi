@@ -2,13 +2,13 @@
 source: src/ui/mod.rs
 expression: "snapshot(80, 24)"
 ---
-╔═══════Library════════╗┌─────────Now Playing──────────┐┌────────Queue─────────┐
+╔═══════Library════════╗┌────────────Player────────────┐┌────────Queue─────────┐
 ║Placeholder           ║│Placeholder                   ││Placeholder           │
 ║                      ║│                              ││                      │
 ║                      ║│                              ││                      │
-║                      ║└──────────────────────────────┘│                      │
-║                      ║┌─────────────Art──────────────┐│                      │
-║                      ║│Placeholder                   ││                      │
+║                      ║│                              ││                      │
+║                      ║│                              ││                      │
+║                      ║│                              ││                      │
 ║                      ║│                              ││                      │
 ║                      ║│                              ││                      │
 ║                      ║│                              ││                      │
@@ -25,4 +25,4 @@ expression: "snapshot(80, 24)"
 ║                      ║│                              ││                      │
 ║                      ║│                              ││                      │
 ╚══════════════════════╝└──────────────────────────────┘└──────────────────────┘
- q quit  Tab/Shift+Tab focus  Space action  Ready  images: fallback
+ q quit  Tab/Shift+Tab focus  Space action  Ready

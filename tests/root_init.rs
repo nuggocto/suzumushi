@@ -6,7 +6,7 @@ use std::path::Path;
 
 use suzumushi::errors::AppError;
 use suzumushi::init::initialize;
-use suzumushi::locks::RootMutationLease;
+use suzumushi::locks::RootWriterLease;
 use suzumushi::paths::{RootSource, discover_root_from};
 use suzumushi::{config, scan};
 use tempfile::TempDir;
@@ -29,10 +29,7 @@ fn init_creates_the_documented_tree_with_private_storage() {
         &paths.library,
         &paths.playlists.join("demo"),
         &paths.state,
-        &paths.artwork_cache,
         &paths.logs,
-        &paths.backups,
-        &paths.tag_backups,
     ] {
         assert!(directory.is_dir(), "missing {}", directory.display());
     }
@@ -42,13 +39,7 @@ fn init_creates_the_documented_tree_with_private_storage() {
             .expect("config readable")
             .contains("max_index_bytes = 117440512")
     );
-    for directory in [
-        &paths.state,
-        &paths.artwork_cache,
-        &paths.logs,
-        &paths.backups,
-        &paths.tag_backups,
-    ] {
+    for directory in [&paths.state, &paths.logs] {
         assert_eq!(
             mode(directory),
             0o700,
@@ -123,13 +114,13 @@ fn reinitialization_respects_the_root_writer_lease() {
     let paths = initialize(&root).expect("initialize fixture");
     let readme = paths.playlists.join("demo/README.txt");
     fs::remove_file(&readme).expect("remove owned file");
-    let lease = RootMutationLease::acquire(&root).expect("hold root writer lease");
+    let lease = RootWriterLease::acquire(&root).expect("hold root writer lease");
 
     let error = initialize(&root).expect_err("reinitialization must contend with the writer");
     assert!(
         error
             .to_string()
-            .contains("root mutation lease is already held")
+            .contains("root writer lease is already held")
     );
     assert!(
         !readme.exists(),

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Simplified the terminal to three full-height Library, Player, and Queue panels.
+- Reduced configuration to behavior that exists today; later phases will add settings with their features.
+- Consolidated the product contract, safety notes, verification rules, and roadmap into `PROJECT.md` and `AGENTS.md`.
+- Renamed the root mutation lease to the root writer lease to match its remaining state and logging role.
+
+### Removed
+
+- Removed cover discovery, artwork state directories, artwork configuration, and every planned artwork cache, MPRIS art URL, and notification image requirement.
+- Removed Kitty, Sixel, and iTerm2 probing, terminal image protocol state, and the terminal capability fuzz target.
+- Removed the visualizer and tag-editing roadmap, configuration, backup tree, and mutation-journal plans.
+- Removed the standalone `docs/` set and `SECURITY.md`; their still-relevant contracts now live in the short project source of truth.
+
 ## [0.2.0] - 2026-08-10
 
 ### Added

@@ -24,7 +24,7 @@ use crate::event::{AppEvent, EventSource};
 ///
 /// # Errors
 ///
-/// Returns a terminal, capability-probe, drawing, or event-stream error.
+/// Returns a terminal, drawing, or event-stream error.
 pub fn run(config: &Config) -> AppResult<()> {
     let initial_area = current_terminal_area()?;
     let stdout = io::stdout();
@@ -34,9 +34,7 @@ pub fn run(config: &Config) -> AppResult<()> {
 
     let mut terminal = create_terminal(initial_area)?;
 
-    let probe = crate::terminal_capabilities::query(config.artwork.terminal_images)?;
     let mut app = AppState::new(config);
-    apply_event(&mut app, AppEvent::Capability(probe));
     let events = EventSource::new();
 
     while !app.should_quit {
@@ -120,10 +118,6 @@ fn apply_event(app: &mut AppState, event: AppEvent) {
             if let Some(action) = app.input.tick(now) {
                 app.apply(action);
             }
-        }
-        AppEvent::Capability(probe) => {
-            app.image_protocol = probe.protocol;
-            app.should_quit = probe.cancelled;
         }
     }
 }
@@ -231,22 +225,12 @@ mod tests {
     use crate::app::AppState;
     use crate::config::Config;
     use crate::event::AppEvent;
-    use crate::terminal_capabilities::{ImageProtocol, ProbeResult};
 
     #[test]
-    fn app_events_record_resize_and_no_reply_fallback() {
+    fn app_events_record_resize() {
         let mut app = AppState::new(&Config::default());
         apply_event(&mut app, AppEvent::Resize(120, 32));
-        apply_event(
-            &mut app,
-            AppEvent::Capability(ProbeResult {
-                protocol: ImageProtocol::Fallback,
-                timed_out: true,
-                cancelled: false,
-            }),
-        );
         assert_eq!(app.terminal_size, (120, 32));
-        assert_eq!(app.image_protocol, ImageProtocol::Fallback);
         assert!(!app.should_quit);
     }
 

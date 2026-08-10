@@ -143,14 +143,13 @@ fn scan(
 }
 
 #[test]
-fn one_pass_finds_context_metadata_artwork_and_symlinks() {
+fn one_pass_finds_context_metadata_and_symlinks() {
     let (_temp, root) = root();
     let library = root.join("audio/library");
     let playlist = root.join("audio/playlists/focus");
     fs::create_dir(&playlist).expect("playlist");
     fs::write(library.join("10 original.mp3"), b"media").expect("library media");
     fs::write(library.join("2 copied.flac"), b"copy").expect("copied media");
-    fs::write(library.join("cover.jpg"), b"not decoded").expect("artwork");
     symlink(
         library.join("10 original.mp3"),
         playlist.join("10 link.mp3"),
@@ -185,7 +184,6 @@ fn one_pass_finds_context_metadata_artwork_and_symlinks() {
         reader.attempts, 3,
         "metadata is parsed once per canonical asset"
     );
-    assert_eq!(index.artwork_candidates.len(), 1);
     let focus = index
         .playlists
         .iter()

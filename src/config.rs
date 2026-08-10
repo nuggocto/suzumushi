@@ -31,20 +31,9 @@ pub(crate) fn scan_reservation_bytes(
 }
 
 /// The default configuration written by `init`.
-pub const DEFAULT_CONFIG: &str = r#"theme = "terminal"
-default_view = "playlists"
-default_volume = 0.70
-volume_step = 0.05
-speed_min = 0.50
-speed_max = 2.00
-speed_step = 0.25
-seek_short_seconds = 5
-seek_long_seconds = 30
-shuffle = false
-repeat = "off"
-queue_max_items = 10000
-queue_max_bytes = 50331648
-queue_max_history_items = 1000
+pub const DEFAULT_CONFIG: &str = r#"config_version = 1
+theme = "terminal"
+default_view = "library"
 
 [input]
 leader_timeout_ms = 250
@@ -68,53 +57,10 @@ follow_file_symlinks = true
 follow_directory_symlinks = false
 ignore_hidden_audio = true
 
-[search]
-enabled = true
-max_results = 200
-max_query_bytes = 4096
-music_search_key = "/"
-palette_key = "space slash"
-metadata_weight = 3
-filename_weight = 1
-
-[artwork]
-enabled = true
-terminal_images = true
-max_decode_bytes = 33554432
-max_cache_bytes = 33554432
-max_source_bytes = 33554432
-max_width_px = 4096
-max_height_px = 4096
-preferred_size_px = 512
-
-[visualizer]
-enabled = true
-style = "suzu"
-bars = 16
-height = 1
-update_hz = 10
-falloff = "soft"
-
-[desktop]
-mpris = true
-notifications = true
-notification_timeout_ms = 5000
-status_write_coalesce_ms = 250
-
 [runtime]
 process_memory_budget_bytes = 402653184
-command_channel_capacity = 32
-event_channel_capacity = 64
-position_channel_capacity = 1
-visualizer_channel_capacity = 2
 max_open_files = 64
-max_blocking_jobs = 4
-max_parser_helpers = 2
-tokio_worker_threads = 2
-audio_prefetch_frames = 16384
-state_file_max_bytes = 1048576
 status_text_max_bytes = 4096
-shutdown_timeout_ms = 5000
 
 [logging]
 max_file_bytes = 10485760
@@ -123,50 +69,18 @@ max_record_bytes = 16384
 queue_capacity = 512
 queue_max_bytes = 8388608
 queue_full_policy = "drop_and_count"
-
-[tags]
-editing = true
-batch_editing = true
-backup_budget_bytes = 2147483648
-backup_max_entries = 10000
-max_batch_files = 200
-max_field_bytes = 16384
-refuse_loaded_audio_file = true
-
-[mutation]
-journal_record_max_bytes = 1048576
-journal_max_entries = 10000
-journal_max_total_bytes = 67108864
-startup_recovery_max_records = 10000
 "#;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    pub config_version: u32,
     pub theme: String,
     pub default_view: String,
-    pub default_volume: f64,
-    pub volume_step: f64,
-    pub speed_min: f64,
-    pub speed_max: f64,
-    pub speed_step: f64,
-    pub seek_short_seconds: u64,
-    pub seek_long_seconds: u64,
-    pub shuffle: bool,
-    pub repeat: String,
-    pub queue_max_items: usize,
-    pub queue_max_bytes: usize,
-    pub queue_max_history_items: usize,
     pub input: InputConfig,
     pub scan: ScanConfig,
-    pub search: SearchConfig,
-    pub artwork: ArtworkConfig,
-    pub visualizer: VisualizerConfig,
-    pub desktop: DesktopConfig,
     pub runtime: RuntimeConfig,
     pub logging: LoggingConfig,
-    pub tags: TagsConfig,
-    pub mutation: MutationConfig,
 }
 
 macro_rules! section {
@@ -199,53 +113,10 @@ section!(ScanConfig {
     follow_directory_symlinks: bool,
     ignore_hidden_audio: bool
 });
-section!(SearchConfig {
-    enabled: bool,
-    max_results: usize,
-    max_query_bytes: usize,
-    music_search_key: String,
-    palette_key: String,
-    metadata_weight: u8,
-    filename_weight: u8
-});
-section!(ArtworkConfig {
-    enabled: bool,
-    terminal_images: bool,
-    max_decode_bytes: usize,
-    max_cache_bytes: usize,
-    max_source_bytes: usize,
-    max_width_px: usize,
-    max_height_px: usize,
-    preferred_size_px: usize
-});
-section!(VisualizerConfig {
-    enabled: bool,
-    style: String,
-    bars: usize,
-    height: usize,
-    update_hz: usize,
-    falloff: String
-});
-section!(DesktopConfig {
-    mpris: bool,
-    notifications: bool,
-    notification_timeout_ms: u64,
-    status_write_coalesce_ms: u64
-});
 section!(RuntimeConfig {
     process_memory_budget_bytes: usize,
-    command_channel_capacity: usize,
-    event_channel_capacity: usize,
-    position_channel_capacity: usize,
-    visualizer_channel_capacity: usize,
     max_open_files: usize,
-    max_blocking_jobs: usize,
-    max_parser_helpers: usize,
-    tokio_worker_threads: usize,
-    audio_prefetch_frames: usize,
-    state_file_max_bytes: usize,
-    status_text_max_bytes: usize,
-    shutdown_timeout_ms: u64
+    status_text_max_bytes: usize
 });
 section!(LoggingConfig {
     max_file_bytes: usize,
@@ -254,21 +125,6 @@ section!(LoggingConfig {
     queue_capacity: usize,
     queue_max_bytes: usize,
     queue_full_policy: String
-});
-section!(TagsConfig {
-    editing: bool,
-    batch_editing: bool,
-    backup_budget_bytes: u64,
-    backup_max_entries: usize,
-    max_batch_files: usize,
-    max_field_bytes: usize,
-    refuse_loaded_audio_file: bool
-});
-section!(MutationConfig {
-    journal_record_max_bytes: usize,
-    journal_max_entries: usize,
-    journal_max_total_bytes: usize,
-    startup_recovery_max_records: usize
 });
 
 /// Parses a bounded TOML document and validates every compiled range.
@@ -285,10 +141,64 @@ pub fn parse(input: &[u8]) -> AppResult<Config> {
     }
     let text = std::str::from_utf8(input)
         .map_err(|error| AppError::InvalidConfig(format!("config is not UTF-8: {error}")))?;
-    let config: Config =
+    let mut document: toml::Table =
         toml::from_str(text).map_err(|error| AppError::InvalidConfig(error.to_string()))?;
+    if !document.contains_key("config_version") {
+        remove_released_prototype_fields(&mut document);
+        document.insert("config_version".into(), toml::Value::Integer(1));
+    }
+    let config: Config = toml::Value::Table(document)
+        .try_into()
+        .map_err(|error| AppError::InvalidConfig(error.to_string()))?;
     config.validate()?;
     Ok(config)
+}
+
+fn remove_released_prototype_fields(document: &mut toml::Table) {
+    for key in [
+        "default_volume",
+        "volume_step",
+        "speed_min",
+        "speed_max",
+        "speed_step",
+        "seek_short_seconds",
+        "seek_long_seconds",
+        "shuffle",
+        "repeat",
+        "queue_max_items",
+        "queue_max_bytes",
+        "queue_max_history_items",
+        "search",
+        "artwork",
+        "visualizer",
+        "desktop",
+        "tags",
+        "mutation",
+    ] {
+        document.remove(key);
+    }
+    if document.get("default_view").and_then(toml::Value::as_str) == Some("playlists") {
+        document.insert("default_view".into(), toml::Value::String("library".into()));
+    }
+    if let Some(runtime) = document
+        .get_mut("runtime")
+        .and_then(toml::Value::as_table_mut)
+    {
+        for key in [
+            "command_channel_capacity",
+            "event_channel_capacity",
+            "position_channel_capacity",
+            "visualizer_channel_capacity",
+            "max_blocking_jobs",
+            "max_parser_helpers",
+            "tokio_worker_threads",
+            "audio_prefetch_frames",
+            "state_file_max_bytes",
+            "shutdown_timeout_ms",
+        ] {
+            runtime.remove(key);
+        }
+    }
 }
 
 /// Loads `config.toml` from a pinned root without following the file target.
@@ -375,11 +285,108 @@ fn one_of(name: &str, value: &str, accepted: &[&str]) -> AppResult<()> {
     Ok(())
 }
 
-fn key(name: &str, value: &str) -> AppResult<()> {
-    if value.is_empty() || value.len() > 64 || value.chars().any(char::is_control) {
-        return Err(AppError::InvalidConfig(format!(
-            "{name} must be one non-control chord of 1..=64 bytes"
-        )));
+fn validate_scan(scan: &ScanConfig) -> AppResult<()> {
+    inclusive("scan.max_files", scan.max_files, 1, 50_000)?;
+    inclusive("scan.max_entries", scan.max_entries, 1, 100_000)?;
+    if scan.max_entries < scan.max_files {
+        return Err(AppError::InvalidConfig(
+            "scan.max_entries must be at least scan.max_files".into(),
+        ));
+    }
+    inclusive("scan.max_depth", scan.max_depth, 1, 16)?;
+    inclusive("scan.max_playlists", scan.max_playlists, 1, 2_000)?;
+    inclusive(
+        "scan.max_entries_per_playlist",
+        scan.max_entries_per_playlist,
+        1,
+        10_000,
+    )?;
+    inclusive(
+        "scan.max_symlink_resolutions",
+        scan.max_symlink_resolutions,
+        1,
+        50_000,
+    )?;
+    inclusive(
+        "scan.max_parser_attempts",
+        scan.max_parser_attempts,
+        1,
+        50_000,
+    )?;
+    inclusive("scan.max_path_bytes", scan.max_path_bytes, 1, 4_096)?;
+    inclusive(
+        "scan.max_total_path_bytes",
+        scan.max_total_path_bytes,
+        1,
+        25_165_824,
+    )?;
+    inclusive(
+        "scan.max_metadata_field_bytes",
+        scan.max_metadata_field_bytes,
+        1,
+        16_384,
+    )?;
+    inclusive(
+        "scan.max_total_metadata_bytes",
+        scan.max_total_metadata_bytes,
+        1,
+        50_331_648,
+    )?;
+    inclusive(
+        "scan.max_warning_bytes",
+        scan.max_warning_bytes,
+        1,
+        8_388_608,
+    )?;
+    inclusive("scan.max_index_bytes", scan.max_index_bytes, 1, 117_440_512)?;
+    if scan.follow_directory_symlinks {
+        return Err(AppError::InvalidConfig(
+            "scan.follow_directory_symlinks must be false in v1".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_logging(logging: &LoggingConfig) -> AppResult<()> {
+    inclusive(
+        "logging.max_file_bytes",
+        logging.max_file_bytes,
+        1,
+        10_485_760,
+    )?;
+    inclusive("logging.max_files", logging.max_files, 1, MAX_LOG_FILES)?;
+    inclusive(
+        "logging.max_record_bytes",
+        logging.max_record_bytes,
+        1,
+        16_384,
+    )?;
+    inclusive("logging.queue_capacity", logging.queue_capacity, 1, 512)?;
+    inclusive(
+        "logging.queue_max_bytes",
+        logging.queue_max_bytes,
+        1,
+        8_388_608,
+    )?;
+    one_of(
+        "logging.queue_full_policy",
+        &logging.queue_full_policy,
+        &["drop_and_count"],
+    )?;
+    let queued_bytes = logging
+        .queue_capacity
+        .checked_mul(logging.max_record_bytes)
+        .ok_or_else(|| AppError::InvalidConfig("logging queue reservation overflow".into()))?;
+    if queued_bytes > logging.queue_max_bytes {
+        return Err(AppError::InvalidConfig(
+            "logging.queue_capacity times logging.max_record_bytes must fit logging.queue_max_bytes"
+                .into(),
+        ));
+    }
+    if logging.max_record_bytes > logging.max_file_bytes {
+        return Err(AppError::InvalidConfig(
+            "logging.max_record_bytes must not exceed logging.max_file_bytes".into(),
+        ));
     }
     Ok(())
 }
@@ -390,170 +397,22 @@ impl Config {
     /// # Errors
     ///
     /// Returns [`AppError::InvalidConfig`] when any compiled invariant fails.
-    #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> AppResult<()> {
+        if self.config_version != 1 {
+            return Err(AppError::InvalidConfig(format!(
+                "config_version must equal 1, got {}",
+                self.config_version
+            )));
+        }
         one_of("theme", &self.theme, &["terminal", "mono"])?;
-        one_of(
-            "default_view",
-            &self.default_view,
-            &["library", "playlists", "queue"],
-        )?;
-        for (name, value, min, max) in [
-            ("default_volume", self.default_volume, 0.0, 1.0),
-            ("volume_step", self.volume_step, 0.01, 1.0),
-            ("speed_min", self.speed_min, 0.5, 2.0),
-            ("speed_max", self.speed_max, 0.5, 2.0),
-            ("speed_step", self.speed_step, 0.01, 1.5),
-        ] {
-            if !value.is_finite() {
-                return Err(AppError::InvalidConfig(format!("{name} must be finite")));
-            }
-            inclusive(name, value, min, max)?;
-        }
-        if self.speed_min > 1.0 || self.speed_max < 1.0 || self.speed_min > self.speed_max {
-            return Err(AppError::InvalidConfig(
-                "speed_min <= 1.0 <= speed_max is required".into(),
-            ));
-        }
-        inclusive("seek_short_seconds", self.seek_short_seconds, 1, 3600)?;
-        inclusive("seek_long_seconds", self.seek_long_seconds, 1, 3600)?;
-        if self.seek_short_seconds > self.seek_long_seconds {
-            return Err(AppError::InvalidConfig(
-                "seek_short_seconds must not exceed seek_long_seconds".into(),
-            ));
-        }
-        one_of("repeat", &self.repeat, &["off", "one", "queue"])?;
-        inclusive("queue_max_items", self.queue_max_items, 1, 10_000)?;
-        inclusive("queue_max_bytes", self.queue_max_bytes, 1, 50_331_648)?;
-        inclusive(
-            "queue_max_history_items",
-            self.queue_max_history_items,
-            1,
-            1_000,
-        )?;
-        if self.queue_max_history_items > self.queue_max_items {
-            return Err(AppError::InvalidConfig(
-                "queue_max_history_items must not exceed queue_max_items".into(),
-            ));
-        }
+        one_of("default_view", &self.default_view, &["library", "queue"])?;
         inclusive(
             "input.leader_timeout_ms",
             self.input.leader_timeout_ms,
             50,
             2_000,
         )?;
-        let s = &self.scan;
-        inclusive("scan.max_files", s.max_files, 1, 50_000)?;
-        inclusive("scan.max_entries", s.max_entries, 1, 100_000)?;
-        if s.max_entries < s.max_files {
-            return Err(AppError::InvalidConfig(
-                "scan.max_entries must be at least scan.max_files".into(),
-            ));
-        }
-        inclusive("scan.max_depth", s.max_depth, 1, 16)?;
-        inclusive("scan.max_playlists", s.max_playlists, 1, 2_000)?;
-        inclusive(
-            "scan.max_entries_per_playlist",
-            s.max_entries_per_playlist,
-            1,
-            10_000,
-        )?;
-        inclusive(
-            "scan.max_symlink_resolutions",
-            s.max_symlink_resolutions,
-            1,
-            50_000,
-        )?;
-        inclusive("scan.max_parser_attempts", s.max_parser_attempts, 1, 50_000)?;
-        inclusive("scan.max_path_bytes", s.max_path_bytes, 1, 4_096)?;
-        inclusive(
-            "scan.max_total_path_bytes",
-            s.max_total_path_bytes,
-            1,
-            25_165_824,
-        )?;
-        inclusive(
-            "scan.max_metadata_field_bytes",
-            s.max_metadata_field_bytes,
-            1,
-            16_384,
-        )?;
-        inclusive(
-            "scan.max_total_metadata_bytes",
-            s.max_total_metadata_bytes,
-            1,
-            50_331_648,
-        )?;
-        inclusive("scan.max_warning_bytes", s.max_warning_bytes, 1, 8_388_608)?;
-        inclusive("scan.max_index_bytes", s.max_index_bytes, 1, 117_440_512)?;
-        if s.follow_directory_symlinks {
-            return Err(AppError::InvalidConfig(
-                "scan.follow_directory_symlinks must be false in v1".into(),
-            ));
-        }
-        inclusive("search.max_results", self.search.max_results, 1, 200)?;
-        inclusive(
-            "search.max_query_bytes",
-            self.search.max_query_bytes,
-            1,
-            4_096,
-        )?;
-        inclusive("search.metadata_weight", self.search.metadata_weight, 0, 16)?;
-        inclusive("search.filename_weight", self.search.filename_weight, 0, 16)?;
-        if self.search.metadata_weight == 0 && self.search.filename_weight == 0 {
-            return Err(AppError::InvalidConfig(
-                "one search weight must be non-zero".into(),
-            ));
-        }
-        key("search.music_search_key", &self.search.music_search_key)?;
-        key("search.palette_key", &self.search.palette_key)?;
-        let a = &self.artwork;
-        inclusive(
-            "artwork.max_source_bytes",
-            a.max_source_bytes,
-            1,
-            33_554_432,
-        )?;
-        inclusive(
-            "artwork.max_decode_bytes",
-            a.max_decode_bytes,
-            1,
-            33_554_432,
-        )?;
-        inclusive("artwork.max_cache_bytes", a.max_cache_bytes, 1, 33_554_432)?;
-        inclusive("artwork.max_width_px", a.max_width_px, 1, 4_096)?;
-        inclusive("artwork.max_height_px", a.max_height_px, 1, 4_096)?;
-        inclusive(
-            "artwork.preferred_size_px",
-            a.preferred_size_px,
-            1,
-            a.max_width_px.min(a.max_height_px),
-        )?;
-        one_of(
-            "visualizer.style",
-            &self.visualizer.style,
-            &["suzu", "bars"],
-        )?;
-        one_of(
-            "visualizer.falloff",
-            &self.visualizer.falloff,
-            &["soft", "none"],
-        )?;
-        inclusive("visualizer.bars", self.visualizer.bars, 1, 32)?;
-        inclusive("visualizer.height", self.visualizer.height, 1, 4)?;
-        inclusive("visualizer.update_hz", self.visualizer.update_hz, 1, 12)?;
-        inclusive(
-            "desktop.notification_timeout_ms",
-            self.desktop.notification_timeout_ms,
-            100,
-            60_000,
-        )?;
-        inclusive(
-            "desktop.status_write_coalesce_ms",
-            self.desktop.status_write_coalesce_ms,
-            50,
-            1_000,
-        )?;
+        validate_scan(&self.scan)?;
         let r = &self.runtime;
         inclusive(
             "runtime.process_memory_budget_bytes",
@@ -561,125 +420,21 @@ impl Config {
             67_108_864,
             402_653_184,
         )?;
-        inclusive(
-            "runtime.command_channel_capacity",
-            r.command_channel_capacity,
-            1,
-            32,
-        )?;
-        inclusive(
-            "runtime.event_channel_capacity",
-            r.event_channel_capacity,
-            1,
-            64,
-        )?;
-        if r.position_channel_capacity != 1 {
-            return Err(AppError::InvalidConfig(
-                "runtime.position_channel_capacity must equal 1".into(),
-            ));
-        }
-        inclusive(
-            "runtime.visualizer_channel_capacity",
-            r.visualizer_channel_capacity,
-            1,
-            2,
-        )?;
         inclusive("runtime.max_open_files", r.max_open_files, 1, 64)?;
-        inclusive("runtime.max_blocking_jobs", r.max_blocking_jobs, 1, 4)?;
-        inclusive("runtime.max_parser_helpers", r.max_parser_helpers, 1, 2)?;
-        inclusive("runtime.tokio_worker_threads", r.tokio_worker_threads, 1, 2)?;
-        inclusive(
-            "runtime.audio_prefetch_frames",
-            r.audio_prefetch_frames,
-            1_024,
-            16_384,
-        )?;
-        inclusive(
-            "runtime.state_file_max_bytes",
-            r.state_file_max_bytes,
-            1,
-            1_048_576,
-        )?;
         inclusive(
             "runtime.status_text_max_bytes",
             r.status_text_max_bytes,
             1,
             4_096,
         )?;
-        inclusive(
-            "runtime.shutdown_timeout_ms",
-            r.shutdown_timeout_ms,
-            100,
-            5_000,
-        )?;
-        let l = &self.logging;
-        inclusive("logging.max_file_bytes", l.max_file_bytes, 1, 10_485_760)?;
-        inclusive("logging.max_files", l.max_files, 1, MAX_LOG_FILES)?;
-        inclusive("logging.max_record_bytes", l.max_record_bytes, 1, 16_384)?;
-        inclusive("logging.queue_capacity", l.queue_capacity, 1, 512)?;
-        inclusive("logging.queue_max_bytes", l.queue_max_bytes, 1, 8_388_608)?;
-        one_of(
-            "logging.queue_full_policy",
-            &l.queue_full_policy,
-            &["drop_and_count"],
-        )?;
-        let queued_log_bytes = l
-            .queue_capacity
-            .checked_mul(l.max_record_bytes)
-            .ok_or_else(|| AppError::InvalidConfig("logging queue reservation overflow".into()))?;
-        if queued_log_bytes > l.queue_max_bytes {
-            return Err(AppError::InvalidConfig(
-                "logging.queue_capacity times logging.max_record_bytes must fit logging.queue_max_bytes"
-                    .into(),
-            ));
-        }
-        if l.max_record_bytes > l.max_file_bytes {
-            return Err(AppError::InvalidConfig(
-                "logging.max_record_bytes must not exceed logging.max_file_bytes".into(),
-            ));
-        }
-        inclusive(
-            "tags.backup_budget_bytes",
-            self.tags.backup_budget_bytes,
-            1,
-            2_147_483_648,
-        )?;
-        inclusive(
-            "tags.backup_max_entries",
-            self.tags.backup_max_entries,
-            1,
-            10_000,
-        )?;
-        inclusive("tags.max_batch_files", self.tags.max_batch_files, 1, 200)?;
-        inclusive("tags.max_field_bytes", self.tags.max_field_bytes, 1, 16_384)?;
-        inclusive(
-            "mutation.journal_record_max_bytes",
-            self.mutation.journal_record_max_bytes,
-            1,
-            1_048_576,
-        )?;
-        inclusive(
-            "mutation.journal_max_entries",
-            self.mutation.journal_max_entries,
-            1,
-            10_000,
-        )?;
-        inclusive(
-            "mutation.journal_max_total_bytes",
-            self.mutation.journal_max_total_bytes,
-            1,
-            67_108_864,
-        )?;
-        inclusive(
-            "mutation.startup_recovery_max_records",
-            self.mutation.startup_recovery_max_records,
-            1,
-            10_000,
-        )?;
-        let reserved_app = scan_reservation_bytes(s.max_index_bytes, s.max_index_bytes)?
-            .checked_add(l.queue_max_bytes)
-            .and_then(|value| value.checked_add(UI_STATE_SCRATCH_BYTES))
-            .ok_or_else(|| AppError::InvalidConfig("application reservation overflow".into()))?;
+        validate_logging(&self.logging)?;
+        let reserved_app =
+            scan_reservation_bytes(self.scan.max_index_bytes, self.scan.max_index_bytes)?
+                .checked_add(self.logging.queue_max_bytes)
+                .and_then(|value| value.checked_add(UI_STATE_SCRATCH_BYTES))
+                .ok_or_else(|| {
+                    AppError::InvalidConfig("application reservation overflow".into())
+                })?;
         if reserved_app > r.process_memory_budget_bytes {
             return Err(AppError::InvalidConfig(
                 "indexes, scan/parser scratch, logging queue, and UI/state scratch exceed process_memory_budget_bytes".into(),
@@ -717,6 +472,30 @@ mod tests {
     }
 
     #[test]
+    fn released_prototype_config_migrates_to_the_smaller_contract() {
+        let legacy = replace_once(DEFAULT_CONFIG, "config_version = 1\n", "");
+        let mut legacy = replace_once(
+            &legacy,
+            "default_view = \"library\"",
+            "default_view = \"playlists\"\ndefault_volume = 0.70",
+        );
+        legacy = replace_once(
+            &legacy,
+            "max_open_files = 64",
+            "command_channel_capacity = 32\nvisualizer_channel_capacity = 2\nmax_open_files = 64",
+        );
+        legacy.push_str("\n[artwork]\nenabled = true\n");
+        let config = parse(legacy.as_bytes()).expect("released prototype config remains readable");
+        assert_eq!(config.default_view, "library");
+
+        let current = format!("{DEFAULT_CONFIG}\n[artwork]\nenabled = true\n");
+        assert!(
+            parse(current.as_bytes()).is_err(),
+            "retired fields are accepted only by the unversioned migration"
+        );
+    }
+
+    #[test]
     fn current_scan_and_runtime_bounds_reject_limit_plus_one() {
         let invalid_replacements = [
             ("max_files = 50000", "max_files = 50001"),
@@ -748,7 +527,6 @@ mod tests {
             ("max_warning_bytes = 8388608", "max_warning_bytes = 8388609"),
             ("max_index_bytes = 117440512", "max_index_bytes = 117440513"),
             ("max_open_files = 64", "max_open_files = 65"),
-            ("max_parser_helpers = 2", "max_parser_helpers = 3"),
             (
                 "process_memory_budget_bytes = 402653184",
                 "process_memory_budget_bytes = 402653185",
@@ -761,38 +539,25 @@ mod tests {
     }
 
     #[test]
-    fn contradictions_and_non_finite_values_fail_before_work_starts() {
-        for (old, new) in [
-            ("default_volume = 0.70", "default_volume = nan"),
-            ("speed_min = 0.50", "speed_min = 1.25"),
-            ("seek_short_seconds = 5", "seek_short_seconds = 31"),
-            (
-                "queue_max_history_items = 1000",
-                "queue_max_history_items = 10001",
-            ),
-            ("metadata_weight = 3", "metadata_weight = 0"),
-        ] {
-            let mut text = replace_once(DEFAULT_CONFIG, old, new);
-            if new == "metadata_weight = 0" {
-                text = replace_once(&text, "filename_weight = 1", "filename_weight = 0");
-            }
-            assert!(
-                parse(text.as_bytes()).is_err(),
-                "accepted contradictory {new}"
-            );
-        }
-
+    fn cross_field_contradictions_fail_before_work_starts() {
         let text = replace_once(
             DEFAULT_CONFIG,
-            "queue_max_bytes = 8388608",
-            "queue_max_bytes = 8388607",
+            "max_file_bytes = 10485760",
+            "max_file_bytes = 16383",
         );
         assert!(parse(text.as_bytes()).is_err());
 
         let text = replace_once(
             DEFAULT_CONFIG,
-            "max_file_bytes = 10485760",
-            "max_file_bytes = 16383",
+            "max_entries = 100000",
+            "max_entries = 49999",
+        );
+        assert!(parse(text.as_bytes()).is_err());
+
+        let text = replace_once(
+            DEFAULT_CONFIG,
+            "follow_directory_symlinks = false",
+            "follow_directory_symlinks = true",
         );
         assert!(parse(text.as_bytes()).is_err());
     }

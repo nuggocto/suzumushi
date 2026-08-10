@@ -16,7 +16,7 @@ use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
 use rustix::termios::{Pid, Winsize, tcsetwinsize};
 use tempfile::TempDir;
 
-const FOCUSED_NOW_PLAYING: &[u8] = b"\x1b[7m\x1b[1m\x1b[38;5;6;49mNow Playing";
+const FOCUSED_PLAYER: &[u8] = b"\x1b[7m\x1b[1m\x1b[38;5;6;49mPlayer";
 
 #[test]
 fn help_succeeds_and_names_the_canonical_command() {
@@ -84,7 +84,7 @@ fn terminal_session_restores_the_pty_and_holds_both_leases() {
     let mut transcript = read_pty_until(&mut master, &mut child, b"Library");
 
     master.write_all(b"\t").expect("send focus key");
-    transcript.extend(read_pty_until(&mut master, &mut child, FOCUSED_NOW_PLAYING));
+    transcript.extend(read_pty_until(&mut master, &mut child, FOCUSED_PLAYER));
 
     resize_terminal(&master, &child, 40, 10);
     transcript.extend(read_pty_until(&mut master, &mut child, b"needs"));
@@ -103,9 +103,6 @@ fn terminal_session_restores_the_pty_and_holds_both_leases() {
     transcript.extend(read_pty_to_exit(&mut master, &mut child));
     assert!(byte_contains(&transcript, b"\x1b[?1049h"));
     assert!(byte_contains(&transcript, b"\x1b[?1049l"));
-    assert!(byte_contains(&transcript, b"\x1b[c"));
-    assert!(!byte_contains(&transcript, b"\x1b_Gi=31"));
-    assert!(!byte_contains(&transcript, b"\x1b[6n"));
     assert!(!byte_contains(&transcript, b"terminal session starting"));
 
     let current = root.join("logs/suzumushi.log");
@@ -150,7 +147,7 @@ fn terminal_session_restores_the_pty_and_holds_both_leases() {
 
     suzumushi::locks::ActiveTuiLease::acquire_in(Some(&runtime))
         .expect("active lease is released after quit");
-    suzumushi::locks::RootMutationLease::acquire(&root).expect("root lease is released after quit");
+    suzumushi::locks::RootWriterLease::acquire(&root).expect("root lease is released after quit");
     suzumushi::init::initialize(&root)
         .expect("the persistent root lock remains an owned initialization entry");
 }
@@ -176,7 +173,7 @@ fn oversized_terminal_resize_is_refused_before_buffer_growth() {
     master
         .write_all(b"\t")
         .expect("prime terminal event delivery");
-    transcript.extend(read_pty_until(&mut master, &mut child, FOCUSED_NOW_PLAYING));
+    transcript.extend(read_pty_until(&mut master, &mut child, FOCUSED_PLAYER));
 
     let pair_bytes = std::mem::size_of::<ratatui::buffer::Cell>() * 2;
     let width = 512_usize;
@@ -199,7 +196,7 @@ fn oversized_terminal_resize_is_refused_before_buffer_growth() {
     assert!(byte_contains(&transcript, b"\x1b[?1049l"));
     suzumushi::locks::ActiveTuiLease::acquire_in(Some(&runtime))
         .expect("active lease is released after resize refusal");
-    suzumushi::locks::RootMutationLease::acquire(&root)
+    suzumushi::locks::RootWriterLease::acquire(&root)
         .expect("root lease is released after resize refusal");
 }
 
@@ -245,7 +242,7 @@ fn background_log_failure_is_reported_after_terminal_restoration() {
 
     suzumushi::locks::ActiveTuiLease::acquire_in(Some(&runtime))
         .expect("active lease is released after writer failure");
-    suzumushi::locks::RootMutationLease::acquire(&root)
+    suzumushi::locks::RootWriterLease::acquire(&root)
         .expect("root lease is released after writer failure");
 }
 
@@ -273,7 +270,7 @@ fn fifo_log_entry_never_blocks_terminal_startup() {
     assert!(stderr.contains("single-link regular file"), "{stderr}");
     suzumushi::locks::ActiveTuiLease::acquire_in(Some(&runtime))
         .expect("active lease is released after startup failure");
-    suzumushi::locks::RootMutationLease::acquire(&root)
+    suzumushi::locks::RootWriterLease::acquire(&root)
         .expect("root lease is released after startup failure");
 }
 
@@ -358,8 +355,6 @@ fn init_and_diagnose_work_through_the_real_executable() {
         playlist.join("broken.mp3"),
     )
     .expect("create broken symlink");
-    fs::write(root.join("audio/library/cover.png"), b"candidate only")
-        .expect("write artwork candidate");
 
     let diagnose = Command::new(env!("CARGO_BIN_EXE_suzumushi"))
         .args([
@@ -378,7 +373,6 @@ fn init_and_diagnose_work_through_the_real_executable() {
     for expected in [
         "assets: 1",
         "tracks: 2",
-        "artwork candidates: 1",
         "Calm Artist - Night Song",
         "BrokenSymlink",
     ] {
@@ -589,11 +583,7 @@ fn terminal_command(root: &std::path::Path, runtime: &std::path::Path) -> Comman
         .arg(root)
         .env("XDG_RUNTIME_DIR", runtime)
         .env("TERM", "xterm-256color")
-        .env_remove("NO_COLOR")
-        .env_remove("TERM_PROGRAM")
-        .env_remove("KITTY_WINDOW_ID")
-        .env_remove("TMUX")
-        .env_remove("ZELLIJ");
+        .env_remove("NO_COLOR");
     command
 }
 

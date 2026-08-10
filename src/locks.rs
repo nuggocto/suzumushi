@@ -17,13 +17,13 @@ pub(crate) const ROOT_LOCK: &str = ".suzumushi-root.lock";
 const ACTIVE_LOCK: &str = "active-tui.lock";
 const MAX_IDENTITY_BYTES: u64 = 256;
 
-/// Exclusive lease for future mutations under one canonical root.
+/// Exclusive lease for mutable app state under one canonical root.
 #[derive(Debug)]
-pub struct RootMutationLease {
+pub struct RootWriterLease {
     _file: File,
 }
 
-impl RootMutationLease {
+impl RootWriterLease {
     /// Attempts to acquire the root writer lease without blocking.
     ///
     /// # Errors
@@ -48,7 +48,7 @@ impl RootMutationLease {
 
     pub(crate) fn acquire_from<Fd: AsFd>(root: Fd, display: &Path) -> AppResult<Self> {
         let file = open_private_lock(root, ROOT_LOCK, &display.join(ROOT_LOCK))?;
-        acquire_and_record(file, "root mutation").map(|file| Self { _file: file })
+        acquire_and_record(file, "root writer").map(|file| Self { _file: file })
     }
 }
 

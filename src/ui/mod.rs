@@ -30,15 +30,8 @@ pub fn render(frame: &mut Frame<'_>, app: &AppState) {
 
     let panels = layout::panels(area);
     panel(frame, panels.library, "Library", Focus::Library, app);
-    panel(
-        frame,
-        panels.now_playing,
-        "Now Playing",
-        Focus::NowPlaying,
-        app,
-    );
+    panel(frame, panels.player, "Player", Focus::Player, app);
     panel(frame, panels.queue, "Queue", Focus::Queue, app);
-    panel(frame, panels.art, "Art", Focus::Art, app);
     status::render(frame, panels.status, app);
 }
 

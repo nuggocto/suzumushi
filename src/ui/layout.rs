@@ -4,12 +4,11 @@
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
-/// Rectangles for the four panels and one bottom status line.
+/// Rectangles for the three panels and one bottom status line.
 pub struct PanelLayout {
     pub library: Rect,
-    pub now_playing: Rect,
+    pub player: Rect,
     pub queue: Rect,
-    pub art: Rect,
     pub status: Rect,
 }
 
@@ -27,15 +26,10 @@ pub fn panels(area: Rect) -> PanelLayout {
             Constraint::Percentage(30),
         ])
         .split(vertical[0]);
-    let middle = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(5), Constraint::Min(1)])
-        .split(columns[1]);
     PanelLayout {
         library: columns[0],
-        now_playing: middle[0],
+        player: columns[1],
         queue: columns[2],
-        art: middle[1],
         status: vertical[1],
     }
 }

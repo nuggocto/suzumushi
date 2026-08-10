@@ -60,14 +60,8 @@ pub struct RootPaths {
     pub playlists: PathBuf,
     /// Reconstructible state.
     pub state: PathBuf,
-    /// Artwork cache.
-    pub artwork_cache: PathBuf,
     /// Private logs.
     pub logs: PathBuf,
-    /// Durable backups.
-    pub backups: PathBuf,
-    /// Tag-edit backups.
-    pub tag_backups: PathBuf,
     /// Root configuration.
     pub config: PathBuf,
 }
@@ -78,18 +72,14 @@ impl RootPaths {
     pub fn new(root: PathBuf) -> Self {
         let audio = root.join("audio");
         let state = root.join("state");
-        let backups = root.join("backups");
         Self {
             library: audio.join("library"),
             playlists: audio.join("playlists"),
-            artwork_cache: state.join("artwork"),
             logs: root.join("logs"),
-            tag_backups: backups.join("tag-edits"),
             config: root.join("config.toml"),
             root,
             audio,
             state,
-            backups,
         }
     }
 }

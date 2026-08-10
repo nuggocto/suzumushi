@@ -8,26 +8,23 @@ use std::time::Duration;
 use crate::config::Config;
 use crate::errors::{AppError, AppResult};
 use crate::input::{AppAction, InputState};
-use crate::locks::{ActiveTuiLease, RootMutationLease};
+use crate::locks::{ActiveTuiLease, RootWriterLease};
 use crate::paths::SelectedRoot;
-use crate::terminal_capabilities::ImageProtocol;
 
 const TUI_STARTUP_OPEN_FILES_PEAK: usize = 5;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Focus {
     Library,
-    NowPlaying,
-    Art,
+    Player,
     Queue,
 }
 
 impl Focus {
     fn next(self) -> Self {
         match self {
-            Self::Library => Self::NowPlaying,
-            Self::NowPlaying => Self::Art,
-            Self::Art => Self::Queue,
+            Self::Library => Self::Player,
+            Self::Player => Self::Queue,
             Self::Queue => Self::Library,
         }
     }
@@ -35,9 +32,8 @@ impl Focus {
     fn previous(self) -> Self {
         match self {
             Self::Library => Self::Queue,
-            Self::NowPlaying => Self::Library,
-            Self::Art => Self::NowPlaying,
-            Self::Queue => Self::Art,
+            Self::Player => Self::Library,
+            Self::Queue => Self::Player,
         }
     }
 }
@@ -65,7 +61,6 @@ pub struct AppState {
     pub focus: Focus,
     pub should_quit: bool,
     pub terminal_size: (u16, u16),
-    pub image_protocol: ImageProtocol,
     pub color_mode: ColorMode,
     pub status_message: &'static str,
     pub input: InputState,
@@ -89,7 +84,6 @@ impl AppState {
             focus,
             should_quit: false,
             terminal_size: (0, 0),
-            image_protocol: ImageProtocol::Fallback,
             color_mode,
             status_message: "Ready",
             input: InputState::new(Duration::from_millis(config.input.leader_timeout_ms)),
@@ -120,7 +114,7 @@ impl AppState {
 pub fn run(root: &SelectedRoot, config: &Config) -> AppResult<()> {
     reserve_startup_open_files(config.runtime.max_open_files)?;
     let _active_lease = ActiveTuiLease::acquire()?;
-    let _root_lease = RootMutationLease::acquire_from(root.descriptor(), &root.path)?;
+    let _root_lease = RootWriterLease::acquire_from(root.descriptor(), &root.path)?;
     let logging = crate::logging::initialize_from(root.descriptor(), &root.path, &config.logging)?;
     tracing::info!("terminal session starting");
     let result = crate::terminal::run(config);
@@ -165,9 +159,7 @@ mod tests {
         let mut app = AppState::new(&Config::default());
         assert_eq!(app.focus, Focus::Library);
         app.apply(AppAction::FocusNext);
-        assert_eq!(app.focus, Focus::NowPlaying);
-        app.apply(AppAction::FocusNext);
-        assert_eq!(app.focus, Focus::Art);
+        assert_eq!(app.focus, Focus::Player);
         app.apply(AppAction::FocusNext);
         assert_eq!(app.focus, Focus::Queue);
         app.apply(AppAction::FocusNext);
@@ -175,9 +167,7 @@ mod tests {
         app.apply(AppAction::FocusPrevious);
         assert_eq!(app.focus, Focus::Queue);
         app.apply(AppAction::FocusPrevious);
-        assert_eq!(app.focus, Focus::Art);
-        app.apply(AppAction::FocusPrevious);
-        assert_eq!(app.focus, Focus::NowPlaying);
+        assert_eq!(app.focus, Focus::Player);
         app.apply(AppAction::FocusPrevious);
         assert_eq!(app.focus, Focus::Library);
     }
