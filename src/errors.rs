@@ -39,6 +39,9 @@ pub enum AppError {
     /// A lock cannot be acquired or stored safely.
     #[error("lock unavailable: {0}")]
     Lock(String),
+    /// A bounded in-memory model could not reserve its validated capacity.
+    #[error("resource unavailable: {0}")]
+    Resource(String),
     /// Preserves both failures when logging fails beside the main operation.
     #[error("{primary}; additionally, {secondary}")]
     Multiple {

@@ -17,6 +17,8 @@ use rustix::termios::{Pid, Winsize, tcsetwinsize};
 use tempfile::TempDir;
 
 const FOCUSED_PLAYER: &[u8] = b"\x1b[7m\x1b[1m\x1b[38;5;6;49mPlayer";
+const FOCUSED_QUEUE: &[u8] = b"\x1b[7m\x1b[1m\x1b[38;5;6;49mQueue";
+const FIRST_QUEUE_ITEM: &[u8] = b"\xe2\x94\x82\xe2\x94\x821.";
 
 #[test]
 fn help_succeeds_and_names_the_canonical_command() {
@@ -150,6 +152,47 @@ fn terminal_session_restores_the_pty_and_holds_both_leases() {
     suzumushi::locks::RootWriterLease::acquire(&root).expect("root lease is released after quit");
     suzumushi::init::initialize(&root)
         .expect("the persistent root lock remains an owned initialization entry");
+}
+
+#[test]
+fn terminal_user_can_search_and_build_a_queue_without_audio() {
+    let temp = TempDir::new().expect("temporary directory");
+    let root = temp.path().join("root");
+    initialize_root(&root);
+    let campaign = root.join("audio/library/JDR/Campaign One");
+    fs::create_dir_all(&campaign).expect("create nested library folders");
+    fs::write(campaign.join("night.mp3"), id3_fixture()).expect("write tagged fixture");
+    let runtime = temp.path().join("runtime");
+    fs::create_dir(&runtime).expect("create runtime directory");
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))
+        .expect("make runtime directory private");
+
+    let (mut master, slave) = open_test_pty(80, 24);
+    let mut child = terminal_command(&root, &runtime)
+        .stdin(Stdio::from(duplicate_file(&slave)))
+        .stdout(Stdio::from(duplicate_file(&slave)))
+        .stderr(Stdio::from(slave))
+        .spawn()
+        .expect("start terminal session");
+    let mut transcript = read_pty_until(&mut master, &mut child, b"Night Song");
+
+    master
+        .write_all(b"/Night\r")
+        .expect("search for and queue the track");
+    transcript.extend(read_pty_until(&mut master, &mut child, b"Queued: Night"));
+    resize_terminal(&master, &child, 81, 24);
+    transcript.extend(read_pty_until(&mut master, &mut child, FIRST_QUEUE_ITEM));
+
+    master.write_all(b"\t\t").expect("focus the queue");
+    transcript.extend(read_pty_until(&mut master, &mut child, FOCUSED_QUEUE));
+    master.write_all(b"d").expect("remove the queued track");
+    transcript.extend(read_pty_until(&mut master, &mut child, b"Queue is empty"));
+
+    master.write_all(b"q").expect("quit the terminal");
+    transcript.extend(read_pty_to_exit(&mut master, &mut child));
+    assert!(byte_contains(&transcript, b"JDR"));
+    assert!(byte_contains(&transcript, b"Campaign"));
+    assert!(byte_contains(&transcript, b"\x1b[?1049l"));
 }
 
 #[test]

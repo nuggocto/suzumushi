@@ -7,9 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added a nested local library and folder-playlist browser backed by the existing descriptor-rooted scan index.
+- Added bounded local search over metadata, filenames, and relative paths.
+- Added app-owned queue selection, insertion, removal, reordering, and clearing with checked item and byte limits.
+
 ### Changed
 
+- Made local search linear in retained field bytes per query update and clarified its modal quit keys.
 - Simplified the terminal to three full-height Library, Player, and Queue panels, with the Player receiving half the terminal width.
+- Terminal startup now transfers its single scan result into the event loop before drawing the library.
 - Reduced configuration to behavior that exists today; later phases will add settings with their features.
 - Consolidated the product contract, safety notes, verification rules, and roadmap into `PROJECT.md` and `AGENTS.md`.
 - Renamed the root mutation lease to the root writer lease to match its remaining state and logging role.

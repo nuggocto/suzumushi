@@ -12,6 +12,16 @@ pub enum AppAction {
     Quit,
     FocusNext,
     FocusPrevious,
+    MovePrevious,
+    MoveNext,
+    MoveFirst,
+    MoveLast,
+    Activate,
+    SearchOpen,
+    QueueRemove,
+    QueueClear,
+    QueueMoveUp,
+    QueueMoveDown,
     PlayPausePlaceholder,
     PalettePlaceholder,
 }
@@ -71,6 +81,7 @@ impl InputState {
 
     fn resolve_plain(&mut self, key: KeyEvent, now: Duration) -> Option<AppAction> {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shifted = key.modifiers == KeyModifiers::SHIFT;
         match key.code {
             KeyCode::Char('q') if !control => Some(AppAction::Quit),
             KeyCode::Char('c') if control => Some(AppAction::Quit),
@@ -79,6 +90,29 @@ impl InputState {
             }
             KeyCode::BackTab => Some(AppAction::FocusPrevious),
             KeyCode::Tab => Some(AppAction::FocusNext),
+            KeyCode::Up | KeyCode::Char('k') if key.modifiers.is_empty() => {
+                Some(AppAction::MovePrevious)
+            }
+            KeyCode::Down | KeyCode::Char('j') if key.modifiers.is_empty() => {
+                Some(AppAction::MoveNext)
+            }
+            KeyCode::Home | KeyCode::Char('g') if key.modifiers.is_empty() => {
+                Some(AppAction::MoveFirst)
+            }
+            KeyCode::End if key.modifiers.is_empty() => Some(AppAction::MoveLast),
+            KeyCode::Char('G') if key.modifiers.is_empty() || shifted => Some(AppAction::MoveLast),
+            KeyCode::Enter if key.modifiers.is_empty() => Some(AppAction::Activate),
+            KeyCode::Char('/') if key.modifiers.is_empty() => Some(AppAction::SearchOpen),
+            KeyCode::Delete | KeyCode::Char('d') if key.modifiers.is_empty() => {
+                Some(AppAction::QueueRemove)
+            }
+            KeyCode::Char('c') if key.modifiers.is_empty() => Some(AppAction::QueueClear),
+            KeyCode::Char('K') if key.modifiers.is_empty() || shifted => {
+                Some(AppAction::QueueMoveUp)
+            }
+            KeyCode::Char('J') if key.modifiers.is_empty() || shifted => {
+                Some(AppAction::QueueMoveDown)
+            }
             KeyCode::Char(' ') if key.modifiers.is_empty() => {
                 self.leader_started = Some(now);
                 None
@@ -172,5 +206,28 @@ mod tests {
             Some(AppAction::PlayPausePlaceholder)
         );
         assert_eq!(input.tick(timeout + Duration::from_millis(1)), None);
+    }
+
+    #[test]
+    fn browser_search_and_queue_keys_resolve_to_one_action() {
+        let mut input = InputState::new(Duration::from_millis(250));
+        let cases = [
+            (key(KeyCode::Char('/')), AppAction::SearchOpen),
+            (key(KeyCode::Down), AppAction::MoveNext),
+            (key(KeyCode::Enter), AppAction::Activate),
+            (key(KeyCode::Char('d')), AppAction::QueueRemove),
+            (key(KeyCode::Char('c')), AppAction::QueueClear),
+            (
+                KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT),
+                AppAction::QueueMoveDown,
+            ),
+            (
+                KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT),
+                AppAction::QueueMoveUp,
+            ),
+        ];
+        for (event, expected) in cases {
+            assert_eq!(input.key(event, Duration::ZERO), Some(expected));
+        }
     }
 }

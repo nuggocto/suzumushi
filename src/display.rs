@@ -39,6 +39,19 @@ pub fn terminal_safe(input: &[u8], max_bytes: usize) -> String {
     output
 }
 
+/// Copies already-safe UTF-8 without splitting a character or exceeding the byte bound.
+#[must_use]
+pub(crate) fn bounded_text(input: &str, max_bytes: usize) -> String {
+    let mut output = String::with_capacity(input.len().min(max_bytes));
+    for character in input.chars() {
+        if output.len().saturating_add(character.len_utf8()) > max_bytes {
+            break;
+        }
+        output.push(character);
+    }
+    output
+}
+
 fn append_valid(output: &mut String, valid: &str, max_bytes: usize) -> bool {
     for character in valid.chars() {
         if character == '\\' {
@@ -79,4 +92,16 @@ fn push_byte_escape_unchecked(output: &mut String, byte: u8) {
     output.push('x');
     output.push(char::from(HEX[usize::from(byte >> 4)]));
     output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bounded_text;
+
+    #[test]
+    fn bounded_text_preserves_existing_escapes_and_utf8_boundaries() {
+        assert_eq!(bounded_text(r"a\\b", 4), r"a\\b");
+        assert_eq!(bounded_text("cricket", 4), "cric");
+        assert_eq!(bounded_text("éé", 3), "é");
+    }
 }

@@ -10,23 +10,21 @@ service, or network feature.
 
 ## Current status
 
-Version `0.2.0` is released. It contains the safe root initializer,
-descriptor-rooted scanner, bounded text metadata reader, terminal shell, file
-logging, tests, fuzz targets, and CI foundation.
-
-The development branch has simplified that shell to three panels:
+Version `0.2.0` is released. The development branch adds the complete local
+library, search, and queue browser to its safe root, scanner, metadata, terminal,
+logging, test, fuzz, and CI foundation.
 
 ```text
 +------------------+------------------------------------+------------------+
 |     Library      |               Player               |      Queue       |
-| library and      | title, creator, progress, time     | upcoming tracks  |
-| playlists/search | volume, speed, playback state      | queue controls   |
+| folders, tracks  | title, creator, progress, time     | ordered tracks   |
+| playlists/search | volume, speed, playback state      | and queue edits  |
 +------------------+------------------------------------+------------------+
-| q quit   Tab focus   Space play/pause   / search   ? help                |
+| q quit   Tab focus   / search   Enter add   arrows move                  |
 +--------------------------------------------------------------------------+
 ```
 
-Playback is not implemented yet. The next work is Phase 4.
+Playback is not implemented yet. The next work is Phase 5.
 
 ## Product contract
 
@@ -98,6 +96,10 @@ properties and embedded pictures are disabled. Parsing runs in a bounded helper
 process with read, operation, output, file descriptor, memory, CPU, and wall-time
 limits.
 
+Search is modal and ASCII-case-insensitive. Each query update uses a linear-time
+matcher over the retained bounded fields. While search is open, `q` remains
+query text; `Esc` closes search and `Ctrl+c` quits globally.
+
 ## Architecture
 
 - The terminal loop exclusively owns `AppState`, focus, library selection,
@@ -140,6 +142,11 @@ expensive work.
   accepted because it reports unmaintained `paste 1.0.15`, reached only through
   Lofty, not a vulnerability. Review or remove the exception by 2026-11-09.
 
+Search queries are capped at 4 KiB and return at most 200 naturally ordered
+results. Queue storage is capped by both item count and reserved bytes before a
+mutation. Existing version 1 configuration files receive these current defaults;
+unknown fields remain rejected.
+
 Security reports should use GitHub private vulnerability reporting. Do not put
 vulnerability details or secrets in a public issue.
 
@@ -177,22 +184,27 @@ and packaged artifact checks belong in focused release QA.
 
 ### Phase 4: library, search, and queue
 
-**Status:** next
+**Status:** complete
 
-- Move the existing scan index into app-owned state.
-- Render the library tree and folder playlists in the Library panel.
-- Add local `/` search over the existing metadata, filename, and relative-path
+- [x] Move the existing scan index into app-owned state.
+- [x] Render the library tree and folder playlists in the Library panel.
+- [x] Add local `/` search over the existing metadata, filename, and relative-path
   fields.
-- Add bounded queue insert, remove, reorder, clear, and selection behavior.
-- Keep deterministic natural ordering and stable asset, entry, and playlist IDs.
-- Defer batch marking and playback transition machinery.
+- [x] Add bounded queue insert, remove, reorder, clear, and selection behavior.
+- [x] Keep deterministic natural ordering and stable asset, entry, and playlist
+  IDs.
+- [x] Defer batch marking and playback transition machinery.
 
 Done when a user can initialize a root, add files, open the TUI, browse and
 search them, build a queue, and quit cleanly without an audio device.
 
+Verified with focused state and adversarial search tests, reviewed 80x24 and
+120x32 snapshots, the full `mise run ci` sequence, and a release-profile PTY
+journey over a synthetic nested `JDR` library.
+
 ### Phase 5: one audio pipeline
 
-**Status:** not started
+**Status:** next
 
 - Run a short compatibility spike and choose one production decode and output
   path. Do not keep two pipelines.

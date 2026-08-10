@@ -16,17 +16,19 @@ use ratatui::layout::Rect;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use crate::app::AppState;
-use crate::config::{Config, UI_STATE_SCRATCH_BYTES};
+use crate::config::{Config, TERMINAL_BUFFER_BYTES};
 use crate::errors::{AppError, AppResult};
 use crate::event::{AppEvent, EventSource};
+use crate::model::ScanIndex;
 
 /// Runs one terminal session and restores terminal modes on every unwind path.
 ///
 /// # Errors
 ///
 /// Returns a terminal, drawing, or event-stream error.
-pub fn run(config: &Config) -> AppResult<()> {
+pub fn run(config: &Config, index: ScanIndex) -> AppResult<()> {
     let initial_area = current_terminal_area()?;
+    let mut app = AppState::new(config, index)?;
     let stdout = io::stdout();
     enable_raw_mode().map_err(|error| AppError::io("enable raw mode", "terminal", error))?;
     let mut guard = TerminalGuard::new(CrosstermControl { stdout });
@@ -34,7 +36,6 @@ pub fn run(config: &Config) -> AppResult<()> {
 
     let mut terminal = create_terminal(initial_area)?;
 
-    let mut app = AppState::new(config);
     let events = EventSource::new();
 
     while !app.should_quit {
@@ -47,7 +48,7 @@ pub fn run(config: &Config) -> AppResult<()> {
         let leader_deadline = app.input.deadline();
         let event = events.next(leader_deadline)?;
         if let AppEvent::Resize(width, height) = event {
-            let area = validate_terminal_area(width, height, UI_STATE_SCRATCH_BYTES)?;
+            let area = validate_terminal_area(width, height, TERMINAL_BUFFER_BYTES)?;
             drop(terminal);
             execute!(guard.output_mut(), Clear(ClearType::All))
                 .map_err(|error| AppError::io("clear resized terminal", "terminal", error))?;
@@ -66,7 +67,7 @@ pub fn run(config: &Config) -> AppResult<()> {
 fn current_terminal_area() -> AppResult<Rect> {
     let (width, height) = terminal_size()
         .map_err(|error| AppError::io("read terminal dimensions", "terminal", error))?;
-    validate_terminal_area(width, height, UI_STATE_SCRATCH_BYTES)
+    validate_terminal_area(width, height, TERMINAL_BUFFER_BYTES)
 }
 
 fn create_terminal(area: Rect) -> AppResult<Terminal<CrosstermBackend<Stdout>>> {
@@ -109,9 +110,7 @@ fn validate_terminal_area(width: u16, height: u16, budget: usize) -> AppResult<R
 fn apply_event(app: &mut AppState, event: AppEvent) {
     match event {
         AppEvent::Key(key, now) => {
-            if let Some(action) = app.input.key(key, now) {
-                app.apply(action);
-            }
+            app.key(key, now);
         }
         AppEvent::Resize(width, height) => app.terminal_size = (width, height),
         AppEvent::Tick(now) => {
@@ -225,10 +224,24 @@ mod tests {
     use crate::app::AppState;
     use crate::config::Config;
     use crate::event::AppEvent;
+    use crate::model::{ScanCounters, ScanIndex};
+
+    fn empty_index() -> ScanIndex {
+        ScanIndex {
+            generation: 1,
+            complete: true,
+            assets: Vec::new(),
+            entries: Vec::new(),
+            playlists: Vec::new(),
+            warnings: Vec::new(),
+            counters: ScanCounters::default(),
+        }
+    }
 
     #[test]
     fn app_events_record_resize() {
-        let mut app = AppState::new(&Config::default());
+        let mut app =
+            AppState::new(&Config::default(), empty_index()).expect("app state reservation");
         apply_event(&mut app, AppEvent::Resize(120, 32));
         assert_eq!(app.terminal_size, (120, 32));
         assert!(!app.should_quit);

@@ -3,9 +3,9 @@ source: src/ui/mod.rs
 expression: "snapshot(80, 24)"
 ---
 ╔═════Library══════╗┌────────────────Player────────────────┐┌──────Queue───────┐
-║Placeholder       ║│Placeholder                           ││Placeholder       │
-║                  ║│                                      ││                  │
-║                  ║│                                      ││                  │
+║Library/          ║│            Nothing playing           ││Queue is empty    │
+║Playlists/        ║│                                      ││                  │
+║                  ║│  Playback arrives in the next phase. ││                  │
 ║                  ║│                                      ││                  │
 ║                  ║│                                      ││                  │
 ║                  ║│                                      ││                  │
@@ -25,4 +25,4 @@ expression: "snapshot(80, 24)"
 ║                  ║│                                      ││                  │
 ║                  ║│                                      ││                  │
 ╚══════════════════╝└──────────────────────────────────────┘└──────────────────┘
- q quit  Tab/Shift+Tab focus  Space action  Ready
+ q quit  Tab focus   / search  Up/Down move  Enter add  Ready: 0 tracks, 0 playl

@@ -18,7 +18,9 @@ pub const MAX_CONFIG_BYTES: usize = 65_536;
 
 pub(crate) const SCAN_PARSER_SCRATCH_BYTES: usize = 32 * 1_048_576;
 pub(crate) const UI_STATE_SCRATCH_BYTES: usize = 8 * 1_048_576;
+pub(crate) const TERMINAL_BUFFER_BYTES: usize = 8 * 1_048_576;
 pub(crate) const MAX_LOG_FILES: usize = 5;
+const QUEUE_ITEM_ACCOUNTING_BYTES: usize = 32;
 
 pub(crate) fn scan_reservation_bytes(
     active_index_bytes: usize,
@@ -57,6 +59,14 @@ follow_file_symlinks = true
 follow_directory_symlinks = false
 ignore_hidden_audio = true
 
+[search]
+max_results = 200
+max_query_bytes = 4096
+
+[queue]
+max_items = 10000
+max_bytes = 1048576
+
 [runtime]
 process_memory_budget_bytes = 402653184
 max_open_files = 64
@@ -79,6 +89,10 @@ pub struct Config {
     pub default_view: String,
     pub input: InputConfig,
     pub scan: ScanConfig,
+    #[serde(default)]
+    pub search: SearchConfig,
+    #[serde(default)]
+    pub queue: QueueConfig,
     pub runtime: RuntimeConfig,
     pub logging: LoggingConfig,
 }
@@ -93,6 +107,14 @@ macro_rules! section {
 
 section!(InputConfig {
     leader_timeout_ms: u64
+});
+section!(SearchConfig {
+    max_results: usize,
+    max_query_bytes: usize
+});
+section!(QueueConfig {
+    max_items: usize,
+    max_bytes: usize
 });
 section!(ScanConfig {
     max_files: usize,
@@ -126,6 +148,24 @@ section!(LoggingConfig {
     queue_max_bytes: usize,
     queue_full_policy: String
 });
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            max_results: 200,
+            max_query_bytes: 4_096,
+        }
+    }
+}
+
+impl Default for QueueConfig {
+    fn default() -> Self {
+        Self {
+            max_items: 10_000,
+            max_bytes: 1_048_576,
+        }
+    }
+}
 
 /// Parses a bounded TOML document and validates every compiled range.
 ///
@@ -391,6 +431,26 @@ fn validate_logging(logging: &LoggingConfig) -> AppResult<()> {
     Ok(())
 }
 
+fn validate_search(search: &SearchConfig) -> AppResult<()> {
+    inclusive("search.max_results", search.max_results, 1, 200)?;
+    inclusive("search.max_query_bytes", search.max_query_bytes, 1, 4_096)
+}
+
+fn validate_queue(queue: &QueueConfig) -> AppResult<()> {
+    inclusive("queue.max_items", queue.max_items, 1, 10_000)?;
+    inclusive("queue.max_bytes", queue.max_bytes, 1, 8_388_608)?;
+    let retained = queue
+        .max_items
+        .checked_mul(QUEUE_ITEM_ACCOUNTING_BYTES)
+        .ok_or_else(|| AppError::InvalidConfig("queue reservation overflow".into()))?;
+    if retained > queue.max_bytes {
+        return Err(AppError::InvalidConfig(
+            "queue.max_items must fit queue.max_bytes".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl Config {
     /// Enforces the exact compiled safety contract.
     ///
@@ -413,6 +473,8 @@ impl Config {
             2_000,
         )?;
         validate_scan(&self.scan)?;
+        validate_search(&self.search)?;
+        validate_queue(&self.queue)?;
         let r = &self.runtime;
         inclusive(
             "runtime.process_memory_budget_bytes",
@@ -432,12 +494,14 @@ impl Config {
             scan_reservation_bytes(self.scan.max_index_bytes, self.scan.max_index_bytes)?
                 .checked_add(self.logging.queue_max_bytes)
                 .and_then(|value| value.checked_add(UI_STATE_SCRATCH_BYTES))
+                .and_then(|value| value.checked_add(TERMINAL_BUFFER_BYTES))
+                .and_then(|value| value.checked_add(self.queue.max_bytes))
                 .ok_or_else(|| {
                     AppError::InvalidConfig("application reservation overflow".into())
                 })?;
         if reserved_app > r.process_memory_budget_bytes {
             return Err(AppError::InvalidConfig(
-                "indexes, scan/parser scratch, logging queue, and UI/state scratch exceed process_memory_budget_bytes".into(),
+                "indexes, scan/parser scratch, queues, terminal buffers, and UI/state scratch exceed process_memory_budget_bytes".into(),
             ));
         }
         Ok(())
@@ -496,6 +560,23 @@ mod tests {
     }
 
     #[test]
+    fn existing_version_one_configs_receive_current_search_and_queue_defaults() {
+        let without_search = DEFAULT_CONFIG.replace(
+            "[search]\nmax_results = 200\nmax_query_bytes = 4096\n\n",
+            "",
+        );
+        let without_current_sections =
+            without_search.replace("[queue]\nmax_items = 10000\nmax_bytes = 1048576\n\n", "");
+
+        let config = parse(without_current_sections.as_bytes())
+            .expect("known version one configs remain readable");
+        assert_eq!(config.search.max_results, 200);
+        assert_eq!(config.search.max_query_bytes, 4_096);
+        assert_eq!(config.queue.max_items, 10_000);
+        assert_eq!(config.queue.max_bytes, 1_048_576);
+    }
+
+    #[test]
     fn current_scan_and_runtime_bounds_reject_limit_plus_one() {
         let invalid_replacements = [
             ("max_files = 50000", "max_files = 50001"),
@@ -526,6 +607,10 @@ mod tests {
             ),
             ("max_warning_bytes = 8388608", "max_warning_bytes = 8388609"),
             ("max_index_bytes = 117440512", "max_index_bytes = 117440513"),
+            ("max_results = 200", "max_results = 201"),
+            ("max_query_bytes = 4096", "max_query_bytes = 4097"),
+            ("max_items = 10000", "max_items = 10001"),
+            ("max_bytes = 1048576", "max_bytes = 8388609"),
             ("max_open_files = 64", "max_open_files = 65"),
             (
                 "process_memory_budget_bytes = 402653184",
@@ -559,6 +644,9 @@ mod tests {
             "follow_directory_symlinks = false",
             "follow_directory_symlinks = true",
         );
+        assert!(parse(text.as_bytes()).is_err());
+
+        let text = replace_once(DEFAULT_CONFIG, "max_bytes = 1048576", "max_bytes = 319999");
         assert!(parse(text.as_bytes()).is_err());
     }
 }
