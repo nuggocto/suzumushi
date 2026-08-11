@@ -27,8 +27,8 @@ and `SHA256SUMS` from the
 either in your browser or with:
 
 ```sh
-curl -fLO https://github.com/nuggocto/suzumushi/releases/download/v1.0.0-rc.1/SHA256SUMS \
-  -O https://github.com/nuggocto/suzumushi/releases/download/v1.0.0-rc.1/suzumushi-v1.0.0-rc.1-x86_64-unknown-linux-gnu.tar.xz
+curl -fLO \
+  'https://github.com/nuggocto/suzumushi/releases/download/v1.0.0-rc.1/{SHA256SUMS,suzumushi-v1.0.0-rc.1-x86_64-unknown-linux-gnu.tar.xz}'
 ```
 
 Then verify and install the downloaded archive:
@@ -80,7 +80,7 @@ suzumushi/audio/
 ├── library/
 │   ├── Music/
 │   ├── Audiobooks/
-│   └── JDR/
+│   └── D&D/
 └── playlists/
     ├── Evening/
     └── Favorites/
