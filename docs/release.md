@@ -34,6 +34,11 @@ create the GitHub release. Prerelease versions are marked as prereleases and
 are never selected as the latest stable release. The workflow refuses to
 overwrite existing archive or checksum files.
 
+If only publication fails after the build job succeeds, download that run's
+named artifact, verify it locally, and publish those exact files from a clean
+checkout containing the annotated tag. Never rebuild the recovery artifact or
+move the tag.
+
 After publication, download both assets into a new temporary directory, run
 `scripts/verify-release-archive.sh`, and exercise the extracted binary and
 relative symlink. Record the tag, commit, workflow result, archive SHA-256, and
@@ -48,9 +53,9 @@ consumes the published GitHub archive by exact SHA-256 and disables makepkg
 stripping so the installed executable remains the verified upstream binary.
 
 No AUR credential belongs in this repository or in GitHub Actions. While AUR
-writes are unavailable, do not probe authentication, create the package, or
-push updates. Keep the prepared files committed here and stop at local package
-verification.
+writes are unavailable, do not probe authentication, create an AUR repository,
+or push updates. Keep the prepared files committed here and stop at local
+package verification.
 
 When writes return:
 
@@ -58,7 +63,8 @@ When writes return:
 2. Clone `ssh://aur@aur.archlinux.org/suzumushi-bin.git` into a new directory.
 3. Copy only `PKGBUILD` and `.SRCINFO` from `packaging/aur/`.
 4. Review the complete diff and run `makepkg --verifysource`.
-5. Build in a clean Arch environment and run `namcap` on both files.
+5. Build in a clean Arch environment and run `namcap` on the `PKGBUILD` and
+   built package.
 6. Test clean installation, both command names, upgrade, and uninstall.
 7. Commit the two packaging files and push once through the configured AUR key.
 

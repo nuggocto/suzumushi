@@ -8,12 +8,30 @@ The interface has three panels: Library, Player, and Queue. It follows the
 terminal's own colors and stays out of the way. Suzu, the small bell-cricket
 mascot, dances in the Player while audio is playing and rests when it is not.
 
+## Install on Arch Linux
+
+When your AUR client can resolve `suzumushi-bin`, install it with:
+
+```sh
+yay -S suzumushi-bin
+```
+
+The package installs both `suzumushi` and the relative `suzu` command symlink.
+If the package is not yet available from AUR, use the verified archive below.
+
 ## Install the Linux release candidate
 
 The verified binary archive is built for 64-bit GNU/Linux. Download the archive
 and `SHA256SUMS` from the
 [`v1.0.0-rc.1` release](https://github.com/nuggocto/suzumushi/releases/tag/v1.0.0-rc.1),
-then verify and install it:
+either in your browser or with:
+
+```sh
+curl -fLO https://github.com/nuggocto/suzumushi/releases/download/v1.0.0-rc.1/SHA256SUMS \
+  -O https://github.com/nuggocto/suzumushi/releases/download/v1.0.0-rc.1/suzumushi-v1.0.0-rc.1-x86_64-unknown-linux-gnu.tar.xz
+```
+
+Then verify and install the downloaded archive:
 
 ```sh
 sha256sum --check --ignore-missing SHA256SUMS
@@ -143,10 +161,10 @@ automatic resampling are not current support claims.
 
 ## Status
 
-Version `1.0.0-rc.1` is the current release candidate. The application is
-feature complete, and its tag-driven Linux archive is verified before GitHub
-publishes it. Its exact release checksum will be staged in the `suzumushi-bin`
-AUR recipe, but the recipe will not be submitted until AUR writes are available
+Version `1.0.0-rc.1` is the current published release candidate. The application
+is feature complete, and its tag-driven Linux archive is verified before GitHub
+publishes it. Its exact release checksum is staged in the `suzumushi-bin` AUR
+recipe, but the recipe will not be submitted until AUR writes are available
 again.
 
 The full contract and roadmap live in [PROJECT.md](PROJECT.md). Release and AUR

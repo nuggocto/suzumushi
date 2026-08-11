@@ -11,11 +11,11 @@ into the player and reacts only to playback state.
 
 ## Current status
 
-Version `1.0.0-rc.1` is the current release candidate. It contains the complete
-local library, search, queue browser, playback controls, MPRIS, global media-key
-support, finished terminal states, built-in help, verified local installation,
-and tag-driven Linux release path on the safe root, scanner, metadata, logging,
-test, fuzz, and CI foundation.
+Version `1.0.0-rc.1` is the current published release candidate. It contains the
+complete local library, search, queue browser, playback controls, MPRIS, global
+media-key support, finished terminal states, built-in help, verified local
+installation, and tag-driven Linux release path on the safe root, scanner,
+metadata, logging, test, fuzz, and CI foundation.
 
 ```text
 +------------------+----------------------------------------+------------------+
@@ -365,11 +365,16 @@ release-profile scan benchmark over 10,000 contextual playlist references.
 
 - [x] Add the single release workflow only when the application is feature
   complete.
-- [ ] Build verified `x86_64-unknown-linux-gnu` archives and checksums from tags.
+- [x] Build verified `x86_64-unknown-linux-gnu` archives and checksums from tags.
 - [ ] Publish only `suzumushi-bin` to AUR from those verified artifacts.
-- [ ] Test clean install, upgrade, uninstall, `suzumushi`, and the relative
+- [x] Test clean install, upgrade, uninstall, `suzumushi`, and the relative
   `suzu` symlink.
 - [x] Finish release notes, compatibility claims, and concise user documentation.
+
+Verified with the published `v1.0.0-rc.1` archive and checksum; a clean Arch
+container install, package upgrade, and uninstall; both command names; and the
+relative packaged symlink. AUR publication remains deliberately pending while
+writes are unavailable.
 
 Done when the tagged artifacts, local install, GitHub release, and AUR package
 all install and run the same tested application.

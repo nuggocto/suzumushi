@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Prepared the `suzumushi-bin` AUR recipe from the exact published
+  release-candidate checksum.
+
+### Fixed
+
+- Made release publication read annotated notes from GitHub without checking
+  executable source into the write-capable job.
+- Updated artifact transfer actions to their pinned Node 24 releases.
+
 ## [1.0.0-rc.1] - 2026-08-11
 
 ### Added
