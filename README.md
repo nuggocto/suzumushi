@@ -1,4 +1,4 @@
-# Suzumushi
+# Suzumushi ༼⁠ ⁠つ⁠ ⁠◕⁠‿⁠◕⁠ ⁠༽⁠つ
 
 Suzumushi is a small, fully local audio player for Linux terminals. It reads
 audio from folders, searches it, builds a queue, and plays it. There is no
