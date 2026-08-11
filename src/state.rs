@@ -27,6 +27,9 @@ const SESSION_MAX_POSITION_MS: u64 = 365 * 24 * 60 * 60 * 1_000;
 // JSON control escapes can occupy six bytes, so two fields at this bound still
 // leave room for the fixed document fields inside STATE_MAX_BYTES.
 const STATE_IDENTITY_MAX_BYTES: usize = 1_024;
+// Recover from interrupted writes without letting unexpected directory contents
+// turn temporary-name selection into unlimited work.
+const STATE_TEMPORARY_CREATE_ATTEMPTS: usize = 16;
 
 /// Stable app-owned playback fields written to private local state.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -236,21 +239,12 @@ impl StateStore {
         temporary_stem: &str,
         bytes: &[u8],
     ) -> AppResult<()> {
-        let temporary = self.temporary_name(temporary_stem)?;
-        let temporary_path = self.directory_path.join(&temporary);
-        let fd = rustix::fs::openat(
-            &self.directory,
-            &temporary,
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::from_raw_mode(0o600),
-        )
-        .map_err(|error| AppError::io("create temporary state", &temporary_path, error.into()))?;
+        let (temporary, temporary_path, mut file) = self.create_temporary(temporary_stem)?;
         let result = (|| {
-            rustix::fs::fchmod(&fd, Mode::from_raw_mode(0o600)).map_err(|error| {
+            rustix::fs::fchmod(&file, Mode::from_raw_mode(0o600)).map_err(|error| {
                 AppError::io("set state permissions", &temporary_path, error.into())
             })?;
             // Readers need one complete snapshot; crash durability is unnecessary for ephemeral state.
-            let mut file = File::from(fd);
             file.write_all(bytes)
                 .map_err(|error| AppError::io("write state", &temporary_path, error))?;
             rustix::fs::renameat(&self.directory, &temporary, &self.directory, file_name).map_err(
@@ -268,6 +262,32 @@ impl StateStore {
             let _ = rustix::fs::unlinkat(&self.directory, &temporary, AtFlags::empty());
         }
         result
+    }
+
+    fn create_temporary(&mut self, stem: &str) -> AppResult<(String, PathBuf, File)> {
+        for _ in 0..STATE_TEMPORARY_CREATE_ATTEMPTS {
+            let temporary = self.temporary_name(stem)?;
+            let temporary_path = self.directory_path.join(&temporary);
+            match rustix::fs::openat(
+                &self.directory,
+                &temporary,
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::from_raw_mode(0o600),
+            ) {
+                Ok(fd) => return Ok((temporary, temporary_path, File::from(fd))),
+                Err(error) if error == rustix::io::Errno::EXIST => {}
+                Err(error) => {
+                    return Err(AppError::io(
+                        "create temporary state",
+                        temporary_path,
+                        error.into(),
+                    ));
+                }
+            }
+        }
+        Err(AppError::Resource(format!(
+            "cannot create temporary state after {STATE_TEMPORARY_CREATE_ATTEMPTS} name collisions"
+        )))
     }
 
     fn temporary_name(&mut self, stem: &str) -> AppResult<String> {
@@ -387,8 +407,8 @@ mod tests {
     use rustix::fd::AsFd;
 
     use super::{
-        NowPlayingProjection, STATE_IDENTITY_MAX_BYTES, STATE_MAX_BYTES, SessionLoad,
-        SessionSnapshot, StateStore,
+        NowPlayingProjection, STATE_IDENTITY_MAX_BYTES, STATE_MAX_BYTES,
+        STATE_TEMPORARY_CREATE_ATTEMPTS, SessionLoad, SessionSnapshot, StateStore,
     };
     use crate::app::AppState;
     use crate::config::Config;
@@ -500,6 +520,50 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn abandoned_temporary_state_does_not_block_atomic_replacement() {
+        let (root, root_file) = root();
+        let abandoned = root
+            .path()
+            .join(format!("state/.now-playing.{}.0.tmp", std::process::id()));
+        fs::write(&abandoned, b"abandoned").expect("abandoned temporary state");
+        fs::set_permissions(&abandoned, fs::Permissions::from_mode(0o600))
+            .expect("private temporary state permissions");
+        let mut store = StateStore::open(root_file.as_fd(), root.path()).expect("state store");
+
+        store
+            .write_now_playing(&NowPlayingProjection::from_app(&app()))
+            .expect("skip abandoned temporary state");
+
+        assert_eq!(
+            fs::read(&abandoned).expect("abandoned state remains untouched"),
+            b"abandoned"
+        );
+        let written =
+            fs::read(root.path().join("state/now-playing.json")).expect("replacement state");
+        serde_json::from_slice::<serde_json::Value>(&written).expect("valid replacement state");
+    }
+
+    #[test]
+    fn temporary_state_name_collisions_stop_at_the_retry_bound() {
+        let (root, root_file) = root();
+        for counter in 0..STATE_TEMPORARY_CREATE_ATTEMPTS {
+            let collision = root.path().join(format!(
+                "state/.now-playing.{}.{counter}.tmp",
+                std::process::id()
+            ));
+            fs::write(collision, b"occupied").expect("occupied temporary name");
+        }
+        let mut store = StateStore::open(root_file.as_fd(), root.path()).expect("state store");
+
+        let error = store
+            .write_now_playing(&NowPlayingProjection::from_app(&app()))
+            .expect_err("bounded collisions must fail");
+
+        assert!(error.to_string().contains("after 16 name collisions"));
+        assert!(!root.path().join("state/now-playing.json").exists());
     }
 
     #[test]

@@ -107,8 +107,8 @@ warning. Unsafe file identities still fail closed.
 
 The scanner performs one deterministic descriptor-rooted traversal per request.
 It never follows directory symlinks. File symlinks are opened with Linux secure
-resolution and no weaker path fallback. Audio extensions are discovery hints,
-not codec support claims.
+resolution and no weaker path fallback. Audio extensions are discovery hints
+for the four verified containers, not broader codec support claims.
 
 Metadata scanning reads only artist, album artist, album, and title. Audio
 properties and embedded pictures are disabled. Parsing runs in a bounded helper
@@ -266,10 +266,11 @@ Done when a queued local file plays through the selected pipeline and every
 basic transition is deterministic under fake-device tests and real-device QA.
 
 Verified with MP3, FLAC, WAV/PCM, and Ogg/Vorbis fixtures through Symphonia
-0.6.0; helper crash, timeout, malformed-input, and descriptor-revalidation
-tests; deterministic fake-device state and drain tests; the bounded decoder
-fuzz target; the full `mise run ci` sequence; and an ignored PTY journey run
-against the local PipeWire-backed Linux output device.
+0.6.0; unsupported AAC and M4A discovery-exclusion coverage; helper crash,
+timeout, malformed-input, and descriptor-revalidation tests; deterministic
+fake-device state and drain tests; the bounded decoder fuzz target; the full
+`mise run ci` sequence; and an ignored PTY journey run against the local
+PipeWire-backed Linux output device.
 
 ### Phase 6: complete playback controls
 
@@ -295,7 +296,8 @@ cross-lane ordering tests; preroll-free accurate seeking through every verified
 container; repeated-seek coalescing and target-acknowledgement tests;
 deterministic fake-device gain, restart, pause-during-restart, position, and
 drain tests;
-bounded escaped-state, atomic replacement, heartbeat, and failure-cleanup tests;
+bounded escaped-state, collision-tolerant atomic replacement, heartbeat, and
+failure-cleanup tests;
 bounded resume-state parsing, stale-entry recovery, clear-state, and
 resume-position tests; deterministic playback-state animation tests; reviewed
 Suzu cycle, 80x24, and 120x32 snapshots; the full `mise run ci` sequence; a PTY

@@ -69,17 +69,9 @@ pub enum PathClass {
 pub fn is_supported_audio_extension(path: &Path) -> bool {
     path.extension().is_some_and(|extension| {
         let bytes = extension.as_bytes();
-        [
-            b"mp3".as_slice(),
-            b"flac",
-            b"wav",
-            b"ogg",
-            b"oga",
-            b"m4a",
-            b"aac",
-        ]
-        .iter()
-        .any(|expected| bytes.eq_ignore_ascii_case(expected))
+        [b"mp3".as_slice(), b"flac", b"wav", b"ogg", b"oga"]
+            .iter()
+            .any(|expected| bytes.eq_ignore_ascii_case(expected))
     })
 }
 

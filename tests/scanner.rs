@@ -237,6 +237,36 @@ fn one_pass_finds_context_metadata_and_symlinks() {
 }
 
 #[test]
+fn unsupported_aac_and_m4a_stay_out_while_oga_remains_discoverable() {
+    let (_temp, root) = root();
+    let library = root.join("audio/library");
+    fs::write(library.join("supported.oga"), b"media").expect("supported Ogg fixture");
+    fs::write(library.join("unsupported.aac"), b"media").expect("unsupported AAC fixture");
+    fs::write(library.join("unsupported.m4a"), b"media").expect("unsupported M4A fixture");
+
+    let mut reader = FakeMetadata::default();
+    let index = scan(&root, &Config::default(), &mut reader);
+
+    assert_eq!(index.entries.len(), 1);
+    assert_eq!(
+        index.entries[0].display_path,
+        Path::new("library/supported.oga")
+    );
+    assert_eq!(
+        reader.attempts, 1,
+        "unsupported files must not reach metadata parsing"
+    );
+    assert!(index.warnings.iter().any(|warning| {
+        warning.code == ScanWarningCode::UnsupportedExtension
+            && warning.path == Path::new("library/unsupported.aac")
+    }));
+    assert!(index.warnings.iter().any(|warning| {
+        warning.code == ScanWarningCode::UnsupportedExtension
+            && warning.path == Path::new("library/unsupported.m4a")
+    }));
+}
+
+#[test]
 fn hidden_audio_policy_applies_to_files_symlinks_and_directories() {
     let (_temp, root) = root();
     let library = root.join("audio/library");

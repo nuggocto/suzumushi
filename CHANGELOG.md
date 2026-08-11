@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Kept unsupported AAC and M4A files out of the library while retaining Ogg audio discovered through the `.oga` extension.
+- Made atomic state writes skip a bounded number of abandoned temporary names without deleting unknown files.
+
 ## [0.4.0] - 2026-08-10
 
 ### Added
