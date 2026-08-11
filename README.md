@@ -8,6 +8,24 @@ The interface has three panels: Library, Player, and Queue. It follows the
 terminal's own colors and stays out of the way. Suzu, the small bell-cricket
 mascot, dances in the Player while audio is playing and rests when it is not.
 
+## Install the Linux release candidate
+
+The verified binary archive is built for 64-bit GNU/Linux. Download the archive
+and `SHA256SUMS` from the
+[`v1.0.0-rc.1` release](https://github.com/nuggocto/suzumushi/releases/tag/v1.0.0-rc.1),
+then verify and install it:
+
+```sh
+sha256sum --check --ignore-missing SHA256SUMS
+tar -xf suzumushi-v1.0.0-rc.1-x86_64-unknown-linux-gnu.tar.xz
+cd suzumushi-v1.0.0-rc.1-x86_64-unknown-linux-gnu
+sudo install -Dm755 suzumushi /usr/local/bin/suzumushi
+sudo ln -s suzumushi /usr/local/bin/suzu
+```
+
+The checksum must report `OK` before installation. The `suzu` command is only a
+relative packaging symlink; `suzumushi` remains the one canonical executable.
+
 ## Install the current checkout
 
 You need Rust 1.95 or newer and the ALSA development files:
@@ -125,9 +143,11 @@ automatic resampling are not current support claims.
 
 ## Status
 
-Version `0.4.0` is the released complete local player with MPRIS, global media
-keys, finished terminal states, built-in help, and the verified local
-installation path. The remaining work is the verified Linux release and
-`suzumushi-bin` AUR package.
+Version `1.0.0-rc.1` is the current release candidate. The application is
+feature complete, and its tag-driven Linux archive is verified before GitHub
+publishes it. Its exact release checksum will be staged in the `suzumushi-bin`
+AUR recipe, but the recipe will not be submitted until AUR writes are available
+again.
 
-The full contract and roadmap live in [PROJECT.md](PROJECT.md).
+The full contract and roadmap live in [PROJECT.md](PROJECT.md). Release and AUR
+maintenance details live in [docs/release.md](docs/release.md).

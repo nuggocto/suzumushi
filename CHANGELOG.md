@@ -7,10 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.1] - 2026-08-11
+
+### Added
+
+- Added tag-driven, checksummed Linux release archives built with Rust 1.97.1.
+- Added the canonical `suzumushi` executable and relative `suzu -> suzumushi` packaging symlink to release archives.
+
 ### Fixed
 
 - Kept unsupported AAC and M4A files out of the library while retaining Ogg audio discovered through the `.oga` extension.
 - Made atomic state writes skip a bounded number of abandoned temporary names without deleting unknown files.
+- Released root and active-session leases explicitly before closing their descriptors so concurrent same-process handoffs remain deterministic.
 
 ## [0.4.0] - 2026-08-10
 

@@ -20,7 +20,7 @@ const MAX_IDENTITY_BYTES: u64 = 256;
 /// Exclusive lease for mutable app state under one canonical root.
 #[derive(Debug)]
 pub struct RootWriterLease {
-    _file: File,
+    file: File,
 }
 
 impl RootWriterLease {
@@ -48,14 +48,22 @@ impl RootWriterLease {
 
     pub(crate) fn acquire_from<Fd: AsFd>(root: Fd, display: &Path) -> AppResult<Self> {
         let file = open_private_lock(root, ROOT_LOCK, &display.join(ROOT_LOCK))?;
-        acquire_and_record(file, "root writer").map(|file| Self { _file: file })
+        acquire_and_record(file, "root writer").map(|file| Self { file })
     }
 }
 
-/// Exclusive per-UID identity lease for the future mutable TUI.
+impl Drop for RootWriterLease {
+    fn drop(&mut self) {
+        // Release before close so a concurrent same-process handoff cannot
+        // observe the advisory lock after this owner starts dropping it.
+        let _ = rustix::fs::flock(&self.file, FlockOperation::Unlock);
+    }
+}
+
+/// Exclusive per-UID identity lease for the active mutable TUI.
 #[derive(Debug)]
 pub struct ActiveTuiLease {
-    _file: File,
+    file: File,
     /// Verified private runtime directory containing the lock.
     pub runtime_directory: PathBuf,
 }
@@ -98,9 +106,16 @@ impl ActiveTuiLease {
         let file = open_private_lock(&app_fd, ACTIVE_LOCK, &app_path.join(ACTIVE_LOCK))?;
         let file = acquire_and_record(file, "active TUI")?;
         Ok(Self {
-            _file: file,
+            file,
             runtime_directory: app_path,
         })
+    }
+}
+
+impl Drop for ActiveTuiLease {
+    fn drop(&mut self) {
+        // Match the root lease's deterministic same-process handoff.
+        let _ = rustix::fs::flock(&self.file, FlockOperation::Unlock);
     }
 }
 

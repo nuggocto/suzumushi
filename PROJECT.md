@@ -11,10 +11,11 @@ into the player and reacts only to playback state.
 
 ## Current status
 
-Version `0.4.0` is released. It contains the complete local library, search,
-queue browser, playback controls, MPRIS, global media-key support, finished
-terminal states, built-in help, and the verified local installation path on the
-safe root, scanner, metadata, logging, test, fuzz, and CI foundation.
+Version `1.0.0-rc.1` is the current release candidate. It contains the complete
+local library, search, queue browser, playback controls, MPRIS, global media-key
+support, finished terminal states, built-in help, verified local installation,
+and tag-driven Linux release path on the safe root, scanner, metadata, logging,
+test, fuzz, and CI foundation.
 
 ```text
 +------------------+----------------------------------------+------------------+
@@ -28,7 +29,8 @@ safe root, scanner, metadata, logging, test, fuzz, and CI foundation.
 ```
 
 The complete local player, desktop controls, and terminal experience are
-implemented. The next work is Phase 9.
+implemented. Phase 9 is in progress while the release candidate is exercised
+and AUR publishing remains externally unavailable.
 
 ## Product contract
 
@@ -359,14 +361,15 @@ release-profile scan benchmark over 10,000 contextual playlist references.
 
 ### Phase 9: Linux release and AUR
 
-**Status:** next
+**Status:** in progress
 
-- Add the single release workflow only when the application is feature complete.
-- Build verified `x86_64-unknown-linux-gnu` archives and checksums from tags.
-- Publish only `suzumushi-bin` to AUR from those verified artifacts.
-- Test clean install, upgrade, uninstall, `suzumushi`, and the relative `suzu`
-  symlink.
-- Finish release notes, compatibility claims, and concise user documentation.
+- [x] Add the single release workflow only when the application is feature
+  complete.
+- [ ] Build verified `x86_64-unknown-linux-gnu` archives and checksums from tags.
+- [ ] Publish only `suzumushi-bin` to AUR from those verified artifacts.
+- [ ] Test clean install, upgrade, uninstall, `suzumushi`, and the relative
+  `suzu` symlink.
+- [x] Finish release notes, compatibility claims, and concise user documentation.
 
 Done when the tagged artifacts, local install, GitHub release, and AUR package
 all install and run the same tested application.
@@ -398,8 +401,8 @@ No website or Node dependency belongs in this repository.
 ## Versioning
 
 `CHANGELOG.md` holds user-visible changes. Git tags use a `v` prefix while Cargo
-and changelog versions do not. `v0.2.0` is the released terminal foundation and
+and changelog versions do not. `v0.2.0` is the released terminal foundation,
 `v0.3.0` is the released playable core, and `v0.4.0` is the released desktop and
-terminal experience. The next planned milestone is `1.0.0` as described above.
-A version is tagged only after local CI, real executable QA, and the exact
-pushed commit are green.
+terminal experience. `v1.0.0-rc.1` is the current release candidate for the
+`1.0.0` milestone described above. A version is tagged only after local CI,
+real executable QA, and the exact pushed commit are green.
