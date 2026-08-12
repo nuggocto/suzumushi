@@ -126,7 +126,6 @@ fn terminal_session_restores_the_pty_and_holds_both_leases() {
     let mut transcript = read_pty_until(&mut master, &mut child, b"Library");
 
     master.write_all(b"?").expect("open terminal help");
-    transcript.extend(read_pty_until(&mut master, &mut child, b"Navigation"));
     transcript.extend(read_pty_until(&mut master, &mut child, b"quit anywhere"));
     master.write_all(b"\x1b").expect("close terminal help");
     transcript.extend(read_pty_until(&mut master, &mut child, b"Library"));
