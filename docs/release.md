@@ -44,7 +44,7 @@ After publication, download both assets into a new temporary directory, run
 relative symlink. Record the tag, commit, workflow result, archive SHA-256, and
 QA environment.
 
-## AUR package hold and resumption
+## AUR package publication
 
 After each GitHub release is published, its exact checksum is staged in
 `packaging/aur/`, the source copy for the `suzumushi-bin` AUR repository. That
@@ -52,12 +52,12 @@ directory must contain only `PKGBUILD` and its generated `.SRCINFO`. The recipe
 consumes the published GitHub archive by exact SHA-256 and lets `makepkg` strip
 unneeded symbols from the installed executable.
 
-No AUR credential belongs in this repository or in GitHub Actions. While AUR
-writes are unavailable, do not probe authentication, create an AUR repository,
-or push updates. Keep the prepared files committed here and stop at local
-package verification.
+No AUR credential belongs in this repository or in GitHub Actions. If AUR
+writes are unavailable, do not probe authentication, create a repository, or
+push updates. Keep the prepared files committed here and stop at local package
+verification.
 
-When writes return:
+When writes are available:
 
 1. Confirm the AUR service notice is cleared through official Arch channels.
 2. Clone `ssh://aur@aur.archlinux.org/suzumushi-bin.git` into a new directory.

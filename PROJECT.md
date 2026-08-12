@@ -29,8 +29,8 @@ metadata, logging, test, fuzz, and CI foundation.
 ```
 
 The complete local player, desktop controls, and terminal experience are
-implemented. The Linux release is complete; AUR publication is the remaining
-distribution step if the service accepts writes.
+implemented. The Linux release and AUR distribution are complete. The separate
+landing-page project is next.
 
 ## Product contract
 
@@ -379,12 +379,12 @@ wall-clock sleeps.
 
 ### Phase 9: Linux release and AUR
 
-**Status:** in progress
+**Status:** complete
 
 - [x] Add the single release workflow only when the application is feature
   complete.
 - [x] Build verified `x86_64-unknown-linux-gnu` archives and checksums from tags.
-- [ ] Publish only `suzumushi-bin` to AUR from those verified artifacts.
+- [x] Publish only `suzumushi-bin` to AUR from those verified artifacts.
 - [x] Test clean install, upgrade, uninstall, `suzumushi`, and the relative
   `suzu` symlink.
 - [x] Finish release notes, compatibility claims, and concise user documentation.
@@ -392,7 +392,8 @@ wall-clock sleeps.
 Verified with the published `v1.0.0` archive and checksum; the exact
 downloaded binary through real audio, keyboard, resume, and MPRIS journeys; a
 clean Arch container install, package upgrade, and uninstall; both command
-names; and the relative packaged symlink.
+names; the relative packaged symlink; and the published `suzumushi-bin` AUR
+repository.
 
 Done when the tagged artifacts, local install, GitHub release, and AUR package
 all install and run the same tested application.

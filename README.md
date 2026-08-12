@@ -10,14 +10,15 @@ mascot, dances in the Player while audio is playing and rests when it is not.
 
 ## Install on Arch Linux
 
-When your AUR client can resolve `suzumushi-bin`, install it with:
+Install [`suzumushi-bin`](https://aur.archlinux.org/packages/suzumushi-bin)
+from AUR:
 
 ```sh
 yay -S suzumushi-bin
 ```
 
 The package installs both `suzumushi` and the relative `suzu` command symlink.
-If the package is not yet available from AUR, use the verified archive below.
+The verified archive below remains available for direct installation.
 
 ## Install the Linux release
 
@@ -177,7 +178,7 @@ automatic resampling are not current support claims.
 
 Version `1.0.0` is the current stable release. Its tag-driven Linux archive is
 fully verified before GitHub publishes it. Arch users can install the matching
-`suzumushi-bin` package when AUR is available.
+`suzumushi-bin` package from AUR.
 
 The full contract and roadmap live in [PROJECT.md](PROJECT.md). Release and AUR
 maintenance details live in [docs/release.md](docs/release.md).
