@@ -389,7 +389,7 @@ wall-clock sleeps.
   `suzu` symlink.
 - [x] Finish release notes, compatibility claims, and concise user documentation.
 
-Verified with the published `v1.0.0-rc.2` archive and checksum; the exact
+Verified with the published `v1.0.0` archive and checksum; the exact
 downloaded binary through real audio, keyboard, resume, and MPRIS journeys; a
 clean Arch container install, package upgrade, and uninstall; both command
 names; and the relative packaged symlink.

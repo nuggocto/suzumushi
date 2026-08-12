@@ -49,8 +49,8 @@ QA environment.
 After each GitHub release is published, its exact checksum is staged in
 `packaging/aur/`, the source copy for the `suzumushi-bin` AUR repository. That
 directory must contain only `PKGBUILD` and its generated `.SRCINFO`. The recipe
-consumes the published GitHub archive by exact SHA-256 and disables makepkg
-stripping so the installed executable remains the verified upstream binary.
+consumes the published GitHub archive by exact SHA-256 and lets `makepkg` strip
+unneeded symbols from the installed executable.
 
 No AUR credential belongs in this repository or in GitHub Actions. While AUR
 writes are unavailable, do not probe authentication, create an AUR repository,
