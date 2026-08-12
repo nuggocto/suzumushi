@@ -20,23 +20,31 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
                 Span::raw(bounded_text(&app.search.query, query_bytes)),
             ]),
             Line::from(vec![
-                Span::raw(" Enter add  Esc close  Ctrl+c quit  "),
+                Span::raw(" Enter add · Esc close · Ctrl+c quit  "),
                 notice_span(app),
             ]),
         ]
     } else {
         let keys = match app.focus {
-            crate::app::Focus::Library => " Tab focus / search Up or Down move Enter add/play  ",
-            crate::app::Focus::Player => " Tab focus Left or Right seek - or + volume m mute  ",
+            crate::app::Focus::Library => " Tab focus · / search · ↑/↓ move · Enter open/add  ",
+            crate::app::Focus::Player => {
+                " Tab focus · ←/→ seek · -/+ volume · m mute · Enter play/pause  "
+            }
             crate::app::Focus::Queue => {
-                " Tab focus Up or Down select J or K reorder d remove c clear  "
+                " Tab focus · ↑/↓ select · J/K reorder · d remove · c clear  "
+            }
+        };
+        let playback_keys = match app.focus {
+            crate::app::Focus::Library => {
+                "q · ? · Space play/pause · s stop · p previous · n next · x shuffle · r repeat"
+            }
+            crate::app::Focus::Player | crate::app::Focus::Queue => {
+                "q · ? · Space/↵ play/pause · s stop · p previous · n next · x shuffle · r repeat"
             }
         };
         vec![
             Line::from(vec![Span::raw(keys), notice_span(app)]),
-            Line::raw(
-                " q quit ? help Space play or pause s stop n next p previous x shuffle r repeat",
-            ),
+            Line::raw(playback_keys),
         ]
     };
     frame.render_widget(Paragraph::new(lines), area);

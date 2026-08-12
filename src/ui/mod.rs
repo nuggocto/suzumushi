@@ -245,7 +245,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         Line::default(),
         Line::styled("Library and search", heading),
         Line::raw("  /                     search artist, title, filename, and path"),
-        Line::raw("  Enter                 add the selection and play when idle"),
+        Line::raw("  Enter                 toggle folders; add tracks or playlists"),
         Line::raw("  Esc                   close search"),
         Line::default(),
         Line::styled("Queue", heading),
@@ -253,8 +253,8 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         Line::raw("  d or Delete           remove item    c clear Queue"),
         Line::default(),
         Line::styled("Playback", heading),
-        Line::raw("  Space                 play or pause    s stop"),
-        Line::raw("  n or p                 next or previous"),
+        Line::raw("  Space or Enter outside Library  play or pause"),
+        Line::raw("  s                     stop    p previous    n next"),
         Line::raw("  Left or Right          seek back or forward five seconds"),
         Line::raw("  - or +                 volume down or up    m mute"),
         Line::raw("  x                     shuffle    r repeat"),
@@ -282,6 +282,7 @@ fn library_row_text(app: &AppState, row: BrowserRow, max_row_bytes: usize) -> St
             entry_index,
             component_index,
             indent,
+            collapsed,
         } => {
             let name = app
                 .entry(entry_index)
@@ -290,7 +291,8 @@ fn library_row_text(app: &AppState, row: BrowserRow, max_row_bytes: usize) -> St
                     || "Missing folder".into(),
                     |name| terminal_safe(name.as_bytes(), max_row_bytes),
                 );
-            format!("{}{name}/", indentation(indent))
+            let marker = if collapsed { "▸" } else { "▾" };
+            format!("{}{marker} {name}/", indentation(indent))
         }
         BrowserRow::Playlist { playlist_index } => {
             app.index.playlists.get(playlist_index).map_or_else(
@@ -332,7 +334,7 @@ fn panel_block<'a>(title: &'a str, focus: Focus, app: &AppState) -> Block<'a> {
     let selected = app.focus == focus;
     Block::default()
         .title(title)
-        .title_alignment(Alignment::Center)
+        .title_alignment(Alignment::Left)
         .title_style(focus_style(app, selected))
         .borders(Borders::ALL)
         .border_type(if selected {
@@ -484,6 +486,19 @@ mod tests {
         app.status_message = "Scan incomplete".into();
         let warning = rendered(&app, 80, 24, Duration::ZERO);
         assert!(warning.contains("Warning: Scan"), "{warning}");
+    }
+
+    #[test]
+    fn player_footer_names_enter_playback_and_separates_bindings() {
+        let mut app = AppState::new(&Config::default(), empty_index()).expect("app state");
+        app.apply(crate::input::AppAction::FocusNext);
+
+        let player = rendered(&app, 80, 24, Duration::ZERO);
+
+        assert!(player.contains("Enter play/pause"), "{player}");
+        assert!(player.contains("p previous · n next"), "{player}");
+        assert!(!player.contains("n/p skip"), "{player}");
+        assert!(player.contains(" · "), "{player}");
     }
 
     #[test]

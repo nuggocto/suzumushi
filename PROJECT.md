@@ -19,12 +19,12 @@ metadata, logging, test, fuzz, and CI foundation.
 
 ```text
 +------------------+----------------------------------------+------------------+
-|     Library      |                 Player                 |      Queue       |
+| Library          | Player                                 | Queue            |
 | folders, tracks  |     title, creator, progress, time     |  ordered tracks  |
 | playlists/search |        volume, state, dancing Suzu     | and queue edits  |
 +------------------+----------------------------------------+------------------+
-| q quit   ? help   Tab focus   / search   Enter add   Up or Down move         |
-| Space play or pause  s stop  n next  p previous  x shuffle  r repeat         |
+| Tab focus · / search · Up/Down move · Enter open/add · q quit · ? help       |
+| Space play/pause · s stop · p previous · n next · x shuffle · r repeat       |
 +------------------------------------------------------------------------------+
 ```
 
@@ -40,13 +40,14 @@ and AUR publishing remains externally unavailable.
 - Arbitrary folders under `audio/library/`.
 - Immediate child folders under `audio/playlists/` as playlists.
 - Copied files and file symlinks in playlists.
-- Library browsing, local search, and a bounded queue.
+- Library browsing with session-only folder collapse, local search, and a
+  bounded queue.
 - Play, pause, stop, next, previous, seek, volume, mute, shuffle, and repeat.
 - An original fixed-size Suzu character animation in the Player. Suzu dances
   only while audio is playing and returns to one calm resting frame otherwise.
 - Automatic restoration of the last non-empty queue, current track, and
   playback position. Restored sessions remain paused until the user presses
-  Space.
+  Space or moves outside Library and presses Enter.
 - MPRIS and global media-key support.
 - A direct local install command, verified GitHub release binaries, and the
   `suzumushi-bin` AUR package.
@@ -123,6 +124,15 @@ asset, and each contextual library or playlist entry holds one checked index
 into that immutable asset table. While search is open, `q` remains query text;
 `Esc` closes search and `Ctrl+c` quits globally.
 
+`Enter` collapses or expands a selected Library folder. This presentation state
+lives only for the terminal session. It does not remove indexed entries, hide
+search results, change the Queue, or affect playback.
+
+Outside Library, `Enter` plays or pauses like Space. Queue insertion uses the
+canonical media asset identity, so selecting the same audio through another
+library or playlist entry cannot add a duplicate. Playlist insertion remains
+all-or-nothing when any of its audio is already queued.
+
 The Player shows artist or album-artist metadata when present. Missing creator
 metadata is omitted rather than replaced with a placeholder.
 
@@ -133,8 +143,8 @@ are coalesced instead of queueing decoder restarts.
 ## Architecture
 
 - The terminal loop exclusively owns `AppState`, focus, library selection,
-  search state, queue, history, shuffle, repeat, queue generations, and playback
-  generations.
+  folder visibility, search state, queue, history, shuffle, repeat, queue
+  generations, and playback generations.
 - The audio worker owns the decoder, output device, and current playback state.
   It never chooses the next queue item.
 - Workers use bounded messages, explicit cancellation, and awaited shutdown.
@@ -161,7 +171,9 @@ are coalesced instead of queueing decoder restarts.
 
 The terminal inherits the user's foreground and background. It uses default or
 named ANSI colors only, honors `NO_COLOR` and `theme = "mono"`, and never relies
-on color alone for focus or state.
+on color alone for focus or state. Transient informational footer notices clear
+after three seconds on the existing monotonic terminal clock. Warnings and
+errors remain visible until another notice supersedes them.
 
 ## Safety boundaries
 
@@ -237,7 +249,8 @@ and packaged artifact checks belong in focused release QA.
 **Status:** complete
 
 - [x] Move the existing scan index into app-owned state.
-- [x] Render the library tree and folder playlists in the Library panel.
+- [x] Render and collapse the library tree and show folder playlists in the
+  Library panel.
 - [x] Add local `/` search over the existing metadata, filename, and relative-path
   fields.
 - [x] Add bounded queue insert, remove, reorder, clear, and selection behavior.
@@ -248,9 +261,10 @@ and packaged artifact checks belong in focused release QA.
 Done when a user can initialize a root, add files, open the TUI, browse and
 search them, build a queue, and quit cleanly without an audio device.
 
-Verified with focused state and adversarial search tests, reviewed 80x24 and
-120x32 snapshots, the full `mise run ci` sequence, and a release-profile PTY
-journey over a synthetic nested `JDR` library.
+Verified with focused folder-visibility, duplicate-insertion, state, and
+adversarial search tests; reviewed 80x24 and 120x32 snapshots; the full
+`mise run ci` sequence; and release-profile PTY journeys over a synthetic nested
+`JDR` library.
 
 ### Phase 5: one audio pipeline
 
@@ -358,6 +372,8 @@ keyboard journeys; the isolated `mise run local-install-qa` flow; the local
 PipeWire-backed audio device; a private session-bus `playerctl` play, pause,
 resume, stop, and metadata journey; the full `mise run ci` sequence; and a
 release-profile scan benchmark over 10,000 contextual playlist references.
+Transient notice timing is verified at its exact deterministic boundary without
+wall-clock sleeps.
 
 ### Phase 9: Linux release and AUR
 

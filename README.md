@@ -90,8 +90,14 @@ Every immediate folder below `audio/playlists/` is a playlist. It may contain
 copied audio files or file symlinks. Suzumushi never scans `~/Music`
 automatically.
 
+Press `Enter` on a Library folder to collapse or expand it. This only changes
+the current terminal view: search still finds tracks inside collapsed folders,
+and the Queue and playback are untouched. Folder visibility resets when
+Suzumushi closes.
+
 The last non-empty Queue, current track, and playback position are restored
-when the player reopens. Playback remains paused until you press `Space`.
+when the player reopens. Playback remains paused until you press `Space`, or
+press `Enter` while Player or Queue is focused.
 
 ## Keys
 
@@ -100,15 +106,16 @@ when the player reopens. Playback remains paused until you press `Space`.
 | `Tab` or `Shift+Tab` | Move between Library, Player, and Queue |
 | Up or Down, or `j` or `k` | Move the selection |
 | `Home` or `End`, or `g` or `G` | Jump to the first or last item |
-| `Enter` | Add the selected Library item to the Queue and start it when idle |
+| `Enter` | In Library, toggle a folder or add a track or playlist; in Player or Queue, play or pause |
 | `/` | Search artist, title, filename, and relative path |
-| `Esc` | Close search |
+| `Esc` | Close search or the built-in key guide |
 | `J` or `K` | In Queue, move the selected item down or up |
 | `d` or `Delete` | In Queue, remove the selected item |
 | `c` | In Queue, clear every item |
 | `Space` | Play or pause |
 | `s` | Stop |
-| `n` or `p` | Play the next or previous track |
+| `p` | Play the previous track |
+| `n` | Play the next track |
 | Left or Right | Seek backward or forward five seconds; hold to move quickly |
 | `-` or `+` | Lower or raise volume by five percent |
 | `m` | Mute |
@@ -119,7 +126,10 @@ when the player reopens. Playback remains paused until you press `Space`.
 | `Ctrl+c` | Quit from anywhere |
 
 Search checks metadata, filenames, and paths. Pressing `Enter` queues the
-selected result. If nothing is playing, it starts immediately.
+selected result. If nothing is playing, it starts immediately. An underlying
+audio file can appear in the Queue only once. Selecting it again, directly or
+through a playlist, leaves the Queue unchanged and reports `Audio already in
+Queue`. Playlist additions remain all-or-nothing.
 
 Held seek input keeps only the newest target, so releasing the arrow key resumes
 from the position shown instead of replaying obsolete intermediate seeks.

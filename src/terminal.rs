@@ -297,11 +297,15 @@ fn validate_terminal_area(width: u16, height: u16, budget: usize) -> AppResult<R
 fn apply_event(app: &mut AppState, event: AppEvent) -> Option<PlaybackIntent> {
     match event {
         AppEvent::Key(key, now) => app.key(key, now),
-        AppEvent::Resize(width, height, _) => {
+        AppEvent::Resize(width, height, now) => {
+            app.advance_time(now);
             app.terminal_size = (width, height);
             None
         }
-        AppEvent::Tick(_) => None,
+        AppEvent::Tick(now) => {
+            app.advance_time(now);
+            None
+        }
     }
 }
 
@@ -481,6 +485,7 @@ mod tests {
     use std::rc::Rc;
     use std::time::Duration;
 
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use rustix::fd::AsFd;
 
     use super::{
@@ -512,6 +517,58 @@ mod tests {
         apply_event(&mut app, AppEvent::Resize(120, 32, Duration::ZERO));
         assert_eq!(app.terminal_size, (120, 32));
         assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn periodic_ticks_clear_expired_information_notices() {
+        let mut app =
+            AppState::new(&Config::default(), empty_index()).expect("app state reservation");
+        apply_event(
+            &mut app,
+            AppEvent::Key(
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+                Duration::from_secs(10),
+            ),
+        );
+
+        apply_event(&mut app, AppEvent::Tick(Duration::from_millis(12_999)));
+        assert_eq!(
+            app.status_message, "Shuffle: on",
+            "the notice remains readable before its deadline"
+        );
+
+        apply_event(
+            &mut app,
+            AppEvent::Key(
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+                Duration::from_millis(12_999),
+            ),
+        );
+        apply_event(&mut app, AppEvent::Tick(Duration::from_secs(13)));
+        assert_eq!(
+            app.status_message, "Shuffle: off",
+            "a newer notice replaces the old deadline"
+        );
+
+        apply_event(&mut app, AppEvent::Tick(Duration::from_millis(15_999)));
+        assert!(
+            app.status_message.is_empty(),
+            "the periodic event clears the newest notice at its deadline"
+        );
+    }
+
+    #[test]
+    fn periodic_ticks_preserve_warnings() {
+        let mut app =
+            AppState::new(&Config::default(), empty_index()).expect("app state reservation");
+        app.desktop_controls_unavailable("fixture unavailable");
+
+        apply_event(&mut app, AppEvent::Tick(Duration::from_secs(30)));
+
+        assert_eq!(
+            app.status_message,
+            "Desktop controls unavailable: fixture unavailable"
+        );
     }
 
     fn state_writer() -> (tempfile::TempDir, std::fs::File, crate::state::StateStore) {

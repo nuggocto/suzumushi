@@ -21,6 +21,7 @@ use crate::model::{PlaylistId, ScanIndex, TrackEntry, TrackEntryId, TrackEntrySo
 use crate::paths::SelectedRoot;
 
 const TUI_STARTUP_OPEN_FILES_PEAK: usize = 6;
+const INFORMATION_NOTICE_LIFETIME: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Focus {
@@ -86,6 +87,7 @@ pub(crate) enum BrowserRow {
         entry_index: usize,
         component_index: usize,
         indent: usize,
+        collapsed: bool,
     },
     Playlist {
         playlist_index: usize,
@@ -94,6 +96,22 @@ pub(crate) enum BrowserRow {
         entry_index: usize,
         indent: usize,
     },
+}
+
+impl BrowserRow {
+    const fn indent(self) -> usize {
+        match self {
+            Self::LibraryRoot | Self::PlaylistsRoot => 0,
+            Self::Playlist { .. } => 1,
+            Self::Folder { indent, .. } | Self::Track { indent, .. } => indent,
+        }
+    }
+}
+
+struct BrowserAllocation {
+    rows: Vec<BrowserRow>,
+    visible_rows: Vec<usize>,
+    selection: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -223,11 +241,16 @@ pub struct AppState {
     pub color_mode: ColorMode,
     pub status_message: String,
     pub(crate) status_kind: StatusKind,
+    event_time: Duration,
+    status_expires_at: Option<Duration>,
     pub index: ScanIndex,
     pub(crate) browser_rows: Vec<BrowserRow>,
+    visible_browser_rows: Vec<usize>,
     pub(crate) library_selection: usize,
     pub(crate) search: SearchState,
     pub(crate) queue: Vec<QueueItem>,
+    /// One byte per canonical asset, set while that audio is queued.
+    queued_assets: Vec<u8>,
     pub(crate) queue_selection: usize,
     pub queue_generation: u64,
     pub playback_generation: u64,
@@ -265,44 +288,33 @@ impl AppState {
             std::env::var_os("TERM").is_some_and(|value| value == "dumb"),
         );
 
-        let browser_capacity = index
-            .counters
-            .encountered_entries
-            .checked_add(index.playlists.len())
-            .and_then(|value| value.checked_add(2))
-            .ok_or_else(|| AppError::Resource("library browser reservation overflow".into()))?;
-        let browser_bytes = browser_capacity
-            .checked_mul(size_of::<BrowserRow>())
-            .ok_or_else(|| {
-                AppError::Resource("library browser byte reservation overflow".into())
-            })?;
+        let (browser_capacity, browser_bytes) = browser_reservation(&index)?;
         let search_bytes = search_reservation_bytes(config)?;
         let shuffle_bytes = config
             .queue
             .max_items
             .checked_mul(size_of::<u64>())
             .ok_or_else(|| AppError::Resource("shuffle reservation overflow".into()))?;
+        let queued_asset_bytes = index
+            .assets
+            .len()
+            .checked_mul(size_of::<u8>())
+            .ok_or_else(|| AppError::Resource("queued asset reservation overflow".into()))?;
         if browser_bytes
             .saturating_add(search_bytes)
             .saturating_add(shuffle_bytes)
+            .saturating_add(queued_asset_bytes)
             > UI_STATE_SCRATCH_BYTES
         {
             return Err(AppError::InvalidConfig(
-                "library browser, search, and shuffle reservations exceed the UI/state scratch budget"
+                "library browser, search, queue identity, and shuffle reservations exceed the UI/state scratch budget"
                     .into(),
             ));
         }
 
-        let mut browser_rows = Vec::new();
-        reserve_exact(&mut browser_rows, browser_capacity, "library browser")?;
-        build_browser_rows(&index, &mut browser_rows, browser_capacity)?;
-        let library_selection = browser_rows
-            .iter()
-            .position(|row| matches!(row, BrowserRow::Track { .. }))
-            .unwrap_or(0);
-
-        let search = allocate_search(config, library_selection)?;
-        let (queue, shuffle_order) = allocate_queue(config)?;
+        let browser = allocate_browser(&index, browser_capacity)?;
+        let search = allocate_search(config, browser.selection)?;
+        let (queue, queued_assets, shuffle_order) = allocate_queue(config, index.assets.len())?;
         let shuffle_seed = random_seed();
 
         let (status_message, status_kind) = if index.complete {
@@ -333,11 +345,15 @@ impl AppState {
             color_mode,
             status_message,
             status_kind,
+            event_time: Duration::ZERO,
+            status_expires_at: None,
             index,
-            browser_rows,
-            library_selection,
+            browser_rows: browser.rows,
+            visible_browser_rows: browser.visible_rows,
+            library_selection: browser.selection,
             search,
             queue,
+            queued_assets,
             queue_selection: 0,
             queue_generation: 0,
             playback_generation: 0,
@@ -359,7 +375,8 @@ impl AppState {
     }
 
     /// Resolves a key against the active search mode or normal key map.
-    pub(crate) fn key(&mut self, key: KeyEvent, _now: Duration) -> Option<PlaybackIntent> {
+    pub(crate) fn key(&mut self, key: KeyEvent, now: Duration) -> Option<PlaybackIntent> {
+        self.advance_time(now);
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.should_quit = true;
             return None;
@@ -449,7 +466,7 @@ impl AppState {
         if self.search.active && !self.search.query.is_empty() {
             self.search.results.len()
         } else {
-            self.browser_rows.len()
+            self.visible_browser_rows.len()
         }
     }
 
@@ -465,7 +482,10 @@ impl AppState {
                     indent: 0,
                 })
         } else {
-            self.browser_rows.get(position).copied()
+            self.visible_browser_rows
+                .get(position)
+                .and_then(|row| self.browser_rows.get(*row))
+                .copied()
         }
     }
 
@@ -698,6 +718,22 @@ impl AppState {
                 continue;
             };
             let entry_index = available[position].1;
+            let asset_index = self.index.entries[entry_index].asset_index;
+            let Some(queued) = self.queued_assets.get(asset_index) else {
+                continue;
+            };
+            if *queued != 0 {
+                if saved_index == snapshot.current_index {
+                    restored_current = self.queue.iter().position(|item| {
+                        self.index
+                            .entries
+                            .get(item.entry_index)
+                            .is_some_and(|entry| entry.asset_index == asset_index)
+                    });
+                }
+                continue;
+            }
+            self.queued_assets[asset_index] = 1;
             let queue_index = self.queue.len();
             self.queue.push(QueueItem {
                 instance_id: self.next_queue_item_id,
@@ -736,16 +772,16 @@ impl AppState {
         self.playback.timeline_revision = 0;
         self.playback.seek_target = None;
         self.playback_status = PlaybackStatus::Stopped;
-        let missing = snapshot
+        let skipped = snapshot
             .queue_entry_ids
             .len()
             .saturating_sub(self.queue.len());
-        if missing == 0 {
-            self.set_status("Session restored; Space resumes");
+        if skipped == 0 {
+            self.set_persistent_status("Session restored; Space resumes");
         } else {
-            let track_label = if missing == 1 { "track" } else { "tracks" };
+            let track_label = if skipped == 1 { "track" } else { "tracks" };
             self.set_warning(&format!(
-                "Session restored; {missing} missing {track_label} skipped; Space resumes"
+                "Session restored; {skipped} unavailable or duplicate {track_label} skipped; Space resumes"
             ));
         }
         Ok(())
@@ -920,7 +956,7 @@ impl AppState {
         self.library_selection = self
             .search
             .saved_selection
-            .min(self.browser_rows.len().saturating_sub(1));
+            .min(self.visible_browser_rows.len().saturating_sub(1));
     }
 
     fn activate_search_result(&mut self) -> Option<PlaybackIntent> {
@@ -995,15 +1031,15 @@ impl AppState {
 
     fn activate(&mut self) -> Option<PlaybackIntent> {
         if self.focus != Focus::Library {
-            return None;
+            return self.play_pause();
         }
         match self.library_row(self.library_selection) {
             Some(BrowserRow::Track { entry_index, .. }) => self.queue_entry(entry_index),
-            Some(BrowserRow::Playlist { playlist_index }) => {
-                self.queue_playlist(playlist_index, self.library_selection)
-            }
+            Some(BrowserRow::Playlist { playlist_index }) => self
+                .normal_browser_position(self.library_selection)
+                .and_then(|position| self.queue_playlist(playlist_index, position)),
             Some(BrowserRow::Folder { .. }) => {
-                self.set_status("Folder tracks are shown below");
+                self.toggle_selected_folder();
                 None
             }
             Some(BrowserRow::LibraryRoot | BrowserRow::PlaylistsRoot) | None => {
@@ -1020,6 +1056,50 @@ impl AppState {
             | BrowserRow::PlaylistsRoot
             | BrowserRow::Folder { .. }
             | BrowserRow::Playlist { .. } => None,
+        }
+    }
+
+    fn normal_browser_position(&self, visible_position: usize) -> Option<usize> {
+        if self.search.active && !self.search.query.is_empty() {
+            None
+        } else {
+            self.visible_browser_rows.get(visible_position).copied()
+        }
+    }
+
+    fn toggle_selected_folder(&mut self) {
+        let Some(position) = self.normal_browser_position(self.library_selection) else {
+            return;
+        };
+        let Some(BrowserRow::Folder { collapsed, .. }) = self.browser_rows.get_mut(position) else {
+            return;
+        };
+        *collapsed = !*collapsed;
+        let collapsed = *collapsed;
+        self.rebuild_visible_browser_rows();
+        self.set_status(if collapsed {
+            "Folder collapsed"
+        } else {
+            "Folder expanded"
+        });
+    }
+
+    fn rebuild_visible_browser_rows(&mut self) {
+        self.visible_browser_rows.clear();
+        let mut collapsed_indent = None;
+        for (position, row) in self.browser_rows.iter().copied().enumerate() {
+            let indent = row.indent();
+            if collapsed_indent.is_some_and(|parent_indent| indent > parent_indent) {
+                continue;
+            }
+            collapsed_indent = None;
+            self.visible_browser_rows.push(position);
+            if let BrowserRow::Folder {
+                collapsed: true, ..
+            } = row
+            {
+                collapsed_indent = Some(indent);
+            }
         }
     }
 
@@ -1196,7 +1276,7 @@ impl AppState {
         self.playback.start_paused = paused;
         self.set_playback_status(PlaybackStatus::Loading);
         let title = self.queue_item_title(item, self.status_text_max_bytes);
-        self.set_status(&format!("Loading: {title}"));
+        self.set_persistent_status(&format!("Loading: {title}"));
         Some(PlaybackIntent::Load {
             generation,
             item,
@@ -1595,10 +1675,23 @@ impl AppState {
     }
 
     fn queue_entry(&mut self, entry_index: usize) -> Option<PlaybackIntent> {
-        let Some(entry_id) = self.index.entries.get(entry_index).map(|entry| entry.id) else {
+        let Some((entry_id, asset_index)) = self
+            .index
+            .entries
+            .get(entry_index)
+            .map(|entry| (entry.id, entry.asset_index))
+        else {
             self.set_warning("The selected track is no longer available");
             return None;
         };
+        let Some(queued) = self.queued_assets.get(asset_index) else {
+            self.set_warning("The selected track is no longer available");
+            return None;
+        };
+        if *queued != 0 {
+            self.set_status("Audio already in Queue");
+            return None;
+        }
         if !self.can_append_queue(1) {
             return None;
         }
@@ -1611,6 +1704,7 @@ impl AppState {
             entry_id,
             scan_generation: self.index.generation,
         });
+        self.queued_assets[asset_index] = 1;
         self.next_queue_item_id += 1;
         self.queue_generation += 1;
         self.set_status(&format!("Queued: {title}"));
@@ -1656,13 +1750,19 @@ impl AppState {
             matches!(
                 row,
                 BrowserRow::Track { entry_index, .. }
-                    if self.index.entries.get(*entry_index).is_none()
+                    if self.index.entries.get(*entry_index).is_none_or(|entry| {
+                        self.queued_assets.get(entry.asset_index).is_none()
+                    })
             )
         }) {
             self.set_warning("The playlist contains a stale track");
             return None;
         }
+        if !self.mark_playlist_assets(start, end) {
+            return None;
+        }
         if !self.can_append_queue(track_count) {
+            self.unmark_playlist_assets(start, end);
             return None;
         }
         let start_now = !self.worker_has_track();
@@ -1693,6 +1793,48 @@ impl AppState {
         }
     }
 
+    fn mark_playlist_assets(&mut self, start: usize, end: usize) -> bool {
+        for position in start..end {
+            let BrowserRow::Track { entry_index, .. } = self.browser_rows[position] else {
+                continue;
+            };
+            let Some(asset_index) = self
+                .index
+                .entries
+                .get(entry_index)
+                .map(|entry| entry.asset_index)
+                .filter(|asset_index| *asset_index < self.queued_assets.len())
+            else {
+                self.unmark_playlist_assets(start, position);
+                self.set_warning("The playlist contains a stale track");
+                return false;
+            };
+            if self.queued_assets[asset_index] != 0 {
+                self.unmark_playlist_assets(start, position);
+                self.set_status("Audio already in Queue");
+                return false;
+            }
+            self.queued_assets[asset_index] = 1;
+        }
+        true
+    }
+
+    fn unmark_playlist_assets(&mut self, start: usize, end: usize) {
+        for row in &self.browser_rows[start..end] {
+            let BrowserRow::Track { entry_index, .. } = row else {
+                continue;
+            };
+            if let Some(queued) = self
+                .index
+                .entries
+                .get(*entry_index)
+                .and_then(|entry| self.queued_assets.get_mut(entry.asset_index))
+            {
+                *queued = 0;
+            }
+        }
+    }
+
     fn remove_queue_item(&mut self) {
         if self.focus != Focus::Queue || self.queue.is_empty() {
             return;
@@ -1703,6 +1845,14 @@ impl AppState {
         let removed = self.queue[self.queue_selection];
         let title = self.entry_title(removed.entry_index);
         self.queue.remove(self.queue_selection);
+        if let Some(queued) = self
+            .index
+            .entries
+            .get(removed.entry_index)
+            .and_then(|entry| self.queued_assets.get_mut(entry.asset_index))
+        {
+            *queued = 0;
+        }
         self.remove_from_shuffle_order(removed.instance_id);
         self.queue_selection = self.queue_selection.min(self.queue.len().saturating_sub(1));
         self.reconcile_playback_position();
@@ -1718,6 +1868,7 @@ impl AppState {
             return;
         }
         self.queue.clear();
+        self.queued_assets.fill(0);
         self.shuffle_order.clear();
         self.shuffle_cursor = None;
         self.queue_selection = 0;
@@ -1775,19 +1926,24 @@ impl AppState {
     }
 
     fn set_status(&mut self, message: &str) {
-        self.set_status_kind(StatusKind::Info, message);
+        self.set_status_kind(StatusKind::Info, message, Some(INFORMATION_NOTICE_LIFETIME));
+    }
+
+    fn set_persistent_status(&mut self, message: &str) {
+        self.set_status_kind(StatusKind::Info, message, None);
     }
 
     fn set_warning(&mut self, message: &str) {
-        self.set_status_kind(StatusKind::Warning, message);
+        self.set_status_kind(StatusKind::Warning, message, None);
     }
 
     fn set_error(&mut self, message: &str) {
-        self.set_status_kind(StatusKind::Error, message);
+        self.set_status_kind(StatusKind::Error, message, None);
     }
 
-    fn set_status_kind(&mut self, kind: StatusKind, message: &str) {
+    fn set_status_kind(&mut self, kind: StatusKind, message: &str, lifetime: Option<Duration>) {
         self.status_kind = kind;
+        self.status_expires_at = lifetime.map(|duration| self.event_time.saturating_add(duration));
         self.status_message.clear();
         for character in message.chars() {
             if self
@@ -1801,12 +1957,62 @@ impl AppState {
             self.status_message.push(character);
         }
     }
+
+    pub(crate) fn advance_time(&mut self, now: Duration) {
+        self.event_time = self.event_time.max(now);
+        if self
+            .status_expires_at
+            .is_some_and(|deadline| self.event_time >= deadline)
+        {
+            self.status_message.clear();
+            self.status_kind = StatusKind::Info;
+            self.status_expires_at = None;
+        }
+    }
 }
 
 fn reserve_exact<T>(items: &mut Vec<T>, capacity: usize, name: &str) -> AppResult<()> {
     items
         .try_reserve_exact(capacity)
         .map_err(|error| AppError::Resource(format!("cannot reserve {name}: {error}")))
+}
+
+fn browser_reservation(index: &ScanIndex) -> AppResult<(usize, usize)> {
+    let capacity = index
+        .counters
+        .encountered_entries
+        .checked_add(index.playlists.len())
+        .and_then(|value| value.checked_add(2))
+        .ok_or_else(|| AppError::Resource("library browser reservation overflow".into()))?;
+    let row_bytes = capacity
+        .checked_mul(size_of::<BrowserRow>())
+        .ok_or_else(|| AppError::Resource("library browser byte reservation overflow".into()))?;
+    let visible_bytes = capacity.checked_mul(size_of::<usize>()).ok_or_else(|| {
+        AppError::Resource("library browser visibility reservation overflow".into())
+    })?;
+    let reserved_bytes = row_bytes.checked_add(visible_bytes).ok_or_else(|| {
+        AppError::Resource("combined library browser reservation overflow".into())
+    })?;
+    Ok((capacity, reserved_bytes))
+}
+
+fn allocate_browser(index: &ScanIndex, capacity: usize) -> AppResult<BrowserAllocation> {
+    let mut rows = Vec::new();
+    reserve_exact(&mut rows, capacity, "library browser")?;
+    build_browser_rows(index, &mut rows, capacity)?;
+    let mut visible_rows = Vec::new();
+    reserve_exact(&mut visible_rows, capacity, "library browser visibility")?;
+    visible_rows.extend(0..rows.len());
+    let selection = visible_rows
+        .iter()
+        .position(|position| matches!(rows[*position], BrowserRow::Track { .. }))
+        .unwrap_or(0);
+
+    Ok(BrowserAllocation {
+        rows,
+        visible_rows,
+        selection,
+    })
 }
 
 fn allocate_search(config: &Config, saved_selection: usize) -> AppResult<SearchState> {
@@ -1833,7 +2039,10 @@ fn allocate_search(config: &Config, saved_selection: usize) -> AppResult<SearchS
     })
 }
 
-fn allocate_queue(config: &Config) -> AppResult<(Vec<QueueItem>, Vec<u64>)> {
+fn allocate_queue(
+    config: &Config,
+    asset_count: usize,
+) -> AppResult<(Vec<QueueItem>, Vec<u8>, Vec<u64>)> {
     let mut queue = Vec::new();
     reserve_exact(&mut queue, config.queue.max_items, "queue")?;
     let queue_bytes = queue
@@ -1847,7 +2056,10 @@ fn allocate_queue(config: &Config) -> AppResult<(Vec<QueueItem>, Vec<u64>)> {
     }
     let mut shuffle_order = Vec::new();
     reserve_exact(&mut shuffle_order, config.queue.max_items, "shuffle order")?;
-    Ok((queue, shuffle_order))
+    let mut queued_assets = Vec::new();
+    reserve_exact(&mut queued_assets, asset_count, "queued assets")?;
+    queued_assets.resize(asset_count, 0);
+    Ok((queue, queued_assets, shuffle_order))
 }
 
 fn random_seed() -> u64 {
@@ -2048,6 +2260,7 @@ fn append_tree_entry(
                 entry_index,
                 component_index: skipped_components + depth - 1,
                 indent: base_indent + depth - 1,
+                collapsed: false,
             },
             row_limit,
         )?;
@@ -2218,6 +2431,19 @@ mod tests {
         }
     }
 
+    fn fixture_index_with_distinct_context_assets() -> ScanIndex {
+        let mut index = fixture_index();
+        for entry_index in 2..4 {
+            let mut asset = index.assets[entry_index - 2].clone();
+            asset.id = MediaAssetId(100 + entry_index as u64);
+            asset.file_identity.inode = 100 + entry_index as u64;
+            asset.canonical_path = index.entries[entry_index].display_path.clone();
+            index.entries[entry_index].asset_index = index.assets.len();
+            index.assets.push(asset);
+        }
+        index
+    }
+
     fn fixture_assets() -> Vec<MediaAsset> {
         let asset = |id, inode, path: &str, artist: &str, album: &str, title: &str| MediaAsset {
             id: MediaAssetId(id),
@@ -2315,19 +2541,17 @@ mod tests {
     }
 
     fn select_entry(app: &mut AppState, entry_index: usize) {
-        app.library_selection = app
-            .browser_rows
-            .iter()
-            .position(|row| {
+        app.library_selection = (0..app.library_row_count())
+            .position(|position| {
                 matches!(
-                    row,
-                    BrowserRow::Track {
+                    app.library_row(position),
+                    Some(BrowserRow::Track {
                         entry_index: candidate,
                         ..
-                    } if *candidate == entry_index
+                    }) if candidate == entry_index
                 )
             })
-            .expect("fixture entry has a browser row");
+            .expect("fixture entry has a visible browser row");
     }
 
     #[test]
@@ -2406,7 +2630,8 @@ mod tests {
             BrowserRow::Folder {
                 entry_index: 0,
                 component_index: 1,
-                indent: 1
+                indent: 1,
+                collapsed: false
             }
         ));
         assert!(matches!(
@@ -2414,7 +2639,8 @@ mod tests {
             BrowserRow::Folder {
                 entry_index: 0,
                 component_index: 2,
-                indent: 2
+                indent: 2,
+                collapsed: false
             }
         ));
         assert!(
@@ -2423,6 +2649,112 @@ mod tests {
                 .any(|row| matches!(row, BrowserRow::Playlist { playlist_index: 0 }))
         );
         assert_eq!(app.library_selection, 3, "the first track starts selected");
+    }
+
+    #[test]
+    fn folder_activation_hides_descendants_without_hiding_search_results() {
+        let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+        let expanded_rows = app.library_row_count();
+        app.library_selection = (0..expanded_rows)
+            .position(|position| {
+                matches!(
+                    app.library_row(position),
+                    Some(BrowserRow::Folder {
+                        entry_index: 0,
+                        component_index: 1,
+                        ..
+                    })
+                )
+            })
+            .expect("fixture JDR folder is visible");
+
+        app.apply(AppAction::Activate);
+
+        assert_eq!(app.library_row_count(), expanded_rows - 2);
+        assert_eq!(app.status_message, "Folder collapsed");
+
+        app.apply(AppAction::SearchOpen);
+        for character in "Night".chars() {
+            app.key(key(KeyCode::Char(character)), Duration::ZERO);
+        }
+        assert!(
+            (0..app.library_row_count()).any(|position| {
+                matches!(
+                    app.library_row(position),
+                    Some(BrowserRow::Track { entry_index: 0, .. })
+                )
+            }),
+            "search ignores temporary folder presentation state"
+        );
+
+        app.key(key(KeyCode::Esc), Duration::ZERO);
+        assert_eq!(app.library_row_count(), expanded_rows - 2);
+        app.apply(AppAction::Activate);
+        assert_eq!(app.library_row_count(), expanded_rows);
+        assert_eq!(app.status_message, "Folder expanded");
+    }
+
+    #[test]
+    fn nested_folder_collapse_survives_parent_toggle() {
+        let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+        let expanded_rows = app.library_row_count();
+        app.library_selection = (0..expanded_rows)
+            .position(|position| {
+                matches!(
+                    app.library_row(position),
+                    Some(BrowserRow::Folder {
+                        entry_index: 0,
+                        component_index: 2,
+                        ..
+                    })
+                )
+            })
+            .expect("fixture campaign folder is visible");
+        app.apply(AppAction::Activate);
+        assert_eq!(app.library_row_count(), expanded_rows - 1);
+
+        app.library_selection = (0..app.library_row_count())
+            .position(|position| {
+                matches!(
+                    app.library_row(position),
+                    Some(BrowserRow::Folder {
+                        entry_index: 0,
+                        component_index: 1,
+                        ..
+                    })
+                )
+            })
+            .expect("fixture JDR folder is visible");
+        app.apply(AppAction::Activate);
+        app.apply(AppAction::Activate);
+
+        assert_eq!(app.library_row_count(), expanded_rows - 1);
+        let campaign_position = (0..app.library_row_count())
+            .position(|position| {
+                matches!(
+                    app.library_row(position),
+                    Some(BrowserRow::Folder {
+                        entry_index: 0,
+                        component_index: 2,
+                        collapsed: true,
+                        ..
+                    })
+                )
+            })
+            .expect("collapsed campaign folder is visible again");
+        assert!(
+            !(0..app.library_row_count()).any(|position| {
+                matches!(
+                    app.library_row(position),
+                    Some(BrowserRow::Track { entry_index: 0, .. })
+                )
+            }),
+            "expanding a parent preserves its child's collapsed state"
+        );
+
+        app.library_selection = campaign_position;
+        app.apply(AppAction::Activate);
+        assert_eq!(app.library_row_count(), expanded_rows);
     }
 
     #[test]
@@ -2534,11 +2866,16 @@ mod tests {
     #[test]
     fn activating_a_playlist_queues_its_tracks_as_one_mutation() {
         let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
-        app.library_selection = app
-            .browser_rows
-            .iter()
-            .position(|row| matches!(row, BrowserRow::Playlist { playlist_index: 0 }))
-            .expect("fixture playlist has a browser row");
+        app.library_selection = 1;
+        app.apply(AppAction::Activate);
+        app.library_selection = (0..app.library_row_count())
+            .position(|position| {
+                matches!(
+                    app.library_row(position),
+                    Some(BrowserRow::Playlist { playlist_index: 0 })
+                )
+            })
+            .expect("fixture playlist remains visible after collapsing an earlier folder");
 
         let start = app.apply(AppAction::Activate);
 
@@ -2550,20 +2887,88 @@ mod tests {
             matches!(start, Some(PlaybackIntent::Load { item, .. }) if item.entry_id == TrackEntryId(40))
         );
         assert_eq!(app.status_message, "Loading: Night Song");
+        app.advance_time(Duration::from_secs(30));
+        assert_eq!(
+            app.status_message, "Loading: Night Song",
+            "the current loading state is not a transient action notice"
+        );
 
         let mut config = Config::default();
         config.queue.max_items = 1;
         config.queue.max_bytes = 32;
         let mut limited = AppState::new(&config, fixture_index()).expect("limited app state");
-        limited.library_selection = limited
-            .browser_rows
-            .iter()
-            .position(|row| matches!(row, BrowserRow::Playlist { playlist_index: 0 }))
-            .expect("fixture playlist has a browser row");
+        limited.library_selection = (0..limited.library_row_count())
+            .position(|position| {
+                matches!(
+                    limited.library_row(position),
+                    Some(BrowserRow::Playlist { playlist_index: 0 })
+                )
+            })
+            .expect("fixture playlist has a visible browser row");
         limited.apply(AppAction::Activate);
         assert!(limited.queue.is_empty(), "a rejected playlist stays atomic");
         assert_eq!(limited.queue_generation, 0);
         assert_eq!(limited.status_message, "Queue limit reached");
+        select_entry(&mut limited, 0);
+        limited.apply(AppAction::Activate);
+        assert_eq!(
+            limited.queue.len(),
+            1,
+            "a capacity rejection rolls back playlist asset marks"
+        );
+    }
+
+    #[test]
+    fn duplicate_audio_activation_does_not_mutate_the_queue() {
+        let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+        select_entry(&mut app, 0);
+        app.apply(AppAction::Activate);
+        select_entry(&mut app, 2);
+
+        let duplicate = app.apply(AppAction::Activate);
+
+        assert!(duplicate.is_none());
+        assert_eq!(app.queue.len(), 1);
+        assert_eq!(app.queue_generation, 1);
+        assert_eq!(app.status_message, "Audio already in Queue");
+
+        app.focus = Focus::Queue;
+        app.apply(AppAction::QueueRemove);
+        app.focus = Focus::Library;
+        select_entry(&mut app, 2);
+        app.apply(AppAction::Activate);
+        assert_eq!(app.queue.len(), 1, "removed audio can be queued again");
+        assert_eq!(app.queue[0].entry_id, TrackEntryId(40));
+    }
+
+    #[test]
+    fn playlist_with_queued_audio_is_rejected_atomically() {
+        let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+        select_entry(&mut app, 1);
+        app.apply(AppAction::Activate);
+        app.library_selection = (0..app.library_row_count())
+            .position(|position| {
+                matches!(
+                    app.library_row(position),
+                    Some(BrowserRow::Playlist { playlist_index: 0 })
+                )
+            })
+            .expect("fixture playlist has a visible browser row");
+
+        let duplicate = app.apply(AppAction::Activate);
+
+        assert!(duplicate.is_none());
+        assert_eq!(app.queue.len(), 1);
+        assert_eq!(app.queue_generation, 1);
+        assert_eq!(app.status_message, "Audio already in Queue");
+
+        select_entry(&mut app, 0);
+        app.apply(AppAction::Activate);
+        assert_eq!(
+            app.queue.len(),
+            2,
+            "playlist preflight rolls back its marks"
+        );
     }
 
     #[test]
@@ -2571,7 +2976,8 @@ mod tests {
         let mut config = Config::default();
         config.queue.max_items = 2;
         config.queue.max_bytes = 64;
-        let mut app = AppState::new(&config, fixture_index()).expect("app state");
+        let mut app = AppState::new(&config, fixture_index_with_distinct_context_assets())
+            .expect("app state");
 
         select_entry(&mut app, 0);
         app.apply(AppAction::Activate);
@@ -2774,6 +3180,37 @@ mod tests {
                 muted: true,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn enter_toggles_playback_outside_the_library() {
+        let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+        select_entry(&mut app, 0);
+        app.apply(AppAction::Activate)
+            .expect("idle activation starts playback");
+        app.audio_event(AudioEvent::Started {
+            generation: 1,
+            timeline_revision: 1,
+            format: AudioFormat {
+                sample_rate: 48_000,
+                channels: 2,
+            },
+            duration: Some(Duration::from_secs(30)),
+            position: Duration::ZERO,
+        });
+
+        app.focus = Focus::Player;
+        assert!(matches!(
+            app.apply(AppAction::Activate),
+            Some(PlaybackIntent::Pause { generation: 1 })
+        ));
+        app.audio_event(AudioEvent::Paused { generation: 1 });
+
+        app.focus = Focus::Queue;
+        assert!(matches!(
+            app.apply(AppAction::Activate),
+            Some(PlaybackIntent::Resume { generation: 1 })
         ));
     }
 
@@ -3158,12 +3595,15 @@ mod tests {
                 .iter()
                 .map(|item| item.entry_id)
                 .collect::<Vec<_>>(),
-            [TrackEntryId(10), TrackEntryId(20), TrackEntryId(10)]
+            [TrackEntryId(10), TrackEntryId(20)]
         );
         assert_eq!(app.queue_selection, 1);
         assert_eq!(app.playback_status, PlaybackStatus::Stopped);
         assert_eq!(app.playback_position(), Duration::from_millis(123_400));
-        assert!(app.status_message.contains("1 missing track"));
+        assert!(
+            app.status_message
+                .contains("2 unavailable or duplicate tracks skipped")
+        );
 
         assert!(matches!(
             app.apply(AppAction::PlayPause),
@@ -3260,7 +3700,11 @@ mod tests {
 
     #[test]
     fn queue_edits_preserve_the_played_shuffle_prefix() {
-        let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+        let mut app = AppState::new(
+            &Config::default(),
+            fixture_index_with_distinct_context_assets(),
+        )
+        .expect("app state");
         app.shuffle_seed = 1;
         for entry_index in 0..3 {
             select_entry(&mut app, entry_index);

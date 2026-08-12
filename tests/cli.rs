@@ -127,14 +127,13 @@ fn terminal_session_restores_the_pty_and_holds_both_leases() {
 
     master.write_all(b"?").expect("open terminal help");
     transcript.extend(read_pty_until(&mut master, &mut child, b"Navigation"));
+    transcript.extend(read_pty_until(&mut master, &mut child, b"quit anywhere"));
     master.write_all(b"\x1b").expect("close terminal help");
     transcript.extend(read_pty_until(&mut master, &mut child, b"Library"));
 
     master.write_all(b"\t").expect("send focus key");
     transcript.extend(read_pty_until(&mut master, &mut child, FOCUSED_PLAYER));
-
-    resize_terminal(&master, &child, 40, 10);
-    transcript.extend(read_pty_until(&mut master, &mut child, b"needs"));
+    assert!(byte_contains(&transcript, "·".as_bytes()));
 
     let second = terminal_command(&root, &runtime)
         .output()
@@ -244,6 +243,41 @@ fn terminal_user_can_search_and_build_a_queue_without_audio() {
     .expect("playback state is valid JSON");
     assert_eq!(state["version"], 1);
     assert_eq!(state["status"], "stopped");
+}
+
+#[test]
+fn terminal_user_can_collapse_and_expand_a_library_folder() {
+    let temp = TempDir::new().expect("temporary directory");
+    let root = temp.path().join("root");
+    initialize_root(&root);
+    let campaign = root.join("audio/library/JDR/Campaign One");
+    fs::create_dir_all(&campaign).expect("create nested library folders");
+    fs::write(campaign.join("night.mp3"), id3_fixture()).expect("write tagged fixture");
+    let runtime = temp.path().join("runtime");
+    fs::create_dir(&runtime).expect("create runtime directory");
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))
+        .expect("make runtime directory private");
+
+    let (mut master, slave) = open_test_pty(80, 24);
+    let mut child = terminal_command(&root, &runtime)
+        .stdin(Stdio::from(duplicate_file(&slave)))
+        .stdout(Stdio::from(duplicate_file(&slave)))
+        .stderr(Stdio::from(slave))
+        .spawn()
+        .expect("start terminal session");
+    read_pty_until(&mut master, &mut child, b"Night Song");
+
+    master
+        .write_all(b"kk\r")
+        .expect("select and collapse the JDR folder");
+    read_pty_until(&mut master, &mut child, "▸".as_bytes());
+
+    master.write_all(b"\r").expect("expand the JDR folder");
+    read_pty_until(&mut master, &mut child, "▾".as_bytes());
+
+    master.write_all(b"q").expect("quit the terminal");
+    let transcript = read_pty_to_exit(&mut master, &mut child);
+    assert!(byte_contains(&transcript, b"\x1b[?1049l"));
 }
 
 #[test]

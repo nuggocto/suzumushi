@@ -10,7 +10,7 @@ expression: "rendered(&app, 80, 24, Duration::ZERO)"
 │                                                                              │
 │Library and search                                                            │
 │  /                     search artist, title, filename, and path              │
-│  Enter                 add the selection and play when idle                  │
+│  Enter                 toggle folders; add tracks or playlists               │
 │  Esc                   close search                                          │
 │                                                                              │
 │Queue                                                                         │
@@ -18,8 +18,8 @@ expression: "rendered(&app, 80, 24, Duration::ZERO)"
 │  d or Delete           remove item    c clear Queue                          │
 │                                                                              │
 │Playback                                                                      │
-│  Space                 play or pause    s stop                               │
-│  n or p                 next or previous                                     │
+│  Space or Enter outside Library  play or pause                               │
+│  s                     stop    p previous    n next                          │
 │  Left or Right          seek back or forward five seconds                    │
 │  - or +                 volume down or up    m mute                          │
 │  x                     shuffle    r repeat                                   │

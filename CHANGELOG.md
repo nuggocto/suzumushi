@@ -9,11 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added session-only Library folder collapse without hiding search results or
+  changing the Queue or playback.
 - Prepared the `suzumushi-bin` AUR recipe from the exact published
   release-candidate checksum.
 
+### Changed
+
+- Aligned the Library, Player, and Queue panel titles to the top-left edge.
+- Made `Enter` play or pause outside Library and separated footer bindings with
+  calm middle dots, with distinct `p` previous and `n` next labels.
+
 ### Fixed
 
+- Prevented the same underlying audio asset from being added to the Queue more
+  than once while keeping playlist insertion atomic.
+- Cleared transient informational footer notices after three seconds while
+  keeping warnings and errors visible.
 - Made release publication read annotated notes from GitHub without checking
   executable source into the write-capable job.
 - Updated artifact transfer actions to their pinned Node 24 releases.
