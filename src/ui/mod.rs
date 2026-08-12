@@ -124,7 +124,7 @@ fn render_player(frame: &mut Frame<'_>, area: Rect, app: &AppState, animation_ti
         animation_time,
         app.color_mode,
     ));
-    content.push(Line::default());
+    content.push(spectrum_line(app));
     content.push(Line::from(timeline));
     content.push(Line::default());
     content.push(Line::styled(
@@ -153,6 +153,27 @@ fn render_player(frame: &mut Frame<'_>, area: Rect, app: &AppState, animation_ti
             .block(panel_block("Player", Focus::Player, app)),
         area,
     );
+}
+
+fn spectrum_line(app: &AppState) -> Line<'static> {
+    const GLYPHS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    if app.playback_status != PlaybackStatus::Playing {
+        return Line::default();
+    }
+    let levels = app.audio_spectrum_levels();
+    let mut bars = String::with_capacity(levels.len().saturating_mul(4));
+    for (index, level) in levels.into_iter().enumerate() {
+        if index != 0 {
+            bars.push(' ');
+        }
+        bars.push(GLYPHS[usize::from(level)]);
+    }
+    let style = if app.color_mode == ColorMode::Terminal {
+        Style::default().fg(Color::Green)
+    } else {
+        Style::default()
+    };
+    Line::styled(bars, style)
 }
 
 fn player_timeline(
@@ -388,6 +409,7 @@ mod tests {
     use ratatui::style::Modifier;
 
     use crate::app::AppState;
+    use crate::audio::AudioSpectrum;
     use crate::config::Config;
     use crate::model::{ScanCounters, ScanIndex};
 
@@ -499,6 +521,28 @@ mod tests {
         let paused = rendered(&app, 80, 24, Duration::from_millis(200));
         assert!(paused.contains("▐▀• •▀▌"), "{paused}");
         assert!(!paused.contains("▐▀^ ^▀▌"), "{paused}");
+    }
+
+    #[test]
+    fn player_spectrum_moves_only_while_audio_is_playing() {
+        let mut app = AppState::new(&Config::default(), empty_index()).expect("app state");
+        app.playback_status = crate::app::PlaybackStatus::Playing;
+        app.audio_spectrum(AudioSpectrum::new([
+            0, 1, 2, 3, 4, 5, 6, 7, 7, 6, 5, 4, 3, 2, 1, 0,
+        ]));
+
+        let playing = rendered(&app, 80, 24, Duration::ZERO);
+        assert!(
+            playing.contains("▁ ▂ ▃ ▄ ▅ ▆ ▇ █ █ ▇ ▆ ▅ ▄ ▃ ▂ ▁"),
+            "{playing}"
+        );
+
+        app.playback_status = crate::app::PlaybackStatus::Paused;
+        let paused = rendered(&app, 80, 24, Duration::ZERO);
+        assert!(
+            !paused.contains("▁ ▂ ▃ ▄ ▅ ▆ ▇ █ █ ▇ ▆ ▅ ▄ ▃ ▂ ▁"),
+            "{paused}"
+        );
     }
 
     #[test]

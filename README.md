@@ -6,7 +6,8 @@ account, database, streaming service, or network access.
 
 The interface has three panels: Library, Player, and Queue. It follows the
 terminal's own colors and stays out of the way. Suzu, the small bell-cricket
-mascot, dances in the Player while audio is playing and rests when it is not.
+mascot, dances in the Player while a compact live spectrum follows the sound.
+Suzu rests and the spectrum falls quiet when playback pauses or stops.
 
 ## Install on Arch Linux
 
@@ -24,20 +25,20 @@ The verified archive below remains available for direct installation.
 
 The verified binary archive is built for 64-bit GNU/Linux. Download the archive
 and `SHA256SUMS` from the
-[`v1.0.0` release](https://github.com/nuggocto/suzumushi/releases/tag/v1.0.0),
+[`v1.0.1` release](https://github.com/nuggocto/suzumushi/releases/tag/v1.0.1),
 either in your browser or with:
 
 ```sh
 curl -fLO \
-  'https://github.com/nuggocto/suzumushi/releases/download/v1.0.0/{SHA256SUMS,suzumushi-v1.0.0-x86_64-unknown-linux-gnu.tar.xz}'
+  'https://github.com/nuggocto/suzumushi/releases/download/v1.0.1/{SHA256SUMS,suzumushi-v1.0.1-x86_64-unknown-linux-gnu.tar.xz}'
 ```
 
 Then verify and install the downloaded archive:
 
 ```sh
 sha256sum --check --ignore-missing SHA256SUMS
-tar -xf suzumushi-v1.0.0-x86_64-unknown-linux-gnu.tar.xz
-cd suzumushi-v1.0.0-x86_64-unknown-linux-gnu
+tar -xf suzumushi-v1.0.1-x86_64-unknown-linux-gnu.tar.xz
+cd suzumushi-v1.0.1-x86_64-unknown-linux-gnu
 sudo install -Dm755 suzumushi /usr/local/bin/suzumushi
 sudo ln -s suzumushi /usr/local/bin/suzu
 ```
@@ -176,7 +177,7 @@ automatic resampling are not current support claims.
 
 ## Status
 
-Version `1.0.0` is the current stable release. Its tag-driven Linux archive is
+Version `1.0.1` is the current stable release. Its tag-driven Linux archive is
 fully verified before GitHub publishes it. Arch users can install the matching
 `suzumushi-bin` package from AUR.
 

@@ -12,6 +12,7 @@ use cpal::{
 };
 use rtrb::{Consumer, Producer, RingBuffer};
 
+use super::spectrum::{SpectrumAnalyzer, SpectrumLane};
 use super::{AudioFormat, OutputStream};
 
 const PCM_RING_SAMPLES: usize = 262_144;
@@ -28,12 +29,13 @@ pub(super) struct CpalOutput {
     consumed: Arc<AtomicU64>,
     failure: Arc<AtomicU8>,
     gain: Arc<AtomicU32>,
+    spectrum: Arc<SpectrumLane>,
     written: u64,
     stream_active: bool,
 }
 
 impl CpalOutput {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(spectrum: Arc<SpectrumLane>) -> Self {
         Self {
             source: None,
             output_channels: 0,
@@ -42,6 +44,7 @@ impl CpalOutput {
             consumed: Arc::new(AtomicU64::new(0)),
             failure: Arc::new(AtomicU8::new(0)),
             gain: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
+            spectrum,
             written: 0,
             stream_active: false,
         }
@@ -92,17 +95,22 @@ impl OutputStream for CpalOutput {
         self.failure.store(0, Ordering::Release);
         self.written = 0;
         self.stream_active = false;
+        self.spectrum.clear();
         let frames_read = Arc::clone(&self.consumed);
         let failure = Arc::clone(&self.failure);
         let gain = Arc::clone(&self.gain);
+        let spectrum = Arc::clone(&self.spectrum);
         let stream = build_stream(
             &device,
             &config,
             sample_format,
             pcm_reader,
-            frames_read,
-            failure,
-            gain,
+            CallbackState {
+                frames_read,
+                failure,
+                gain,
+                spectrum,
+            },
         )?;
         self.source = Some(source);
         self.producer = Some(producer);
@@ -187,6 +195,7 @@ impl OutputStream for CpalOutput {
 
     fn pause(&mut self) -> Result<(), String> {
         if !self.stream_active {
+            self.spectrum.clear();
             return Ok(());
         }
         self.stream
@@ -195,6 +204,7 @@ impl OutputStream for CpalOutput {
             .pause()
             .map_err(|error| format!("cannot pause the audio output stream: {error}"))?;
         self.stream_active = false;
+        self.spectrum.clear();
         Ok(())
     }
 
@@ -208,6 +218,7 @@ impl OutputStream for CpalOutput {
         self.producer.take();
         self.source = None;
         self.stream_active = false;
+        self.spectrum.clear();
         pause_error.map_or(Ok(()), Err)
     }
 
@@ -234,75 +245,69 @@ fn build_stream(
     config: &StreamConfig,
     format: SampleFormat,
     pcm_reader: Consumer<f32>,
+    callback: CallbackState,
+) -> Result<Stream, String> {
+    match format {
+        SampleFormat::I8 => typed_stream::<i8>(device, config, pcm_reader, callback),
+        SampleFormat::I16 => typed_stream::<i16>(device, config, pcm_reader, callback),
+        SampleFormat::I24 => typed_stream::<I24>(device, config, pcm_reader, callback),
+        SampleFormat::I32 => typed_stream::<i32>(device, config, pcm_reader, callback),
+        SampleFormat::I64 => typed_stream::<i64>(device, config, pcm_reader, callback),
+        SampleFormat::U8 => typed_stream::<u8>(device, config, pcm_reader, callback),
+        SampleFormat::U16 => typed_stream::<u16>(device, config, pcm_reader, callback),
+        SampleFormat::U24 => typed_stream::<U24>(device, config, pcm_reader, callback),
+        SampleFormat::U32 => typed_stream::<u32>(device, config, pcm_reader, callback),
+        SampleFormat::U64 => typed_stream::<u64>(device, config, pcm_reader, callback),
+        SampleFormat::F32 => typed_stream::<f32>(device, config, pcm_reader, callback),
+        SampleFormat::F64 => typed_stream::<f64>(device, config, pcm_reader, callback),
+        _ => Err(format!("unsupported output sample format {format}")),
+    }
+}
+
+struct CallbackState {
     frames_read: Arc<AtomicU64>,
     failure: Arc<AtomicU8>,
     gain: Arc<AtomicU32>,
-) -> Result<Stream, String> {
-    match format {
-        SampleFormat::I8 => {
-            typed_stream::<i8>(device, config, pcm_reader, frames_read, failure, gain)
-        }
-        SampleFormat::I16 => {
-            typed_stream::<i16>(device, config, pcm_reader, frames_read, failure, gain)
-        }
-        SampleFormat::I24 => {
-            typed_stream::<I24>(device, config, pcm_reader, frames_read, failure, gain)
-        }
-        SampleFormat::I32 => {
-            typed_stream::<i32>(device, config, pcm_reader, frames_read, failure, gain)
-        }
-        SampleFormat::I64 => {
-            typed_stream::<i64>(device, config, pcm_reader, frames_read, failure, gain)
-        }
-        SampleFormat::U8 => {
-            typed_stream::<u8>(device, config, pcm_reader, frames_read, failure, gain)
-        }
-        SampleFormat::U16 => {
-            typed_stream::<u16>(device, config, pcm_reader, frames_read, failure, gain)
-        }
-        SampleFormat::U24 => {
-            typed_stream::<U24>(device, config, pcm_reader, frames_read, failure, gain)
-        }
-        SampleFormat::U32 => {
-            typed_stream::<u32>(device, config, pcm_reader, frames_read, failure, gain)
-        }
-        SampleFormat::U64 => {
-            typed_stream::<u64>(device, config, pcm_reader, frames_read, failure, gain)
-        }
-        SampleFormat::F32 => {
-            typed_stream::<f32>(device, config, pcm_reader, frames_read, failure, gain)
-        }
-        SampleFormat::F64 => {
-            typed_stream::<f64>(device, config, pcm_reader, frames_read, failure, gain)
-        }
-        _ => Err(format!("unsupported output sample format {format}")),
-    }
+    spectrum: Arc<SpectrumLane>,
 }
 
 fn typed_stream<T>(
     device: &Device,
     config: &StreamConfig,
     mut pcm_reader: Consumer<f32>,
-    frames_read: Arc<AtomicU64>,
-    failure: Arc<AtomicU8>,
-    gain: Arc<AtomicU32>,
+    callback: CallbackState,
 ) -> Result<Stream, String>
 where
     T: SizedSample + FromSample<f32>,
 {
+    let CallbackState {
+        frames_read,
+        failure,
+        gain,
+        spectrum,
+    } = callback;
+    let mut analyzer = SpectrumAnalyzer::new(config.sample_rate, config.channels);
     device
         .build_output_stream(
             *config,
             move |output: &mut [T], _: &OutputCallbackInfo| {
                 let mut read = 0_u64;
                 let gain = f32::from_bits(gain.load(Ordering::Relaxed));
+                let mut published = None;
                 for sample in output {
-                    if let Ok(value) = pcm_reader.pop() {
-                        *sample = T::from_sample(finite_or_silence(value * gain));
+                    let value = if let Ok(value) = pcm_reader.pop() {
                         read += 1;
+                        finite_or_silence(value * gain)
                     } else {
-                        *sample = T::from_sample(0.0);
+                        0.0
+                    };
+                    *sample = T::from_sample(value);
+                    if let Some(levels) = analyzer.push_interleaved(value) {
+                        published = Some(levels);
                     }
+                }
+                if let Some(levels) = published {
+                    spectrum.publish(levels);
                 }
                 frames_read.fetch_add(read, Ordering::Release);
             },
@@ -342,14 +347,21 @@ fn finite_or_silence(sample: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{CpalOutput, OutputStream};
+    use std::sync::Arc;
+
+    use crate::audio::{AudioSpectrum, SPECTRUM_BANDS};
+
+    use super::{CpalOutput, OutputStream, SpectrumLane};
 
     #[test]
-    fn inactive_stream_lifecycle_is_idempotent() {
-        let mut output = CpalOutput::new();
+    fn inactive_pause_clears_spectrum_and_remains_idempotent() {
+        let spectrum = Arc::new(SpectrumLane::default());
+        spectrum.publish(AudioSpectrum::new([5; SPECTRUM_BANDS]));
+        let mut output = CpalOutput::new(Arc::clone(&spectrum));
         output
             .pause()
             .expect("an inactive stream is already paused");
+        assert_eq!(spectrum.latest(), AudioSpectrum::default());
         output.stop().expect("an inactive stream stops cleanly");
     }
 }

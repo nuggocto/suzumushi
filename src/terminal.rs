@@ -314,6 +314,7 @@ fn drain_audio_events(
     root: BorrowedFd<'_>,
     audio: &AudioRuntime,
 ) -> AppResult<()> {
+    app.audio_spectrum(audio.spectrum());
     while let Some(position) = audio.try_position()? {
         app.audio_position(position);
     }

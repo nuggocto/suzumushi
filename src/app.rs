@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::audio::{AudioEvent, AudioFormat, AudioPosition, PlaybackSettings};
+use crate::audio::{AudioEvent, AudioFormat, AudioPosition, AudioSpectrum, PlaybackSettings};
 use crate::config::{Config, UI_STATE_SCRATCH_BYTES};
 use crate::display::{bounded_text, terminal_safe};
 use crate::errors::{AppError, AppResult};
@@ -196,6 +196,7 @@ struct PlaybackState {
     position: Duration,
     duration: Option<Duration>,
     start_paused: bool,
+    spectrum: AudioSpectrum,
 }
 
 impl PlaybackState {
@@ -209,6 +210,7 @@ impl PlaybackState {
             position: Duration::ZERO,
             duration: None,
             start_paused: false,
+            spectrum: AudioSpectrum::silent(),
         }
     }
 }
@@ -602,6 +604,15 @@ impl AppState {
     }
 
     #[must_use]
+    pub(crate) const fn audio_spectrum_levels(&self) -> [u8; crate::audio::SPECTRUM_BANDS] {
+        self.playback.spectrum.levels()
+    }
+
+    pub(crate) fn audio_spectrum(&mut self, spectrum: AudioSpectrum) {
+        self.playback.spectrum = spectrum;
+    }
+
+    #[must_use]
     pub(crate) fn queue_position(&self) -> Option<usize> {
         self.current_queue_index().map(|index| index + 1)
     }
@@ -827,6 +838,7 @@ impl AppState {
                 self.playback.seek_target = None;
                 self.playback.format = Some(format);
                 self.playback.duration = duration;
+                self.playback.spectrum = AudioSpectrum::default();
                 self.apply_event_position(timeline_revision, position);
                 self.set_status(if status == PlaybackStatus::Paused {
                     "Paused"
@@ -1274,6 +1286,7 @@ impl AppState {
         self.playback.position = position;
         self.playback.duration = None;
         self.playback.start_paused = paused;
+        self.playback.spectrum = AudioSpectrum::default();
         self.set_playback_status(PlaybackStatus::Loading);
         let title = self.queue_item_title(item, self.status_text_max_bytes);
         self.set_persistent_status(&format!("Loading: {title}"));
@@ -1311,6 +1324,7 @@ impl AppState {
         self.playback.position = Duration::ZERO;
         self.playback.duration = None;
         self.playback.start_paused = false;
+        self.playback.spectrum = AudioSpectrum::default();
         self.set_playback_status(PlaybackStatus::Stopped);
         let title = self.queue_item_title(item, self.status_text_max_bytes);
         self.set_status(&format!("Selected: {title}"));

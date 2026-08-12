@@ -7,14 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-08-12
+
 ### Added
 
-- Published the verified `suzumushi-bin` package to AUR for Arch Linux.
+- Added a compact, dependency-free 16-band spectrum to the Player that follows
+  the played PCM and clears cleanly on pause or stop.
+
+### Fixed
+
+- Preserved the visible energy of stereo-width and opposite-polarity audio by
+  combining independently filtered channel energy instead of averaging the
+  stereo waveforms before analysis.
 
 ## [1.0.0] - 2026-08-12
 
 ### Added
 
+- Published the verified `suzumushi-bin` package to AUR for Arch Linux.
 - Added session-only Library folder collapse without hiding search results or
   changing the Queue or playback.
 

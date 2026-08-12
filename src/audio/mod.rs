@@ -5,6 +5,7 @@
 mod decoder;
 mod file;
 mod output;
+mod spectrum;
 
 use std::fs::File;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
@@ -15,6 +16,8 @@ use std::time::Duration;
 use crate::errors::{AppError, AppResult};
 
 pub(crate) use file::open_verified_media;
+use spectrum::SpectrumLane;
+pub(crate) use spectrum::{AudioSpectrum, SPECTRUM_BANDS};
 
 /// Runs the isolated decoder entry point selected by the hidden CLI command.
 #[must_use]
@@ -134,6 +137,7 @@ pub struct AudioRuntime {
     seeks: Option<Arc<SeekLane>>,
     events: Option<Receiver<AudioEvent>>,
     positions: Option<Arc<PositionLane>>,
+    spectrum: Option<Arc<SpectrumLane>>,
     worker: Option<JoinHandle<AppResult<()>>>,
 }
 
@@ -150,6 +154,8 @@ impl AudioRuntime {
         let worker_seeks = Arc::clone(&seeks);
         let positions = Arc::new(PositionLane::default());
         let worker_positions = Arc::clone(&positions);
+        let spectrum = Arc::new(SpectrumLane::default());
+        let worker_spectrum = Arc::clone(&spectrum);
         let worker = thread::Builder::new()
             .name("suzumushi-audio".into())
             .spawn(move || {
@@ -158,7 +164,9 @@ impl AudioRuntime {
                     &worker_seeks,
                     &event_tx,
                     &worker_positions,
-                    ProductionBackend,
+                    ProductionBackend {
+                        spectrum: worker_spectrum,
+                    },
                 );
                 worker_seeks.close();
                 result
@@ -169,6 +177,7 @@ impl AudioRuntime {
             seeks: Some(seeks),
             events: Some(event_rx),
             positions: Some(positions),
+            spectrum: Some(spectrum),
             worker: Some(worker),
         })
     }
@@ -241,6 +250,13 @@ impl AudioRuntime {
             .take())
     }
 
+    /// Returns the newest lock-free spectrum snapshot without blocking.
+    pub(crate) fn spectrum(&self) -> AudioSpectrum {
+        self.spectrum
+            .as_ref()
+            .map_or_else(AudioSpectrum::default, |spectrum| spectrum.latest())
+    }
+
     /// Cancels active playback and awaits every owned thread and helper.
     ///
     /// # Errors
@@ -260,6 +276,7 @@ impl AudioRuntime {
         }
         self.events.take();
         self.positions.take();
+        self.spectrum.take();
         let Some(worker) = self.worker.take() else {
             return Ok(());
         };
@@ -388,13 +405,15 @@ trait Backend: Send {
     fn open(&mut self, file: &File, position: Duration) -> Result<PlaybackParts, String>;
 }
 
-struct ProductionBackend;
+struct ProductionBackend {
+    spectrum: Arc<SpectrumLane>,
+}
 
 impl Backend for ProductionBackend {
     fn open(&mut self, file: &File, position: Duration) -> Result<PlaybackParts, String> {
         Ok((
             Box::new(decoder::HelperDecoder::start(file, position)?),
-            Box::new(output::CpalOutput::new()),
+            Box::new(output::CpalOutput::new(Arc::clone(&self.spectrum))),
         ))
     }
 }
@@ -1252,6 +1271,7 @@ mod tests {
             seeks: Some(Arc::clone(&seeks)),
             events: None,
             positions: None,
+            spectrum: None,
             worker: None,
         };
 
