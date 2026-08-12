@@ -180,5 +180,5 @@ Version `1.0.0` is the current stable release. Its tag-driven Linux archive is
 fully verified before GitHub publishes it. Arch users can install the matching
 `suzumushi-bin` package from AUR.
 
-The full contract and roadmap live in [PROJECT.md](PROJECT.md). Release and AUR
-maintenance details live in [docs/release.md](docs/release.md).
+Release and AUR maintenance details live in
+[docs/release.md](docs/release.md).
