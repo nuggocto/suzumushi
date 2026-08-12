@@ -6,7 +6,7 @@ use std::borrow::Cow;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsFd;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -14,7 +14,8 @@ use lofty::config::ParseOptions;
 use lofty::file::TaggedFileExt;
 use lofty::probe::Probe;
 use lofty::tag::{Accessor, ItemKey};
-use rustix::process::{Resource, Rlimit, setrlimit};
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
+use rustix::process::{Pid, PidfdFlags, Resource, Rlimit, pidfd_open, setrlimit};
 use serde::{Deserialize, Serialize};
 
 use crate::errors::{AppError, AppResult};
@@ -85,23 +86,17 @@ fn run_helper(mut command: Command, file: &File, timeout: Duration) -> AppResult
         stdout.take(65_537).read_to_end(&mut bytes).map(|_| bytes)
     });
 
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
-            Ok(None) => {
-                terminate_and_reap(&mut child, reader)?;
-                return Err(AppError::MetadataHelper(
-                    "helper timed out and was killed and reaped".into(),
-                ));
-            }
-            Err(error) => {
-                terminate_and_reap(&mut child, reader)?;
-                return Err(AppError::MetadataHelper(format!(
-                    "cannot wait for helper: {error}"
-                )));
-            }
+    let status = match wait_for_exit(&mut child, timeout) {
+        Ok(Some(status)) => status,
+        Ok(None) => {
+            terminate_and_reap(&mut child, reader)?;
+            return Err(AppError::MetadataHelper(
+                "helper timed out and was killed and reaped".into(),
+            ));
+        }
+        Err(error) => {
+            terminate_and_reap(&mut child, reader)?;
+            return Err(error);
         }
     };
     let output = reader
@@ -119,6 +114,68 @@ fn run_helper(mut command: Command, file: &File, timeout: Duration) -> AppResult
         )));
     }
     parse_reply(&output)
+}
+
+fn wait_for_exit(child: &mut Child, timeout: Duration) -> AppResult<Option<ExitStatus>> {
+    // pidfds arrived in Linux 5.3 and may also be blocked by a sandbox policy.
+    let Ok(pidfd) = pidfd_open(Pid::from_child(child), PidfdFlags::empty()) else {
+        return wait_for_exit_with_sleep(child, timeout);
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(Some(status)),
+            Ok(None) => {}
+            Err(error) => {
+                return Err(AppError::MetadataHelper(format!(
+                    "cannot wait for helper: {error}"
+                )));
+            }
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        let timeout = Timespec {
+            tv_sec: i64::try_from(remaining.as_secs()).unwrap_or(i64::MAX),
+            tv_nsec: i64::from(remaining.subsec_nanos()),
+        };
+        let mut descriptor = [PollFd::new(&pidfd, PollFlags::IN)];
+        match poll(&mut descriptor, Some(&timeout)) {
+            Ok(0) => return Ok(None),
+            Ok(_) => {
+                return child.wait().map(Some).map_err(|error| {
+                    AppError::MetadataHelper(format!("cannot reap helper: {error}"))
+                });
+            }
+            Err(rustix::io::Errno::INTR) => {}
+            Err(error) => {
+                return Err(AppError::MetadataHelper(format!(
+                    "cannot poll helper process: {error}"
+                )));
+            }
+        }
+    }
+}
+
+fn wait_for_exit_with_sleep(child: &mut Child, timeout: Duration) -> AppResult<Option<ExitStatus>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(Some(status)),
+            Ok(None) => {}
+            Err(error) => {
+                return Err(AppError::MetadataHelper(format!(
+                    "cannot wait for helper: {error}"
+                )));
+            }
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        thread::sleep(remaining.min(Duration::from_millis(5)));
+    }
 }
 
 fn terminate_and_reap(

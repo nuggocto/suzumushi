@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Limited CI to pull requests and `shrek` pushes, cancelled superseded runs,
+  and reused pruned Rust dependency builds from the default branch without
+  caching workspace or incremental artifacts.
+- Replaced metadata-helper sleep polling with Linux process-descriptor
+  notification while retaining bounded cleanup and a compatibility fallback.
+- Reduced release binary size with ThinLTO, one code-generation unit, and
+  symbol stripping while preserving panic unwinding.
+
 ## [1.0.1] - 2026-08-12
 
 ### Added
