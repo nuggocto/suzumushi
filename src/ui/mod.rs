@@ -13,7 +13,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::app::{AppState, BrowserRow, ColorMode, Focus, PlaybackStatus, normal_component};
 use crate::display::{bounded_text, terminal_safe};
@@ -332,16 +332,18 @@ fn centered_offset(selection: usize, len: usize, visible: usize) -> usize {
 
 fn panel_block<'a>(title: &'a str, focus: Focus, app: &AppState) -> Block<'a> {
     let selected = app.focus == focus;
+    let marker = if selected { "> " } else { "" };
+    let style = if selected {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
     Block::default()
-        .title(title)
+        .title(format!(" {marker}{title} "))
         .title_alignment(Alignment::Left)
-        .title_style(focus_style(app, selected))
+        .title_style(style)
         .borders(Borders::ALL)
-        .border_type(if selected {
-            BorderType::Double
-        } else {
-            BorderType::Plain
-        })
+        .border_style(style)
 }
 
 fn focus_style(app: &AppState, selected: bool) -> Style {
@@ -383,6 +385,7 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::layout::Position;
+    use ratatui::style::Modifier;
 
     use crate::app::AppState;
     use crate::config::Config;
@@ -432,6 +435,37 @@ mod tests {
     fn supported_terminal_layouts_are_stable() {
         insta::assert_snapshot!("terminal_80x24", snapshot(80, 24));
         insta::assert_snapshot!("terminal_120x32", snapshot(120, 32));
+    }
+
+    #[test]
+    fn focused_panel_uses_a_title_marker_and_uniform_border_shape() {
+        let mut app = AppState::new(&Config::default(), empty_index()).expect("app state");
+
+        let library = rendered(&app, 80, 24, Duration::ZERO);
+        assert!(library.contains("┌ > Library "), "{library}");
+        assert!(library.contains("┌ Player "), "{library}");
+        assert!(!library.contains('╔'), "{library}");
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| super::render(frame, &app, Duration::ZERO))
+            .expect("draw UI");
+        let buffer = terminal.backend().buffer();
+        assert!(
+            buffer[(0, 0)].modifier.contains(Modifier::BOLD),
+            "the focused Library border is bold"
+        );
+        assert!(
+            !buffer[(20, 0)].modifier.contains(Modifier::BOLD),
+            "the inactive Player border is not bold"
+        );
+
+        app.apply(crate::input::AppAction::FocusNext);
+        let player = rendered(&app, 80, 24, Duration::ZERO);
+        assert!(player.contains("┌ Library "), "{player}");
+        assert!(player.contains("┌ > Player "), "{player}");
+        assert!(!player.contains(" > Library "), "{player}");
     }
 
     #[test]

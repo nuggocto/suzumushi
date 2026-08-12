@@ -154,7 +154,9 @@ accept files and URLs through MPRIS.
 
 Suzumushi inherits the terminal's foreground, background, and named ANSI
 palette. Changing the terminal theme changes the player with it. Set
-`NO_COLOR`, or use `theme = "mono"`, for a monochrome interface.
+`NO_COLOR`, or use `theme = "mono"`, for a monochrome interface. The focused
+panel is marked with `>` and a bold single-line border, so focus never depends
+on color alone.
 
 ## Audio support
 

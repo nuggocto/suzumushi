@@ -19,7 +19,7 @@ metadata, logging, test, fuzz, and CI foundation.
 
 ```text
 +------------------+----------------------------------------+------------------+
-| Library          | Player                                 | Queue            |
+| > Library        | Player                                 | Queue            |
 | folders, tracks  |     title, creator, progress, time     |  ordered tracks  |
 | playlists/search |        volume, state, dancing Suzu     | and queue edits  |
 +------------------+----------------------------------------+------------------+
@@ -171,9 +171,11 @@ are coalesced instead of queueing decoder restarts.
 
 The terminal inherits the user's foreground and background. It uses default or
 named ANSI colors only, honors `NO_COLOR` and `theme = "mono"`, and never relies
-on color alone for focus or state. Transient informational footer notices clear
-after three seconds on the existing monotonic terminal clock. Warnings and
-errors remain visible until another notice supersedes them.
+on color alone for focus or state. The focused panel uses a bold single-line
+border and a `>` title marker instead of changing the border shape. Transient
+informational footer notices clear after three seconds on the existing
+monotonic terminal clock. Warnings and errors remain visible until another
+notice supersedes them.
 
 ## Safety boundaries
 

@@ -17,8 +17,8 @@ use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
 use rustix::termios::{Pid, Winsize, tcsetwinsize};
 use tempfile::TempDir;
 
-const FOCUSED_PLAYER: &[u8] = b"\x1b[7m\x1b[1m\x1b[38;5;6;49mPlayer";
-const FOCUSED_QUEUE: &[u8] = b"\x1b[7m\x1b[1m\x1b[38;5;6;49mQueue";
+const FOCUSED_PLAYER: &[u8] = b"> Player";
+const FOCUSED_QUEUE: &[u8] = b"> Queue";
 const FIRST_QUEUE_ITEM: &[u8] = b"1. Night";
 
 #[test]

@@ -2,27 +2,27 @@
 source: src/ui/mod.rs
 expression: "snapshot(80, 24)"
 ---
-╔Library═══════════╗┌Player────────────────────────────────┐┌Queue─────────────┐
-║Library is empty  ║│                                      ││Queue is empty    │
-║Add audio below   ║│                                      ││Select a track and│
-║audio/library/.   ║│            Nothing playing           ││press Enter.      │
-║Press ? for help. ║│                                      ││                  │
-║                  ║│                  ╲       ╱           ││                  │
-║                  ║│                    ╲ ▄▄▄ ╱           ││                  │
-║                  ║│                    ▐▀• •▀▌           ││                  │
-║                  ║│                 ▄▄█  ▴  █▄▄          ││                  │
-║                  ║│              ╱  ▐█▄▄▄█▌  ╲──╮        ││                  │
-║                  ║│                 ▐█ █ █▌     │        ││                  │
-║                  ║│               ▄▀  █  ▀▄   ▟█▙        ││                  │
-║                  ║│               ▀   ▀ ▀   ▀   ▀        ││                  │
-║                  ║│                                      ││                  │
-║                  ║│[----------------------]  0:00 / --:--││                  │
-║                  ║│                                      ││                  │
-║                  ║│            State: Stopped            ││                  │
-║                  ║│              Volume 100%             ││                  │
-║                  ║│        Shuffle off  Repeat off       ││                  │
-║                  ║│                                      ││                  │
-║                  ║│                                      ││                  │
-╚══════════════════╝└──────────────────────────────────────┘└──────────────────┘
+┌ > Library ───────┐┌ Player ──────────────────────────────┐┌ Queue ───────────┐
+│Library is empty  ││                                      ││Queue is empty    │
+│Add audio below   ││                                      ││Select a track and│
+│audio/library/.   ││            Nothing playing           ││press Enter.      │
+│Press ? for help. ││                                      ││                  │
+│                  ││                  ╲       ╱           ││                  │
+│                  ││                    ╲ ▄▄▄ ╱           ││                  │
+│                  ││                    ▐▀• •▀▌           ││                  │
+│                  ││                 ▄▄█  ▴  █▄▄          ││                  │
+│                  ││              ╱  ▐█▄▄▄█▌  ╲──╮        ││                  │
+│                  ││                 ▐█ █ █▌     │        ││                  │
+│                  ││               ▄▀  █  ▀▄   ▟█▙        ││                  │
+│                  ││               ▀   ▀ ▀   ▀   ▀        ││                  │
+│                  ││                                      ││                  │
+│                  ││[----------------------]  0:00 / --:--││                  │
+│                  ││                                      ││                  │
+│                  ││            State: Stopped            ││                  │
+│                  ││              Volume 100%             ││                  │
+│                  ││        Shuffle off  Repeat off       ││                  │
+│                  ││                                      ││                  │
+│                  ││                                      ││                  │
+└──────────────────┘└──────────────────────────────────────┘└──────────────────┘
  Tab focus · / search · ↑/↓ move · Enter open/add  Ready: 0 tracks, 0 playlists
 q · ? · Space play/pause · s stop · p previous · n next · x shuffle · r repeat

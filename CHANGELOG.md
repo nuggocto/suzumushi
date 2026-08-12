@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Aligned the Library, Player, and Queue panel titles to the top-left edge.
+- Marked the focused panel with `>` and a bold single-line border instead of
+  changing the border shape.
 - Made `Enter` play or pause outside Library and separated footer bindings with
   calm middle dots, with distinct `p` previous and `n` next labels.
 
