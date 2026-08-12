@@ -11,7 +11,7 @@ into the player and reacts only to playback state.
 
 ## Current status
 
-Version `1.0.0-rc.2` is the current release candidate. It contains the
+Version `1.0.0` is the current stable release. It contains the
 complete local library, search, queue browser, playback controls, MPRIS, global
 media-key support, finished terminal states, built-in help, verified local
 installation, and tag-driven Linux release path on the safe root, scanner,
@@ -29,8 +29,8 @@ metadata, logging, test, fuzz, and CI foundation.
 ```
 
 The complete local player, desktop controls, and terminal experience are
-implemented. Phase 9 is in progress through final release verification and AUR
-publication.
+implemented. The Linux release is complete; AUR publication is the remaining
+distribution step if the service accepts writes.
 
 ## Product contract
 
@@ -389,10 +389,10 @@ wall-clock sleeps.
   `suzu` symlink.
 - [x] Finish release notes, compatibility claims, and concise user documentation.
 
-Verified with the published `v1.0.0-rc.1` archive and checksum; a clean Arch
-container install, package upgrade, and uninstall; both command names; and the
-relative packaged symlink. AUR publication remains deliberately pending while
-writes are unavailable.
+Verified with the published `v1.0.0-rc.2` archive and checksum; the exact
+downloaded binary through real audio, keyboard, resume, and MPRIS journeys; a
+clean Arch container install, package upgrade, and uninstall; both command
+names; and the relative packaged symlink.
 
 Done when the tagged artifacts, local install, GitHub release, and AUR package
 all install and run the same tested application.
@@ -426,6 +426,6 @@ No website or Node dependency belongs in this repository.
 `CHANGELOG.md` holds user-visible changes. Git tags use a `v` prefix while Cargo
 and changelog versions do not. `v0.2.0` is the released terminal foundation,
 `v0.3.0` is the released playable core, and `v0.4.0` is the released desktop and
-terminal experience. `v1.0.0-rc.2` is the current release candidate for the
-`1.0.0` milestone described above. A version is tagged only after local CI,
+terminal experience. `v1.0.0` is the current stable release for the milestone
+described above. A version is tagged only after local CI,
 real executable QA, and the exact pushed commit are green.

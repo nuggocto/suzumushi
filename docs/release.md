@@ -68,6 +68,6 @@ When writes return:
 6. Test clean installation, both command names, upgrade, and uninstall.
 7. Commit the two packaging files and push once through the configured AUR key.
 
-For `1.0.0`, update the Cargo version and changelog first. Publish and verify
-the final GitHub artifact, then replace the candidate version, URL, and checksum
-in the AUR recipe. Regenerate `.SRCINFO`; never edit it by hand.
+For a stable release, update the Cargo version and changelog first. Publish and
+verify the final GitHub artifact, then replace the prior version, URL, and
+checksum in the AUR recipe. Regenerate `.SRCINFO`; never edit it by hand.
