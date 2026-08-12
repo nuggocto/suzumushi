@@ -11,7 +11,7 @@ into the player and reacts only to playback state.
 
 ## Current status
 
-Version `1.0.0-rc.1` is the current published release candidate. It contains the
+Version `1.0.0-rc.2` is the current release candidate. It contains the
 complete local library, search, queue browser, playback controls, MPRIS, global
 media-key support, finished terminal states, built-in help, verified local
 installation, and tag-driven Linux release path on the safe root, scanner,
@@ -29,8 +29,8 @@ metadata, logging, test, fuzz, and CI foundation.
 ```
 
 The complete local player, desktop controls, and terminal experience are
-implemented. Phase 9 is in progress while the release candidate is exercised
-and AUR publishing remains externally unavailable.
+implemented. Phase 9 is in progress through final release verification and AUR
+publication.
 
 ## Product contract
 
@@ -426,6 +426,6 @@ No website or Node dependency belongs in this repository.
 `CHANGELOG.md` holds user-visible changes. Git tags use a `v` prefix while Cargo
 and changelog versions do not. `v0.2.0` is the released terminal foundation,
 `v0.3.0` is the released playable core, and `v0.4.0` is the released desktop and
-terminal experience. `v1.0.0-rc.1` is the current release candidate for the
+terminal experience. `v1.0.0-rc.2` is the current release candidate for the
 `1.0.0` milestone described above. A version is tagged only after local CI,
 real executable QA, and the exact pushed commit are green.

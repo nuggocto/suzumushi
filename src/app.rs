@@ -3006,6 +3006,12 @@ mod tests {
         assert_eq!(app.queue_generation, 5);
         app.apply(AppAction::QueueClear);
         assert_eq!(app.queue_generation, 5, "an empty clear is not a mutation");
+
+        app.focus = Focus::Library;
+        select_entry(&mut app, 1);
+        app.apply(AppAction::Activate);
+        assert_eq!(app.queue.len(), 1, "cleared audio can be queued again");
+        assert_eq!(app.queue_generation, 6);
     }
 
     #[test]

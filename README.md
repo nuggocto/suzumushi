@@ -23,20 +23,20 @@ If the package is not yet available from AUR, use the verified archive below.
 
 The verified binary archive is built for 64-bit GNU/Linux. Download the archive
 and `SHA256SUMS` from the
-[`v1.0.0-rc.1` release](https://github.com/nuggocto/suzumushi/releases/tag/v1.0.0-rc.1),
+[`v1.0.0-rc.2` release](https://github.com/nuggocto/suzumushi/releases/tag/v1.0.0-rc.2),
 either in your browser or with:
 
 ```sh
 curl -fLO \
-  'https://github.com/nuggocto/suzumushi/releases/download/v1.0.0-rc.1/{SHA256SUMS,suzumushi-v1.0.0-rc.1-x86_64-unknown-linux-gnu.tar.xz}'
+  'https://github.com/nuggocto/suzumushi/releases/download/v1.0.0-rc.2/{SHA256SUMS,suzumushi-v1.0.0-rc.2-x86_64-unknown-linux-gnu.tar.xz}'
 ```
 
 Then verify and install the downloaded archive:
 
 ```sh
 sha256sum --check --ignore-missing SHA256SUMS
-tar -xf suzumushi-v1.0.0-rc.1-x86_64-unknown-linux-gnu.tar.xz
-cd suzumushi-v1.0.0-rc.1-x86_64-unknown-linux-gnu
+tar -xf suzumushi-v1.0.0-rc.2-x86_64-unknown-linux-gnu.tar.xz
+cd suzumushi-v1.0.0-rc.2-x86_64-unknown-linux-gnu
 sudo install -Dm755 suzumushi /usr/local/bin/suzumushi
 sudo ln -s suzumushi /usr/local/bin/suzu
 ```
@@ -126,10 +126,12 @@ press `Enter` while Player or Queue is focused.
 | `Ctrl+c` | Quit from anywhere |
 
 Search checks metadata, filenames, and paths. Pressing `Enter` queues the
-selected result. If nothing is playing, it starts immediately. An underlying
-audio file can appear in the Queue only once. Selecting it again, directly or
-through a playlist, leaves the Queue unchanged and reports `Audio already in
-Queue`. Playlist additions remain all-or-nothing.
+selected result. Pressing `Enter` on a playlist adds all of its tracks as one
+Queue change. If nothing is playing, it starts immediately. An underlying audio
+file can appear in the Queue only once. Selecting it again, directly or through
+a playlist, leaves the Queue unchanged and reports `Audio already in Queue`.
+Playlist additions remain all-or-nothing. Shuffle keeps the editable Queue in
+its visible order while randomizing playback across its tracks.
 
 Held seek input keeps only the newest target, so releasing the arrow key resumes
 from the position shown instead of replaying obsolete intermediate seeks.
@@ -173,11 +175,10 @@ automatic resampling are not current support claims.
 
 ## Status
 
-Version `1.0.0-rc.1` is the current published release candidate. The application
+Version `1.0.0-rc.2` is the current release candidate. The application
 is feature complete, and its tag-driven Linux archive is verified before GitHub
-publishes it. Its exact release checksum is staged in the `suzumushi-bin` AUR
-recipe, but the recipe will not be submitted until AUR writes are available
-again.
+publishes it. The `suzumushi-bin` recipe will be refreshed from the final
+`1.0.0` archive and submitted only when AUR writes are available.
 
 The full contract and roadmap live in [PROJECT.md](PROJECT.md). Release and AUR
 maintenance details live in [docs/release.md](docs/release.md).
