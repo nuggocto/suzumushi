@@ -1,0 +1,43 @@
+config_version = 1
+theme = "terminal"
+default_view = "library"
+
+[scan]
+max_files = 50000
+max_entries = 100000
+max_depth = 16
+max_playlists = 2000
+max_entries_per_playlist = 10000
+max_symlink_resolutions = 50000
+max_parser_attempts = 50000
+cross_mounts = false
+max_path_bytes = 4096
+max_total_path_bytes = 25165824
+max_metadata_field_bytes = 16384
+max_total_metadata_bytes = 50331648
+max_warning_bytes = 8388608
+max_index_bytes = 117440512
+follow_file_symlinks = true
+follow_directory_symlinks = false
+ignore_hidden_audio = true
+
+[search]
+max_results = 200
+max_query_bytes = 4096
+
+[queue]
+max_items = 10000
+max_bytes = 1048576
+
+[runtime]
+process_memory_budget_bytes = 402653184
+max_open_files = 64
+status_text_max_bytes = 4096
+
+[logging]
+max_file_bytes = 10485760
+max_files = 5
+max_record_bytes = 16384
+queue_capacity = 512
+queue_max_bytes = 8388608
+queue_full_policy = "drop_and_count"

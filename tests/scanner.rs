@@ -237,6 +237,41 @@ fn one_pass_finds_context_metadata_and_symlinks() {
 }
 
 #[test]
+fn hard_links_share_one_asset_and_keep_its_identity_across_names() {
+    let (_temp, root) = root();
+    let library_file = root.join("audio/library/original.mp3");
+    let playlist = root.join("audio/playlists/focus");
+    fs::create_dir(&playlist).expect("playlist");
+    fs::write(&library_file, b"media").expect("library media");
+    fs::hard_link(&library_file, playlist.join("copy.mp3")).expect("playlist hard link");
+
+    let mut reader = FakeMetadata::default();
+    let first = scan(&root, &Config::default(), &mut reader);
+
+    assert_eq!(first.entries.len(), 2);
+    assert_eq!(first.assets.len(), 1, "hard links name one inode");
+    assert_eq!(reader.attempts, 1, "metadata is parsed once per inode");
+    assert!(
+        first
+            .entries
+            .iter()
+            .all(|entry| entry.asset_index == first.entries[0].asset_index)
+    );
+    let asset_id = first.assets[0].id;
+
+    fs::remove_file(&library_file).expect("remove one hard-link name");
+    let mut reader = FakeMetadata::default();
+    let second = scan(&root, &Config::default(), &mut reader);
+
+    assert_eq!(second.entries.len(), 1);
+    assert_eq!(second.assets.len(), 1);
+    assert_eq!(
+        second.assets[0].id, asset_id,
+        "the inode identity is stable"
+    );
+}
+
+#[test]
 fn unsupported_aac_and_m4a_stay_out_while_oga_remains_discoverable() {
     let (_temp, root) = root();
     let library = root.join("audio/library");

@@ -1,12 +1,13 @@
 [package]
 name = "suzumushi"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2024"
 rust-version = "1.95.0"
 description = "A calm, fully local terminal audio player for Linux"
 license = "Apache-2.0"
 repository = "https://github.com/nuggocto/suzumushi"
 default-run = "suzumushi"
+publish = false
 
 [dependencies]
 clap = { version = "=4.6.6", default-features = false, features = ["help", "std", "usage"] }

@@ -255,7 +255,7 @@ struct Scanner<'a> {
     complete: bool,
     stopped: bool,
     assets: Vec<MediaAsset>,
-    asset_keys: BTreeMap<(Vec<u8>, FileIdentity), (MediaAssetId, usize)>,
+    asset_indices: BTreeMap<(u64, u64), usize>,
     entries: Vec<PendingEntry>,
     playlists: BTreeMap<Vec<u8>, Playlist>,
     warnings: Vec<ScanWarning>,
@@ -285,7 +285,7 @@ impl<'a> Scanner<'a> {
             complete: true,
             stopped: false,
             assets: Vec::new(),
-            asset_keys: BTreeMap::new(),
+            asset_indices: BTreeMap::new(),
             entries: Vec::new(),
             playlists: BTreeMap::new(),
             warnings: Vec::new(),
@@ -692,17 +692,12 @@ impl<'a> Scanner<'a> {
             self.limit(&child, "scan.max_path_bytes");
             return Ok(());
         }
-        let key = (canonical_bytes.clone(), identity);
-        let asset_index = if let Some((id, asset_index)) = self.asset_keys.get(&key).copied() {
-            let asset = self
-                .assets
-                .get(asset_index)
-                .expect("asset lookup index must name an inserted asset");
-            assert_eq!(asset.id, id, "asset lookup ID must match its stored index");
+        let identity_key = (identity.device, identity.inode);
+        let asset_index = if let Some(asset_index) = self.asset_indices.get(&identity_key).copied()
+        {
             asset_index
         } else {
             let id = MediaAssetId(stable_id(&[
-                &canonical_bytes,
                 &identity.device.to_le_bytes(),
                 &identity.inode.to_le_bytes(),
             ]));
@@ -717,7 +712,7 @@ impl<'a> Scanner<'a> {
                 .metadata_bytes
                 .saturating_add(tag_bytes(&tags));
             let asset_index = self.assets.len();
-            self.asset_keys.insert(key, (id, asset_index));
+            self.asset_indices.insert(identity_key, asset_index);
             self.assets.push(MediaAsset {
                 id,
                 canonical_path: canonical_path.clone(),
@@ -1069,7 +1064,7 @@ fn tag_bytes(tags: &TrackTags) -> usize {
 // buffers, vector slack, and allocator bookkeeping under one index budget.
 fn retained_asset_bytes(path_bytes: usize, metadata_bytes: usize) -> usize {
     std::mem::size_of::<MediaAsset>()
-        .saturating_add(std::mem::size_of::<((Vec<u8>, FileIdentity), MediaAssetId)>())
+        .saturating_add(std::mem::size_of::<((u64, u64), usize)>())
         .saturating_add(256)
         .saturating_add(path_bytes.saturating_mul(4))
         .saturating_add(metadata_bytes.saturating_mul(3))
@@ -1163,10 +1158,10 @@ fn natural_bytes_cmp(mut left: &[u8], mut right: &[u8]) -> std::cmp::Ordering {
                 })
                 .then_with(|| left_run.cmp(right_run))
         } else {
-            let folded_left: Vec<u8> = left_run.iter().map(u8::to_ascii_lowercase).collect();
-            let folded_right: Vec<u8> = right_run.iter().map(u8::to_ascii_lowercase).collect();
-            folded_left
-                .cmp(&folded_right)
+            left_run
+                .iter()
+                .map(u8::to_ascii_lowercase)
+                .cmp(right_run.iter().map(u8::to_ascii_lowercase))
                 .then_with(|| left_run.cmp(right_run))
         };
         if order != std::cmp::Ordering::Equal {
@@ -1185,7 +1180,7 @@ mod tests {
     use std::os::unix::ffi::OsStringExt;
     use std::path::PathBuf;
 
-    use super::natural_path_cmp;
+    use super::{natural_bytes_cmp, natural_path_cmp};
 
     #[test]
     fn natural_order_v1_fixed_vectors_compare_components_independently() {
@@ -1207,6 +1202,23 @@ mod tests {
             let right = PathBuf::from(OsString::from_vec(right.to_vec()));
             assert_eq!(natural_path_cmp(&left, &right), Ordering::Less);
             assert_eq!(natural_path_cmp(&right, &left), Ordering::Greater);
+        }
+    }
+
+    #[test]
+    fn natural_order_keeps_numeric_case_and_byte_tie_breakers() {
+        const ORDERED_PAIRS: &[(&[u8], &[u8])] = &[
+            (b"track2", b"track10"),
+            (b"track2", b"track02"),
+            (b"a", b"aa"),
+            (b"ABC", b"abd"),
+            (b"Abc", b"abc"),
+            (b"bad-\xfe", b"bad-\xff"),
+        ];
+
+        for &(left, right) in ORDERED_PAIRS {
+            assert_eq!(natural_bytes_cmp(left, right), Ordering::Less);
+            assert_eq!(natural_bytes_cmp(right, left), Ordering::Greater);
         }
     }
 }

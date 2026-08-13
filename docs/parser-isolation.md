@@ -37,10 +37,10 @@ code hang.
 - The current decoder accepts mono or stereo PCM at 8 kHz through 192 kHz. The
   output device must support the source sample rate. No hidden resampler or
   second fallback pipeline exists.
-- The output ring is fixed at 262,144 samples. The callback only pops samples,
+- The output ring is fixed at 262,144 samples. The callback pops samples,
   applies one atomic gain, writes silence on underrun, converts sample types,
-  and updates atomics. It does not allocate, block, log, take a lock, or send a
-  message.
+  updates the fixed 16-band spectrum analyzer, and publishes atomic state. It
+  does not allocate, block, log, take a lock, or send a message.
 - Seeking restarts the isolated helper before the requested source timestamp,
   then discards decoded preroll against packet presentation timestamps before
   emitting PCM. Automatic session resume enters through the same verified

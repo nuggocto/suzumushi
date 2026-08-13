@@ -24,6 +24,7 @@ run = "mise exec rust@1.95.0 -- cargo test --locked --workspace"
 
 [tasks.security]
 description = "Check dependency advisories, licenses, bans, and sources"
+# RUSTSEC-2024-0436 is transitive through Lofty; deny.toml records the exception.
 run = [
   "mise exec cargo:cargo-audit@0.22.2 -- cargo-audit audit --deny warnings --ignore RUSTSEC-2024-0436",
   "mise exec cargo:cargo-audit@0.22.2 -- cargo-audit audit --file fuzz/Cargo.lock --deny warnings --ignore RUSTSEC-2024-0436",

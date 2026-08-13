@@ -7,8 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-08-13
+
 ### Changed
 
+- Marked the application crate as non-publishable through Cargo.
+- Removed per-comparison allocations from natural path sorting without changing
+  its numeric, case, or raw-byte tie breakers.
+- Added compact starting inputs for every fuzz target so clean checkouts begin
+  with valid configuration, protocol, path, terminal, and audio samples.
 - Limited CI to pull requests and `shrek` pushes, cancelled superseded runs,
   and reused pruned Rust dependency builds from the default branch without
   caching workspace or incremental artifacts.
@@ -16,6 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   notification while retaining bounded cleanup and a compatibility fallback.
 - Reduced release binary size with ThinLTO, one code-generation unit, and
   symbol stripping while preserving panic unwinding.
+
+### Fixed
+
+- Deduplicated hard-linked paths by verified device and inode so every name
+  shares one asset, one metadata parse, and one Queue identity.
+- Updated the parser-isolation contract to include the fixed 16-band analyzer
+  that runs inside the allocation-free audio callback.
 
 ## [1.0.1] - 2026-08-12
 

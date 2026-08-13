@@ -5,7 +5,10 @@ target/
 **/mutants.out*/
 /fuzz/artifacts/
 /fuzz/coverage/
-/fuzz/corpus/
+/fuzz/corpus/*
+!/fuzz/corpus/*/
+/fuzz/corpus/*/*
+!/fuzz/corpus/*/seed-*
 
 # Local Suzumushi roots and generated runtime data
 /suzumushi/
