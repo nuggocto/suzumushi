@@ -5,9 +5,9 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
-use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, ResolveFlags};
@@ -17,10 +17,12 @@ use crate::display::terminal_safe;
 use crate::errors::{AppError, AppResult};
 use crate::metadata;
 use crate::model::{
-    FileIdentity, MediaAsset, MediaAssetId, Playlist, PlaylistId, ScanCounters, ScanIndex,
-    ScanWarning, ScanWarningCode, SearchFields, TrackEntry, TrackEntryId, TrackEntrySource,
-    TrackTags, stable_id,
+    FileIdentity, MediaAsset, Playlist, PlaylistId, ScanCounters, ScanIndex, ScanWarning,
+    ScanWarningCode, SearchFields, TrackEntry, TrackEntryId, TrackEntrySource, TrackTags,
+    stable_id,
 };
+
+const METADATA_TIME_BUDGET: Duration = Duration::from_mins(1);
 
 /// Testable behavior when secure file-symlink opening is unavailable.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -32,8 +34,8 @@ pub enum SecureOpenMode {
     Unsupported,
 }
 
-/// Scanner options that do not alter product semantics.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// Scanner limits and deterministic verification seams.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ScanOptions {
     /// Secure-open availability seam.
     pub secure_open: SecureOpenMode,
@@ -41,6 +43,19 @@ pub struct ScanOptions {
     pub active_index_bytes: usize,
     /// Deterministic mount-identity seam used only by verification.
     pub root_device_override: Option<u64>,
+    /// Cumulative wall time allowed for isolated metadata helpers.
+    pub metadata_time_budget: Duration,
+}
+
+impl Default for ScanOptions {
+    fn default() -> Self {
+        Self {
+            secure_open: SecureOpenMode::Auto,
+            active_index_bytes: 0,
+            root_device_override: None,
+            metadata_time_budget: METADATA_TIME_BUDGET,
+        }
+    }
 }
 
 /// Observer for proving descriptor pinning without timing races.
@@ -230,7 +245,6 @@ fn scan_with_components_from<Fd: AsFd>(
         reader,
         observer,
     );
-    scanner.counters.traversals = 1;
     scanner.walk_directory(audio_fd, PathBuf::new(), 0)?;
     Ok(scanner.finish())
 }
@@ -260,6 +274,8 @@ struct Scanner<'a> {
     playlists: BTreeMap<Vec<u8>, Playlist>,
     warnings: Vec<ScanWarning>,
     counters: ScanCounters,
+    metadata_elapsed: Duration,
+    metadata_budget_reported: bool,
 }
 
 impl<'a> Scanner<'a> {
@@ -293,6 +309,8 @@ impl<'a> Scanner<'a> {
                 open_files_high_water: 1,
                 ..ScanCounters::default()
             },
+            metadata_elapsed: Duration::ZERO,
+            metadata_budget_reported: false,
         }
     }
 
@@ -655,55 +673,13 @@ impl<'a> Scanner<'a> {
             modified_seconds: stat.st_mtime,
             modified_nanoseconds: stat.st_mtime_nsec,
         };
-        let cross_mount = identity.device != self.root_device;
-        let descriptor_limit = self
-            .root
-            .as_os_str()
-            .as_bytes()
-            .len()
-            .saturating_add(self.limits.max_path_bytes)
-            .saturating_add(1);
-        let canonical_path = match descriptor_path(&file, descriptor_limit) {
-            Ok(path) => path,
-            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
-                self.limit(&child, "scan.max_path_bytes");
-                return Ok(());
-            }
-            Err(error) => {
-                self.complete = false;
-                self.warn(
-                    ScanWarningCode::UnsupportedSecureOpen,
-                    &child,
-                    format!("cannot resolve verified descriptor identity: {error}"),
-                );
-                return Ok(());
-            }
-        };
-        let canonical_bytes = canonical_path.as_os_str().as_bytes().to_vec();
-        let external = !canonical_path.starts_with(self.root);
-        let canonical_relative_bytes = if external {
-            canonical_bytes.len()
-        } else {
-            canonical_path
-                .strip_prefix(self.root)
-                .map_or(canonical_bytes.len(), path_bytes)
-        };
-        if canonical_relative_bytes > self.limits.max_path_bytes {
-            self.limit(&child, "scan.max_path_bytes");
-            return Ok(());
-        }
         let identity_key = (identity.device, identity.inode);
         let asset_index = if let Some(asset_index) = self.asset_indices.get(&identity_key).copied()
         {
             asset_index
         } else {
-            let id = MediaAssetId(stable_id(&[
-                &identity.device.to_le_bytes(),
-                &identity.inode.to_le_bytes(),
-            ]));
             let tags = self.read_tags(&file, &child);
-            let bytes = retained_asset_bytes(canonical_bytes.len(), tag_bytes(&tags));
-            self.account_index(bytes, &child);
+            self.account_index(retained_asset_bytes(tag_bytes(&tags)), &child);
             if self.stopped {
                 return Ok(());
             }
@@ -714,42 +690,22 @@ impl<'a> Scanner<'a> {
             let asset_index = self.assets.len();
             self.asset_indices.insert(identity_key, asset_index);
             self.assets.push(MediaAsset {
-                id,
-                canonical_path: canonical_path.clone(),
                 tags,
                 file_identity: identity,
-                external,
-                cross_mount,
             });
             asset_index
         };
         let child_bytes = child.as_os_str().as_bytes();
         let playlist_id = playlist.as_deref().map(|key| PlaylistId(stable_id(&[key])));
         let source = match (playlist_id, symlink) {
-            (Some(playlist), true) => TrackEntrySource::PlaylistSymlink {
-                playlist,
-                target: canonical_path.clone(),
-            },
+            (Some(playlist), true) => TrackEntrySource::PlaylistSymlink { playlist },
             (Some(playlist), false) => TrackEntrySource::PlaylistCopy { playlist },
-            (None, true) => TrackEntrySource::LibrarySymlink {
-                relative_path: child.clone(),
-                target: canonical_path,
-            },
-            (None, false) => TrackEntrySource::LibraryFile {
-                relative_path: child.clone(),
-            },
+            (None, true) => TrackEntrySource::LibrarySymlink,
+            (None, false) => TrackEntrySource::LibraryFile,
         };
         let context = playlist.as_deref().unwrap_or(b"library");
         let id = TrackEntryId(stable_id(&[context, child_bytes]));
-        let source_path_bytes = if symlink {
-            canonical_bytes.len()
-        } else {
-            child_bytes.len()
-        };
-        self.account_index(
-            retained_entry_bytes(child_bytes.len(), source_path_bytes),
-            &child,
-        );
+        self.account_index(retained_entry_bytes(child_bytes.len()), &child);
         if self.stopped {
             return Ok(());
         }
@@ -768,6 +724,18 @@ impl<'a> Scanner<'a> {
     }
 
     fn read_tags(&mut self, file: &File, path: &Path) -> TrackTags {
+        if self.metadata_elapsed >= self.options.metadata_time_budget {
+            if !self.metadata_budget_reported {
+                self.metadata_budget_reported = true;
+                self.complete = false;
+                self.warn(
+                    ScanWarningCode::LimitReached,
+                    path,
+                    "metadata helper time budget reached; remaining tracks use filenames only",
+                );
+            }
+            return TrackTags::default();
+        }
         if self.counters.parser_attempts >= self.limits.max_parser_attempts {
             self.limit(path, "scan.max_parser_attempts");
             return TrackTags::default();
@@ -776,7 +744,9 @@ impl<'a> Scanner<'a> {
         if !self.acquire_open_slots(2, path) {
             return TrackTags::default();
         }
+        let started = Instant::now();
         let parsed = self.reader.read(file);
+        self.metadata_elapsed = self.metadata_elapsed.saturating_add(started.elapsed());
         self.release_open_slots(2);
         match parsed {
             Ok(tags) if fields_within_limit(&tags, self.limits.max_metadata_field_bytes) => {
@@ -998,30 +968,6 @@ fn open_direct_directory<Fd: AsFd>(
     }
 }
 
-fn descriptor_path(file: &File, max_bytes: usize) -> std::io::Result<PathBuf> {
-    let capacity = max_bytes.checked_add(1).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "descriptor path bound overflow",
-        )
-    })?;
-    let mut bytes = vec![0; capacity];
-    let read = rustix::fs::readlinkat_raw(
-        rustix::fs::CWD,
-        format!("/proc/self/fd/{}", file.as_raw_fd()),
-        &mut bytes,
-    )
-    .map_err(std::io::Error::from)?;
-    if read == bytes.len() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "verified descriptor path exceeds its bound",
-        ));
-    }
-    bytes.truncate(read);
-    Ok(PathBuf::from(OsString::from_vec(bytes)))
-}
-
 fn playlist_key(path: &Path) -> Option<&[u8]> {
     let mut components = path.components();
     if components.next()?.as_os_str().as_bytes() != b"playlists" {
@@ -1062,20 +1008,18 @@ fn tag_bytes(tags: &TrackTags) -> usize {
 // These charges intentionally exceed the retained model payload. They cover
 // both build-time and final containers, lookup-tree nodes, cloned path
 // buffers, vector slack, and allocator bookkeeping under one index budget.
-fn retained_asset_bytes(path_bytes: usize, metadata_bytes: usize) -> usize {
+fn retained_asset_bytes(metadata_bytes: usize) -> usize {
     std::mem::size_of::<MediaAsset>()
         .saturating_add(std::mem::size_of::<((u64, u64), usize)>())
         .saturating_add(256)
-        .saturating_add(path_bytes.saturating_mul(4))
         .saturating_add(metadata_bytes.saturating_mul(3))
 }
 
-fn retained_entry_bytes(path_bytes: usize, source_path_bytes: usize) -> usize {
+fn retained_entry_bytes(path_bytes: usize) -> usize {
     std::mem::size_of::<PendingEntry>()
         .saturating_add(std::mem::size_of::<TrackEntry>())
         .saturating_add(256)
         .saturating_add(path_bytes.saturating_mul(12))
-        .saturating_add(source_path_bytes.saturating_mul(2))
 }
 
 fn retained_playlist_bytes(key_bytes: usize, name_bytes: usize, path: &Path) -> usize {

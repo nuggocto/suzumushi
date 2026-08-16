@@ -7,7 +7,7 @@ Status: accepted for the first playback pipeline.
 Suzumushi uses one pipeline:
 
 ```text
-verified file descriptor -> Symphonia 0.6.0 helper -> bounded f32 PCM ->
+verified file descriptor -> Symphonia 0.6.1 helper -> bounded f32 PCM ->
 owned worker -> rtrb 0.3.4 -> CPAL 0.18.1 -> Linux audio device
 ```
 

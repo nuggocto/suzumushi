@@ -47,7 +47,7 @@ pub(crate) fn open_verified_media(
     let final_name = final_name.ok_or_else(|| AppError::Audio("track path is empty".into()))?;
     let follows_file_link = matches!(
         entry.source,
-        TrackEntrySource::LibrarySymlink { .. } | TrackEntrySource::PlaylistSymlink { .. }
+        TrackEntrySource::LibrarySymlink | TrackEntrySource::PlaylistSymlink { .. }
     );
     let fd = if follows_file_link {
         rustix::fs::openat2(
@@ -115,8 +115,8 @@ mod tests {
 
     use super::open_verified_media;
     use crate::model::{
-        FileIdentity, MediaAsset, MediaAssetId, SearchFields, TrackEntry, TrackEntryId,
-        TrackEntrySource, TrackTags,
+        FileIdentity, MediaAsset, SearchFields, TrackEntry, TrackEntryId, TrackEntrySource,
+        TrackTags,
     };
     use crate::paths::discover_root_from;
 
@@ -128,9 +128,7 @@ mod tests {
                 id: TrackEntryId(1),
                 asset_index: 0,
                 display_path: PathBuf::from(relative),
-                source: TrackEntrySource::LibraryFile {
-                    relative_path: PathBuf::from(relative),
-                },
+                source: TrackEntrySource::LibraryFile,
                 search: SearchFields {
                     filename: "tone".into(),
                     relative_path: relative.into(),
@@ -138,8 +136,6 @@ mod tests {
                 scan_generation: 1,
             },
             MediaAsset {
-                id: MediaAssetId(2),
-                canonical_path: path,
                 tags: TrackTags::default(),
                 file_identity: FileIdentity {
                     device: metadata.dev(),
@@ -149,8 +145,6 @@ mod tests {
                     modified_nanoseconds: u64::try_from(metadata.mtime_nsec())
                         .expect("fixture nanoseconds are non-negative"),
                 },
-                external: false,
-                cross_mount: false,
             },
         )
     }

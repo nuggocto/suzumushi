@@ -2222,7 +2222,7 @@ fn build_browser_rows(
     while let Some(entry) = index.entries.get(entry_cursor) {
         if matches!(
             &entry.source,
-            TrackEntrySource::LibraryFile { .. } | TrackEntrySource::LibrarySymlink { .. }
+            TrackEntrySource::LibraryFile | TrackEntrySource::LibrarySymlink
         ) {
             append_tree_entry(index, rows, entry_cursor, 1, 1, &mut previous, row_limit)?;
             entry_cursor += 1;
@@ -2345,7 +2345,7 @@ fn entry_playlist(entry: &TrackEntry) -> Option<PlaylistId> {
     match &entry.source {
         TrackEntrySource::PlaylistCopy { playlist }
         | TrackEntrySource::PlaylistSymlink { playlist, .. } => Some(*playlist),
-        TrackEntrySource::LibraryFile { .. } | TrackEntrySource::LibrarySymlink { .. } => None,
+        TrackEntrySource::LibraryFile | TrackEntrySource::LibrarySymlink => None,
     }
 }
 
@@ -2408,8 +2408,8 @@ mod tests {
     use crate::config::Config;
     use crate::input::AppAction;
     use crate::model::{
-        FileIdentity, MediaAsset, MediaAssetId, Playlist, PlaylistId, ScanCounters, ScanIndex,
-        SearchFields, TrackEntry, TrackEntryId, TrackEntrySource, TrackTags,
+        FileIdentity, MediaAsset, Playlist, PlaylistId, ScanCounters, ScanIndex, SearchFields,
+        TrackEntry, TrackEntryId, TrackEntrySource, TrackTags,
     };
 
     fn empty_index() -> ScanIndex {
@@ -2449,9 +2449,7 @@ mod tests {
         let mut index = fixture_index();
         for entry_index in 2..4 {
             let mut asset = index.assets[entry_index - 2].clone();
-            asset.id = MediaAssetId(100 + entry_index as u64);
             asset.file_identity.inode = 100 + entry_index as u64;
-            asset.canonical_path = index.entries[entry_index].display_path.clone();
             index.entries[entry_index].asset_index = index.assets.len();
             index.assets.push(asset);
         }
@@ -2459,9 +2457,7 @@ mod tests {
     }
 
     fn fixture_assets() -> Vec<MediaAsset> {
-        let asset = |id, inode, path: &str, artist: &str, album: &str, title: &str| MediaAsset {
-            id: MediaAssetId(id),
-            canonical_path: PathBuf::from(path),
+        let asset = |inode, artist: &str, album: &str, title: &str| MediaAsset {
             tags: TrackTags {
                 artist: Some(artist.into()),
                 album_artist: None,
@@ -2475,26 +2471,10 @@ mod tests {
                 modified_seconds: 10,
                 modified_nanoseconds: 0,
             },
-            external: false,
-            cross_mount: false,
         };
         vec![
-            asset(
-                1,
-                1,
-                "audio/library/JDR/Campaign One/night.mp3",
-                "Calm Artist",
-                "Campaign One",
-                "Night Song",
-            ),
-            asset(
-                2,
-                2,
-                "audio/library/Music/quiet.flac",
-                "Still Artist",
-                "Quiet Album",
-                "Quiet Song",
-            ),
+            asset(1, "Calm Artist", "Campaign One", "Night Song"),
+            asset(2, "Still Artist", "Quiet Album", "Quiet Song"),
         ]
     }
 
@@ -2519,17 +2499,13 @@ mod tests {
                 10,
                 0,
                 "library/JDR/Campaign One/night.mp3",
-                TrackEntrySource::LibraryFile {
-                    relative_path: PathBuf::from("library/JDR/Campaign One/night.mp3"),
-                },
+                TrackEntrySource::LibraryFile,
             ),
             entry(
                 20,
                 1,
                 "library/Music/quiet.flac",
-                TrackEntrySource::LibraryFile {
-                    relative_path: PathBuf::from("library/Music/quiet.flac"),
-                },
+                TrackEntrySource::LibraryFile,
             ),
             entry(
                 40,

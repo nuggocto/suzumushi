@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Updated Symphonia to 0.6.1 for its malformed-input hardening and decoder fixes.
+- Limited cumulative metadata-helper work to one minute per scan, then continued
+  discovery with filename-only entries and one visible warning.
+- Removed unused canonical-path, source-path, media-ID, mount-status, and scanner
+  counter data from the retained library index.
+- Disabled release-tool caching, stopped checkout credential persistence, and
+  moved the validated release version out of inline shell expansion.
+
 ## [1.0.2] - 2026-08-13
 
 ### Changed

@@ -6,10 +6,6 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-/// Stable-within-identity media identifier.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-pub struct MediaAssetId(pub u64);
-
 /// Stable-within-context browser entry identifier.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct TrackEntryId(pub u64);
@@ -41,31 +37,17 @@ pub struct TrackTags {
 /// One canonical media file.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct MediaAsset {
-    pub id: MediaAssetId,
-    pub canonical_path: PathBuf,
     pub tags: TrackTags,
     pub file_identity: FileIdentity,
-    pub external: bool,
-    pub cross_mount: bool,
 }
 
 /// The context through which a user encountered an asset.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub enum TrackEntrySource {
-    LibraryFile {
-        relative_path: PathBuf,
-    },
-    LibrarySymlink {
-        relative_path: PathBuf,
-        target: PathBuf,
-    },
-    PlaylistCopy {
-        playlist: PlaylistId,
-    },
-    PlaylistSymlink {
-        playlist: PlaylistId,
-        target: PathBuf,
-    },
+    LibraryFile,
+    LibrarySymlink,
+    PlaylistCopy { playlist: PlaylistId },
+    PlaylistSymlink { playlist: PlaylistId },
 }
 
 /// A contextual browser entry. Several entries may name one asset.
@@ -124,7 +106,6 @@ pub struct ScanWarning {
 /// Observable counters proving scanner bounds and traversal behavior.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct ScanCounters {
-    pub traversals: usize,
     pub directory_enumerations: usize,
     pub encountered_entries: usize,
     pub directories: usize,
@@ -137,7 +118,6 @@ pub struct ScanCounters {
     pub warning_bytes: usize,
     pub index_bytes: usize,
     pub open_files_high_water: usize,
-    pub pathname_reopens: usize,
 }
 
 /// Complete or visibly partial replacement index.

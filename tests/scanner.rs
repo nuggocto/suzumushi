@@ -2,10 +2,11 @@
 
 use std::ffi::OsString;
 use std::fs::{self, File};
-use std::os::unix::ffi::OsStringExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, symlink};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use suzumushi::config::Config;
 use suzumushi::init::initialize;
@@ -36,6 +37,27 @@ impl ScanObserver for Noop {}
 type Configure = Box<dyn Fn(&mut Config)>;
 type CounterCase = (&'static str, Configure, Configure);
 
+fn retained_max_path_bytes(index: &suzumushi::model::ScanIndex) -> usize {
+    index
+        .entries
+        .iter()
+        .map(|entry| entry.display_path.as_os_str().as_bytes().len())
+        .chain(
+            index
+                .playlists
+                .iter()
+                .map(|playlist| playlist.path.as_os_str().as_bytes().len()),
+        )
+        .chain(
+            index
+                .warnings
+                .iter()
+                .map(|warning| warning.path.as_os_str().as_bytes().len()),
+        )
+        .max()
+        .expect("the baseline retains paths")
+}
+
 fn retained_counter_cases(baseline: &suzumushi::model::ScanIndex) -> Vec<CounterCase> {
     let media_files = baseline.counters.media_files;
     let entries = baseline.counters.encountered_entries;
@@ -49,6 +71,7 @@ fn retained_counter_cases(baseline: &suzumushi::model::ScanIndex) -> Vec<Counter
     let symlinks = baseline.counters.symlink_resolutions;
     let parsers = baseline.counters.parser_attempts;
     let path_bytes = baseline.counters.path_bytes;
+    let max_path_bytes = retained_max_path_bytes(baseline);
     let metadata_bytes = baseline.counters.metadata_bytes;
     let warning_bytes = baseline.counters.warning_bytes;
     let index_bytes = baseline.counters.index_bytes;
@@ -96,8 +119,8 @@ fn retained_counter_cases(baseline: &suzumushi::model::ScanIndex) -> Vec<Counter
         ),
         (
             "path bytes",
-            Box::new(|config| config.scan.max_path_bytes = 32),
-            Box::new(|config| config.scan.max_path_bytes = 31),
+            Box::new(move |config| config.scan.max_path_bytes = max_path_bytes),
+            Box::new(move |config| config.scan.max_path_bytes = max_path_bytes - 1),
         ),
         (
             "total path bytes",
@@ -172,8 +195,6 @@ fn one_pass_finds_context_metadata_and_symlinks() {
 
     assert!(index.complete);
     assert_eq!(index.generation, 7);
-    assert_eq!(index.counters.traversals, 1);
-    assert_eq!(index.counters.pathname_reopens, 0);
     assert_eq!(index.entries.len(), 4);
     assert_eq!(
         index.assets.len(),
@@ -257,7 +278,7 @@ fn hard_links_share_one_asset_and_keep_its_identity_across_names() {
             .iter()
             .all(|entry| entry.asset_index == first.entries[0].asset_index)
     );
-    let asset_id = first.assets[0].id;
+    let asset_identity = first.assets[0].file_identity;
 
     fs::remove_file(&library_file).expect("remove one hard-link name");
     let mut reader = FakeMetadata::default();
@@ -266,7 +287,7 @@ fn hard_links_share_one_asset_and_keep_its_identity_across_names() {
     assert_eq!(second.entries.len(), 1);
     assert_eq!(second.assets.len(), 1);
     assert_eq!(
-        second.assets[0].id, asset_id,
+        second.assets[0].file_identity, asset_identity,
         "the inode identity is stable"
     );
 }
@@ -395,18 +416,17 @@ fn external_broken_magic_and_directory_symlinks_are_bounded_warnings() {
 
     let mut reader = FakeMetadata::default();
     let index = scan(&root, &Config::default(), &mut reader);
-    let external_asset = index
-        .assets
+    let external_entry = index
+        .entries
         .iter()
-        .find(|asset| asset.external)
+        .find(|entry| entry.display_path == Path::new("playlists/links/external.mp3"))
+        .expect("external entry");
+    let external_asset = index
+        .asset_for_entry(external_entry)
         .expect("external asset");
-    assert_eq!(
-        external_asset.cross_mount,
-        fs::metadata(&external).expect("external metadata").dev()
-            != fs::metadata(root.join("audio"))
-                .expect("audio metadata")
-                .dev()
-    );
+    let external_metadata = fs::metadata(&external).expect("external metadata");
+    assert_eq!(external_asset.file_identity.device, external_metadata.dev());
+    assert_eq!(external_asset.file_identity.inode, external_metadata.ino());
     assert!(
         index
             .warnings
@@ -511,8 +531,6 @@ fn parent_substitution_cannot_redirect_a_pinned_enumeration() {
             .iter()
             .any(|entry| entry.display_path == Path::new("library/redirected.mp3"))
     );
-    assert_eq!(index.counters.traversals, 1);
-    assert_eq!(index.counters.pathname_reopens, 0);
 }
 
 struct RetargetSymlink {
@@ -564,7 +582,49 @@ fn retargeted_symlink_uses_only_the_verified_open_descriptor() {
         .find(|entry| entry.display_path == Path::new("playlists/links/song.mp3"))
         .expect("symlink entry");
     let asset = index.asset_for_entry(entry).expect("symlink asset");
-    assert_eq!(asset.canonical_path, replacement);
+    let replacement_metadata = fs::metadata(replacement).expect("replacement metadata");
+    assert_eq!(asset.file_identity.device, replacement_metadata.dev());
+    assert_eq!(asset.file_identity.inode, replacement_metadata.ino());
+}
+
+#[test]
+fn metadata_time_budget_skips_tags_without_stopping_discovery() {
+    let (_temp, root) = root();
+    fs::write(root.join("audio/library/one.mp3"), b"one").expect("first media");
+    fs::write(root.join("audio/library/two.mp3"), b"two").expect("second media");
+    let mut reader = FakeMetadata::default();
+    let mut observer = Noop;
+
+    let index = scan_with_components(
+        &root,
+        &Config::default(),
+        1,
+        ScanOptions {
+            metadata_time_budget: Duration::ZERO,
+            ..ScanOptions::default()
+        },
+        &mut reader,
+        &mut observer,
+    )
+    .expect("bounded metadata scan");
+
+    assert_eq!(reader.attempts, 0);
+    assert_eq!(index.entries.len(), 2);
+    assert!(!index.complete);
+    assert_eq!(
+        index
+            .warnings
+            .iter()
+            .filter(|warning| warning.code == ScanWarningCode::LimitReached)
+            .count(),
+        1
+    );
+    assert!(
+        index
+            .assets
+            .iter()
+            .all(|asset| asset.tags == TrackTags::default())
+    );
 }
 
 #[test]

@@ -67,7 +67,7 @@ impl MprisProjection {
         capabilities |= u8::from(app.can_go_next()) * CAN_GO_NEXT;
         capabilities |= u8::from(app.current_track_token().is_some()) * CAN_GO_PREVIOUS;
         capabilities |= u8::from(!app.queue.is_empty()) * CAN_PLAY;
-        capabilities |= pause_capability(track_token.is_some());
+        capabilities |= u8::from(track_token.is_some()) * CAN_PAUSE;
         capabilities |= u8::from(active) * CAN_SEEK;
         Self {
             playback_status: app.playback_status,
@@ -83,10 +83,6 @@ impl MprisProjection {
             seek_revision: app.seek_revision(),
         }
     }
-}
-
-const fn pause_capability(has_track: bool) -> u8 {
-    if has_track { CAN_PAUSE } else { 0 }
 }
 
 pub(crate) struct MprisRuntime {
@@ -700,7 +696,7 @@ mod tests {
     use super::{
         CAN_GO_NEXT, CAN_GO_PREVIOUS, CAN_PAUSE, CAN_PLAY, CAN_SEEK, MprisProjection,
         PlayerInterface, REQUEST_CAPACITY, TEXT_MAX_BYTES, metadata_from_projection, mpris_text,
-        parse_track_path, pause_capability, track_path,
+        parse_track_path, track_path,
     };
     use crate::app::{PlaybackStatus, RepeatMode};
     use crate::input::AppAction;
@@ -753,12 +749,6 @@ mod tests {
             let path = OwnedObjectPath::try_from(invalid).expect("valid object path syntax");
             assert_eq!(parse_track_path(&path), None, "{invalid}");
         }
-    }
-
-    #[test]
-    fn a_current_local_track_is_always_pausable() {
-        assert_eq!(pause_capability(true), CAN_PAUSE);
-        assert_eq!(pause_capability(false), 0);
     }
 
     #[test]

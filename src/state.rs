@@ -414,8 +414,8 @@ mod tests {
     use crate::config::Config;
     use crate::input::AppAction;
     use crate::model::{
-        FileIdentity, MediaAsset, MediaAssetId, ScanCounters, ScanIndex, SearchFields, TrackEntry,
-        TrackEntryId, TrackEntrySource, TrackTags,
+        FileIdentity, MediaAsset, ScanCounters, ScanIndex, SearchFields, TrackEntry, TrackEntryId,
+        TrackEntrySource, TrackTags,
     };
 
     fn app() -> AppState {
@@ -445,13 +445,10 @@ mod tests {
 
     fn app_with_control_metadata() -> AppState {
         let controls = "\u{1b}".repeat(4_096);
-        let path = PathBuf::from("audio/library/fixture.wav");
         let index = ScanIndex {
             generation: 1,
             complete: true,
             assets: vec![MediaAsset {
-                id: MediaAssetId(1),
-                canonical_path: path.clone(),
                 tags: TrackTags {
                     artist: Some(controls.clone()),
                     album_artist: None,
@@ -465,16 +462,12 @@ mod tests {
                     modified_seconds: 1,
                     modified_nanoseconds: 0,
                 },
-                external: false,
-                cross_mount: false,
             }],
             entries: vec![TrackEntry {
                 id: TrackEntryId(1),
                 asset_index: 0,
                 display_path: PathBuf::from("library/fixture.wav"),
-                source: TrackEntrySource::LibraryFile {
-                    relative_path: PathBuf::from("library/fixture.wav"),
-                },
+                source: TrackEntrySource::LibraryFile,
                 search: SearchFields {
                     filename: "fixture".into(),
                     relative_path: "library/fixture.wav".into(),
