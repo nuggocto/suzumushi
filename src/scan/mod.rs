@@ -256,6 +256,33 @@ struct PendingEntry {
     source: TrackEntrySource,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScanProgress {
+    Clean,
+    Degraded,
+    Stopped,
+}
+
+impl ScanProgress {
+    const fn is_stopped(self) -> bool {
+        matches!(self, Self::Stopped)
+    }
+
+    const fn is_complete(self) -> bool {
+        matches!(self, Self::Clean)
+    }
+
+    fn degrade(&mut self) {
+        if matches!(self, Self::Clean) {
+            *self = Self::Degraded;
+        }
+    }
+
+    fn stop(&mut self) {
+        *self = Self::Stopped;
+    }
+}
+
 struct Scanner<'a> {
     root: &'a Path,
     limits: &'a ScanConfig,
@@ -266,8 +293,7 @@ struct Scanner<'a> {
     open_files: usize,
     reader: &'a mut dyn metadata::MetadataReader,
     observer: &'a mut dyn ScanObserver,
-    complete: bool,
-    stopped: bool,
+    progress: ScanProgress,
     assets: Vec<MediaAsset>,
     asset_indices: BTreeMap<(u64, u64), usize>,
     entries: Vec<PendingEntry>,
@@ -298,8 +324,7 @@ impl<'a> Scanner<'a> {
             open_files: 1,
             reader,
             observer,
-            complete: true,
-            stopped: false,
+            progress: ScanProgress::Clean,
             assets: Vec::new(),
             asset_indices: BTreeMap::new(),
             entries: Vec::new(),
@@ -317,7 +342,7 @@ impl<'a> Scanner<'a> {
     // Ownership keeps the pinned directory descriptor alive for the full enumeration.
     #[allow(clippy::needless_pass_by_value)]
     fn walk_directory(&mut self, fd: OwnedFd, relative: PathBuf, depth: usize) -> AppResult<()> {
-        if self.stopped {
+        if self.progress.is_stopped() {
             return Ok(());
         }
         if !self.acquire_open_slots(1, &relative) {
@@ -338,7 +363,7 @@ impl<'a> Scanner<'a> {
         self.counters.directory_enumerations += 1;
         let mut names = Vec::new();
         for result in &mut directory {
-            if self.stopped {
+            if self.progress.is_stopped() {
                 break;
             }
             let entry = match result {
@@ -358,7 +383,7 @@ impl<'a> Scanner<'a> {
             }
             let child = relative.join(&name);
             if !self.encounter(&child) {
-                if self.stopped {
+                if self.progress.is_stopped() {
                     break;
                 }
                 continue;
@@ -367,7 +392,7 @@ impl<'a> Scanner<'a> {
         }
         names.sort_by(|left, right| natural_bytes_cmp(left.as_bytes(), right.as_bytes()));
         for name in names {
-            if self.stopped {
+            if self.progress.is_stopped() {
                 break;
             }
             let child = relative.join(&name);
@@ -538,7 +563,7 @@ impl<'a> Scanner<'a> {
             return Ok(());
         }
         self.counters.symlink_resolutions += 1;
-        if !self.limits.follow_file_symlinks {
+        if !self.limits.symlink_policy.follows_files() {
             self.warn(
                 ScanWarningCode::UnsupportedSecureOpen,
                 &child,
@@ -680,7 +705,7 @@ impl<'a> Scanner<'a> {
         } else {
             let tags = self.read_tags(&file, &child);
             self.account_index(retained_asset_bytes(tag_bytes(&tags)), &child);
-            if self.stopped {
+            if self.progress.is_stopped() {
                 return Ok(());
             }
             self.counters.metadata_bytes = self
@@ -706,7 +731,7 @@ impl<'a> Scanner<'a> {
         let context = playlist.as_deref().unwrap_or(b"library");
         let id = TrackEntryId(stable_id(&[context, child_bytes]));
         self.account_index(retained_entry_bytes(child_bytes.len()), &child);
-        if self.stopped {
+        if self.progress.is_stopped() {
             return Ok(());
         }
         self.entries.push(PendingEntry {
@@ -727,7 +752,7 @@ impl<'a> Scanner<'a> {
         if self.metadata_elapsed >= self.options.metadata_time_budget {
             if !self.metadata_budget_reported {
                 self.metadata_budget_reported = true;
-                self.complete = false;
+                self.progress.degrade();
                 self.warn(
                     ScanWarningCode::LimitReached,
                     path,
@@ -786,7 +811,7 @@ impl<'a> Scanner<'a> {
         let id = PlaylistId(stable_id(&[key]));
         let name = terminal_safe(key, self.limits.max_path_bytes);
         self.account_index(retained_playlist_bytes(key.len(), name.len(), path), path);
-        if self.stopped {
+        if self.progress.is_stopped() {
             return false;
         }
         self.playlists.insert(
@@ -808,7 +833,7 @@ impl<'a> Scanner<'a> {
         }
         let bytes = path_bytes(path);
         if bytes > self.limits.max_path_bytes {
-            self.complete = false;
+            self.progress.degrade();
             self.warn(
                 ScanWarningCode::LimitReached,
                 path,
@@ -844,7 +869,7 @@ impl<'a> Scanner<'a> {
             self.open_files = remaining;
         } else {
             self.open_files = 0;
-            self.complete = false;
+            self.progress.degrade();
         }
     }
 
@@ -857,13 +882,12 @@ impl<'a> Scanner<'a> {
     }
 
     fn limit(&mut self, path: &Path, name: &str) {
-        self.complete = false;
+        self.progress.stop();
         self.warn(
             ScanWarningCode::LimitReached,
             path,
             format!("{name} limit reached"),
         );
-        self.stopped = true;
     }
 
     fn warn(&mut self, code: ScanWarningCode, path: &Path, message: impl Into<String>) {
@@ -873,12 +897,11 @@ impl<'a> Scanner<'a> {
         );
         let bytes = retained_warning_bytes(path, message.len());
         if self.counters.warning_bytes.saturating_add(bytes) > self.limits.max_warning_bytes {
-            self.complete = false;
+            self.progress.degrade();
             return;
         }
         if self.counters.index_bytes.saturating_add(bytes) > self.limits.max_index_bytes {
-            self.complete = false;
-            self.stopped = true;
+            self.progress.stop();
             return;
         }
         self.counters.warning_bytes += bytes;
@@ -930,7 +953,7 @@ impl<'a> Scanner<'a> {
         playlists.sort_by(|left, right| natural_path_cmp(&left.path, &right.path));
         ScanIndex {
             generation: self.generation,
-            complete: self.complete,
+            complete: self.progress.is_complete(),
             assets: self.assets,
             entries: contextual,
             playlists,

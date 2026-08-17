@@ -244,40 +244,50 @@ impl<'a> MakeWriter<'a> for BoundedMakeWriter {
             queue: Arc::clone(&self.queue),
             bytes: Vec::with_capacity(self.max_record_bytes.min(1_024)),
             max_record_bytes: self.max_record_bytes,
-            truncated: false,
-            emitted: false,
+            state: RecordState::Open,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecordState {
+    Open,
+    Truncated,
+    Emitted,
 }
 
 struct BoundedRecordWriter {
     queue: Arc<LogQueue>,
     bytes: Vec<u8>,
     max_record_bytes: usize,
-    truncated: bool,
-    emitted: bool,
+    state: RecordState,
 }
 
 impl BoundedRecordWriter {
     fn emit(&mut self) {
-        if self.emitted || self.bytes.is_empty() {
+        if self.state == RecordState::Emitted || self.bytes.is_empty() {
             return;
         }
-        if self.truncated {
+        if self.state == RecordState::Truncated {
             mark_truncated(&mut self.bytes, self.max_record_bytes);
         }
         self.bytes.truncate(self.max_record_bytes);
         self.queue.enqueue(std::mem::take(&mut self.bytes));
-        self.emitted = true;
+        self.state = RecordState::Emitted;
     }
 }
 
 impl Write for BoundedRecordWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.state == RecordState::Emitted {
+            return Ok(bytes.len());
+        }
         let remaining = self.max_record_bytes.saturating_sub(self.bytes.len());
         let accepted = remaining.min(bytes.len());
         self.bytes.extend_from_slice(&bytes[..accepted]);
-        self.truncated |= accepted < bytes.len();
+        if accepted < bytes.len() {
+            self.state = RecordState::Truncated;
+        }
         Ok(bytes.len())
     }
 
@@ -532,7 +542,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        LogQueue, LoggingGuard, TRUNCATED, mark_truncated, report_dropped_records, spawn_log_worker,
+        BoundedRecordWriter, LogQueue, LoggingGuard, RecordState, TRUNCATED, mark_truncated,
+        report_dropped_records, spawn_log_worker,
     };
 
     #[test]
@@ -546,6 +557,36 @@ mod tests {
         let mut tiny = b"long".to_vec();
         mark_truncated(&mut tiny, 1);
         assert_eq!(tiny, b"~");
+    }
+
+    #[test]
+    fn record_writer_truncates_and_emits_only_once() {
+        let failed = Arc::new(AtomicBool::new(false));
+        let (queue, receiver) = LogQueue::new(2, failed);
+        let mut writer = BoundedRecordWriter {
+            queue: Arc::clone(&queue),
+            bytes: Vec::new(),
+            max_record_bytes: 20,
+            state: RecordState::Open,
+        };
+
+        writer
+            .write_all(&[b'x'; 32])
+            .expect("bounded record accepts the formatter write");
+        writer.flush().expect("first flush emits the record");
+        writer
+            .write_all(b"ignored after emission")
+            .expect("later formatter writes remain harmless");
+        writer.flush().expect("later flush remains idempotent");
+        drop(writer);
+
+        let record = receiver.try_recv().expect("one record was emitted");
+        assert_eq!(record.len(), 20);
+        assert!(record.ends_with(TRUNCATED));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
     }
 
     #[test]

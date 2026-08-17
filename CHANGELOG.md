@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   discovery with filename-only entries and one visible warning.
 - Removed unused canonical-path, source-path, media-ID, mount-status, and scanner
   counter data from the retained library index.
+- Replaced internal symlink policy, scan progress, and log-record lifecycle
+  boolean pairs with enums while keeping version-1 configuration files
+  compatible.
 - Disabled release-tool caching, stopped checkout credential persistence, and
   moved the validated release version out of inline shell expansion.
 

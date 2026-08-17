@@ -107,25 +107,40 @@ section!(QueueConfig {
     max_items: usize,
     max_bytes: usize
 });
-section!(ScanConfig {
-    max_files: usize,
-    max_entries: usize,
-    max_depth: usize,
-    max_playlists: usize,
-    max_entries_per_playlist: usize,
-    max_symlink_resolutions: usize,
-    max_parser_attempts: usize,
-    cross_mounts: bool,
-    max_path_bytes: usize,
-    max_total_path_bytes: usize,
-    max_metadata_field_bytes: usize,
-    max_total_metadata_bytes: usize,
-    max_warning_bytes: usize,
-    max_index_bytes: usize,
-    follow_file_symlinks: bool,
-    follow_directory_symlinks: bool,
-    ignore_hidden_audio: bool
-});
+
+/// Supported file-symlink behavior after validating the version-1 config.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SymlinkPolicy {
+    Ignore,
+    FollowFiles,
+}
+
+impl SymlinkPolicy {
+    #[must_use]
+    pub const fn follows_files(self) -> bool {
+        matches!(self, Self::FollowFiles)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ScanConfig {
+    pub max_files: usize,
+    pub max_entries: usize,
+    pub max_depth: usize,
+    pub max_playlists: usize,
+    pub max_entries_per_playlist: usize,
+    pub max_symlink_resolutions: usize,
+    pub max_parser_attempts: usize,
+    pub cross_mounts: bool,
+    pub max_path_bytes: usize,
+    pub max_total_path_bytes: usize,
+    pub max_metadata_field_bytes: usize,
+    pub max_total_metadata_bytes: usize,
+    pub max_warning_bytes: usize,
+    pub max_index_bytes: usize,
+    pub symlink_policy: SymlinkPolicy,
+    pub ignore_hidden_audio: bool,
+}
 section!(RuntimeConfig {
     process_memory_budget_bytes: usize,
     max_open_files: usize,
@@ -148,13 +163,71 @@ struct ParsedConfig {
     default_view: String,
     #[serde(default)]
     input: Option<RetiredInputConfig>,
-    scan: ScanConfig,
+    scan: ParsedScanConfig,
     #[serde(default)]
     search: SearchConfig,
     #[serde(default)]
     queue: QueueConfig,
     runtime: RuntimeConfig,
     logging: LoggingConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+// Version 1 persists four boolean keys. Parsing them verbatim keeps existing
+// config files compatible before the symlink pair becomes one enum.
+#[allow(clippy::struct_excessive_bools)]
+struct ParsedScanConfig {
+    max_files: usize,
+    max_entries: usize,
+    max_depth: usize,
+    max_playlists: usize,
+    max_entries_per_playlist: usize,
+    max_symlink_resolutions: usize,
+    max_parser_attempts: usize,
+    cross_mounts: bool,
+    max_path_bytes: usize,
+    max_total_path_bytes: usize,
+    max_metadata_field_bytes: usize,
+    max_total_metadata_bytes: usize,
+    max_warning_bytes: usize,
+    max_index_bytes: usize,
+    follow_file_symlinks: bool,
+    follow_directory_symlinks: bool,
+    ignore_hidden_audio: bool,
+}
+
+impl ParsedScanConfig {
+    fn into_config(self) -> AppResult<ScanConfig> {
+        if self.follow_directory_symlinks {
+            return Err(AppError::InvalidConfig(
+                "scan.follow_directory_symlinks must be false in v1".into(),
+            ));
+        }
+        let symlink_policy = if self.follow_file_symlinks {
+            SymlinkPolicy::FollowFiles
+        } else {
+            SymlinkPolicy::Ignore
+        };
+        Ok(ScanConfig {
+            max_files: self.max_files,
+            max_entries: self.max_entries,
+            max_depth: self.max_depth,
+            max_playlists: self.max_playlists,
+            max_entries_per_playlist: self.max_entries_per_playlist,
+            max_symlink_resolutions: self.max_symlink_resolutions,
+            max_parser_attempts: self.max_parser_attempts,
+            cross_mounts: self.cross_mounts,
+            max_path_bytes: self.max_path_bytes,
+            max_total_path_bytes: self.max_total_path_bytes,
+            max_metadata_field_bytes: self.max_metadata_field_bytes,
+            max_total_metadata_bytes: self.max_total_metadata_bytes,
+            max_warning_bytes: self.max_warning_bytes,
+            max_index_bytes: self.max_index_bytes,
+            symlink_policy,
+            ignore_hidden_audio: self.ignore_hidden_audio,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -212,11 +285,12 @@ pub fn parse(input: &[u8]) -> AppResult<Config> {
             2_000,
         )?;
     }
+    let scan = parsed.scan.into_config()?;
     let config = Config {
         config_version: parsed.config_version,
         theme: parsed.theme,
         default_view: parsed.default_view,
-        scan: parsed.scan,
+        scan,
         search: parsed.search,
         queue: parsed.queue,
         runtime: parsed.runtime,
@@ -411,11 +485,6 @@ fn validate_scan(scan: &ScanConfig) -> AppResult<()> {
         8_388_608,
     )?;
     inclusive("scan.max_index_bytes", scan.max_index_bytes, 1, 117_440_512)?;
-    if scan.follow_directory_symlinks {
-        return Err(AppError::InvalidConfig(
-            "scan.follow_directory_symlinks must be false in v1".into(),
-        ));
-    }
     Ok(())
 }
 
@@ -543,7 +612,7 @@ impl Default for Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_CONFIG, MAX_CONFIG_BYTES, parse};
+    use super::{DEFAULT_CONFIG, MAX_CONFIG_BYTES, SymlinkPolicy, parse};
 
     fn replace_once(source: &str, old: &str, new: &str) -> String {
         assert_eq!(
@@ -601,6 +670,32 @@ mod tests {
         assert_eq!(config.search.max_query_bytes, 4_096);
         assert_eq!(config.queue.max_items, 10_000);
         assert_eq!(config.queue.max_bytes, 1_048_576);
+    }
+
+    #[test]
+    fn version_one_symlink_flags_map_to_the_supported_policy() {
+        let followed = parse(DEFAULT_CONFIG.as_bytes()).expect("default config remains readable");
+        assert_eq!(followed.scan.symlink_policy, SymlinkPolicy::FollowFiles);
+
+        let ignored = replace_once(
+            DEFAULT_CONFIG,
+            "follow_file_symlinks = true",
+            "follow_file_symlinks = false",
+        );
+        let ignored = parse(ignored.as_bytes()).expect("disabled file symlinks remain readable");
+        assert_eq!(ignored.scan.symlink_policy, SymlinkPolicy::Ignore);
+
+        let directories = replace_once(
+            DEFAULT_CONFIG,
+            "follow_directory_symlinks = false",
+            "follow_directory_symlinks = true",
+        );
+        let error = parse(directories.as_bytes()).expect_err("directory symlinks remain forbidden");
+        assert!(
+            error
+                .to_string()
+                .contains("scan.follow_directory_symlinks must be false in v1")
+        );
     }
 
     #[test]
@@ -675,13 +770,6 @@ mod tests {
             DEFAULT_CONFIG,
             "max_entries = 100000",
             "max_entries = 49999",
-        );
-        assert!(parse(text.as_bytes()).is_err());
-
-        let text = replace_once(
-            DEFAULT_CONFIG,
-            "follow_directory_symlinks = false",
-            "follow_directory_symlinks = true",
         );
         assert!(parse(text.as_bytes()).is_err());
 
