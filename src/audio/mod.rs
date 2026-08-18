@@ -8,7 +8,8 @@ mod output;
 mod spectrum;
 
 use std::fs::File;
-use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError, channel, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -31,9 +32,38 @@ pub fn fuzz_decode(input: &[u8]) {
 }
 
 const COMMAND_CAPACITY: usize = 32;
-const EVENT_CAPACITY: usize = 64;
 const WORKER_POLL: Duration = Duration::from_millis(5);
 const POSITION_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Counters that can be read without touching the audio callback's control path.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct AudioDiagnostics {
+    pub(crate) underrun_samples: u64,
+    pub(crate) xruns: u64,
+    pub(crate) realtime_denied: u64,
+    pub(crate) device_changes: u64,
+}
+
+/// The counters behind [`AudioDiagnostics`], written by the audio callback and
+/// the CPAL error callback, and read by the terminal loop.
+#[derive(Default)]
+pub(crate) struct AudioMetrics {
+    pub(crate) underrun_samples: AtomicU64,
+    pub(crate) xruns: AtomicU64,
+    pub(crate) realtime_denied: AtomicU64,
+    pub(crate) device_changes: AtomicU64,
+}
+
+impl AudioMetrics {
+    fn snapshot(&self) -> AudioDiagnostics {
+        AudioDiagnostics {
+            underrun_samples: self.underrun_samples.load(Ordering::Relaxed),
+            xruns: self.xruns.load(Ordering::Relaxed),
+            realtime_denied: self.realtime_denied.load(Ordering::Relaxed),
+            device_changes: self.device_changes.load(Ordering::Relaxed),
+        }
+    }
+}
 
 /// One decoded PCM format accepted by the current pipeline.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -138,6 +168,7 @@ pub struct AudioRuntime {
     events: Option<Receiver<AudioEvent>>,
     positions: Option<Arc<PositionLane>>,
     spectrum: Option<Arc<SpectrumLane>>,
+    metrics: Arc<AudioMetrics>,
     worker: Option<JoinHandle<AppResult<()>>>,
 }
 
@@ -149,13 +180,16 @@ impl AudioRuntime {
     /// Returns an audio error when the owned worker thread cannot start.
     pub fn start() -> AppResult<Self> {
         let (command_tx, command_rx) = sync_channel(COMMAND_CAPACITY);
-        let (event_tx, event_rx) = sync_channel(EVENT_CAPACITY);
+        // State events must not backpressure the worker that keeps the PCM ring fed.
+        let (event_tx, event_rx) = channel();
         let seeks = Arc::new(SeekLane::default());
         let worker_seeks = Arc::clone(&seeks);
         let positions = Arc::new(PositionLane::default());
         let worker_positions = Arc::clone(&positions);
         let spectrum = Arc::new(SpectrumLane::default());
         let worker_spectrum = Arc::clone(&spectrum);
+        let metrics = Arc::new(AudioMetrics::default());
+        let worker_metrics = Arc::clone(&metrics);
         let worker = thread::Builder::new()
             .name("suzumushi-audio".into())
             .spawn(move || {
@@ -166,6 +200,7 @@ impl AudioRuntime {
                     &worker_positions,
                     ProductionBackend {
                         spectrum: worker_spectrum,
+                        metrics: worker_metrics,
                     },
                 );
                 worker_seeks.close();
@@ -178,6 +213,7 @@ impl AudioRuntime {
             events: Some(event_rx),
             positions: Some(positions),
             spectrum: Some(spectrum),
+            metrics,
             worker: Some(worker),
         })
     }
@@ -255,6 +291,11 @@ impl AudioRuntime {
         self.spectrum
             .as_ref()
             .map_or_else(AudioSpectrum::default, |spectrum| spectrum.latest())
+    }
+
+    /// Returns callback and backend diagnostics without waiting for the worker.
+    pub(crate) fn diagnostics(&self) -> AudioDiagnostics {
+        self.metrics.snapshot()
     }
 
     /// Cancels active playback and awaits every owned thread and helper.
@@ -407,13 +448,17 @@ trait Backend: Send {
 
 struct ProductionBackend {
     spectrum: Arc<SpectrumLane>,
+    metrics: Arc<AudioMetrics>,
 }
 
 impl Backend for ProductionBackend {
     fn open(&mut self, file: &File, position: Duration) -> Result<PlaybackParts, String> {
         Ok((
             Box::new(decoder::HelperDecoder::start(file, position)?),
-            Box::new(output::CpalOutput::new(Arc::clone(&self.spectrum))),
+            Box::new(output::CpalOutput::with_metrics(
+                Arc::clone(&self.spectrum),
+                Arc::clone(&self.metrics),
+            )),
         ))
     }
 }
@@ -457,7 +502,7 @@ impl<B: Backend> WorkerCore<B> {
     fn command(
         &mut self,
         command: AudioCommand,
-        events: &SyncSender<AudioEvent>,
+        events: &Sender<AudioEvent>,
         positions: &PositionLane,
     ) -> Result<bool, String> {
         match command {
@@ -505,7 +550,7 @@ impl<B: Backend> WorkerCore<B> {
         position: Duration,
         mut settings: PlaybackSettings,
         paused: bool,
-        events: &SyncSender<AudioEvent>,
+        events: &Sender<AudioEvent>,
     ) {
         settings.volume_percent = settings.volume_percent.min(100);
         if let Err(message) = self.stop_active() {
@@ -548,12 +593,7 @@ impl<B: Backend> WorkerCore<B> {
         }
     }
 
-    fn pause(
-        &mut self,
-        generation: u64,
-        events: &SyncSender<AudioEvent>,
-        positions: &PositionLane,
-    ) {
+    fn pause(&mut self, generation: u64, events: &Sender<AudioEvent>, positions: &PositionLane) {
         if let Some(active) = self.matching_active(generation)
             && !active.paused
         {
@@ -573,7 +613,7 @@ impl<B: Backend> WorkerCore<B> {
         self.publish_position(positions, true);
     }
 
-    fn resume(&mut self, generation: u64, events: &SyncSender<AudioEvent>) {
+    fn resume(&mut self, generation: u64, events: &Sender<AudioEvent>) {
         if let Some(active) = self.matching_active(generation)
             && active.paused
         {
@@ -592,7 +632,7 @@ impl<B: Backend> WorkerCore<B> {
         }
     }
 
-    fn stop(&mut self, generation: u64, events: &SyncSender<AudioEvent>) {
+    fn stop(&mut self, generation: u64, events: &Sender<AudioEvent>) {
         if self
             .active
             .as_ref()
@@ -615,7 +655,7 @@ impl<B: Backend> WorkerCore<B> {
         &mut self,
         generation: u64,
         position: Duration,
-        events: &SyncSender<AudioEvent>,
+        events: &Sender<AudioEvent>,
         positions: &PositionLane,
     ) {
         let timing = self
@@ -664,7 +704,7 @@ impl<B: Backend> WorkerCore<B> {
         }
     }
 
-    fn drive(&mut self, events: &SyncSender<AudioEvent>, positions: &PositionLane) -> bool {
+    fn drive(&mut self, events: &Sender<AudioEvent>, positions: &PositionLane) -> bool {
         let Some(active) = self.active.as_ref() else {
             return false;
         };
@@ -679,7 +719,7 @@ impl<B: Backend> WorkerCore<B> {
             || self.finish_drained(events, positions, generation)
     }
 
-    fn write_pending(&mut self, events: &SyncSender<AudioEvent>, generation: u64) -> bool {
+    fn write_pending(&mut self, events: &Sender<AudioEvent>, generation: u64) -> bool {
         let active = self.active.as_mut().expect("active playback is retained");
         let Some((samples, mut offset)) = active.pending.take() else {
             return false;
@@ -713,7 +753,7 @@ impl<B: Backend> WorkerCore<B> {
         }
     }
 
-    fn poll_decoder(&mut self, events: &SyncSender<AudioEvent>, generation: u64) -> bool {
+    fn poll_decoder(&mut self, events: &Sender<AudioEvent>, generation: u64) -> bool {
         let active = self.active.as_mut().expect("active playback is retained");
         if active.pending.is_some() || active.ended {
             return false;
@@ -739,12 +779,7 @@ impl<B: Backend> WorkerCore<B> {
         }
     }
 
-    fn decoder_ready(
-        &mut self,
-        events: &SyncSender<AudioEvent>,
-        generation: u64,
-        info: DecodedInfo,
-    ) {
+    fn decoder_ready(&mut self, events: &Sender<AudioEvent>, generation: u64, info: DecodedInfo) {
         let active = self.active.as_mut().expect("active playback is retained");
         if active.info.is_some() {
             self.fail(events, generation, "decoder sent two format headers");
@@ -760,12 +795,7 @@ impl<B: Backend> WorkerCore<B> {
         }
     }
 
-    fn decoder_samples(
-        &mut self,
-        events: &SyncSender<AudioEvent>,
-        generation: u64,
-        samples: Vec<f32>,
-    ) {
+    fn decoder_samples(&mut self, events: &Sender<AudioEvent>, generation: u64, samples: Vec<f32>) {
         let active = self.active.as_mut().expect("active playback is retained");
         let invalid = if active.info.is_none() {
             Some("decoder sent samples before its format")
@@ -785,7 +815,7 @@ impl<B: Backend> WorkerCore<B> {
 
     fn finish_drained(
         &mut self,
-        events: &SyncSender<AudioEvent>,
+        events: &Sender<AudioEvent>,
         positions: &PositionLane,
         generation: u64,
     ) -> bool {
@@ -906,7 +936,7 @@ impl<B: Backend> WorkerCore<B> {
         });
     }
 
-    fn output_failed(&mut self, events: &SyncSender<AudioEvent>, generation: u64) -> bool {
+    fn output_failed(&mut self, events: &Sender<AudioEvent>, generation: u64) -> bool {
         let message = self
             .active
             .as_ref()
@@ -925,7 +955,7 @@ impl<B: Backend> WorkerCore<B> {
             .filter(|active| active.generation == generation)
     }
 
-    fn fail(&mut self, events: &SyncSender<AudioEvent>, generation: u64, message: &str) {
+    fn fail(&mut self, events: &Sender<AudioEvent>, generation: u64, message: &str) {
         let cleanup = self.stop_active().err();
         let message = cleanup.map_or_else(
             || message.to_owned(),
@@ -950,7 +980,7 @@ impl<B: Backend> WorkerCore<B> {
     }
 }
 
-fn emit_started(active: &mut ActivePlayback, events: &SyncSender<AudioEvent>) {
+fn emit_started(active: &mut ActivePlayback, events: &Sender<AudioEvent>) {
     let info = active
         .info
         .expect("samples require prepared decoder information");
@@ -1002,7 +1032,7 @@ fn position_for(active: &ActivePlayback) -> Duration {
 fn worker_main<B: Backend>(
     commands: &Receiver<AudioCommand>,
     seeks: &SeekLane,
-    events: &SyncSender<AudioEvent>,
+    events: &Sender<AudioEvent>,
     positions: &PositionLane,
     backend: B,
 ) -> AppResult<()> {
@@ -1049,7 +1079,7 @@ fn worker_main<B: Backend>(
     }
 }
 
-fn emit(events: &SyncSender<AudioEvent>, event: AudioEvent) {
+fn emit(events: &Sender<AudioEvent>, event: AudioEvent) {
     let _ = events.send(event);
 }
 
@@ -1063,9 +1093,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        AudioCommand, AudioEvent, AudioFormat, AudioPosition, AudioRuntime, Backend, DecoderPoll,
-        DecoderStream, OutputStream, PlaybackParts, PlaybackSettings, PositionLane, SeekLane,
-        SeekRequest, WorkerCore, sync_channel,
+        AudioCommand, AudioEvent, AudioFormat, AudioMetrics, AudioPosition, AudioRuntime, Backend,
+        DecoderPoll, DecoderStream, OutputStream, PlaybackParts, PlaybackSettings, PositionLane,
+        SeekLane, SeekRequest, WorkerCore, channel, sync_channel,
     };
 
     #[derive(Default)]
@@ -1225,7 +1255,7 @@ mod tests {
 
     fn drive_steps<B: Backend>(
         core: &mut WorkerCore<B>,
-        events: &std::sync::mpsc::SyncSender<AudioEvent>,
+        events: &std::sync::mpsc::Sender<AudioEvent>,
         positions: &PositionLane,
         steps: usize,
     ) {
@@ -1272,6 +1302,7 @@ mod tests {
             events: None,
             positions: None,
             spectrum: None,
+            metrics: Arc::new(AudioMetrics::default()),
             worker: None,
         };
 
@@ -1321,7 +1352,7 @@ mod tests {
             DecoderPoll::Samples(vec![0.1, -0.1]),
         ]));
         let mut core = WorkerCore::new(backend);
-        let (events, received) = sync_channel(4);
+        let (events, received) = channel();
         let positions = PositionLane::default();
 
         core.command(
@@ -1367,7 +1398,7 @@ mod tests {
             DecoderPoll::Samples(vec![0.1, -0.1]),
         ]));
         let mut core = WorkerCore::new(backend);
-        let (events, received) = sync_channel(4);
+        let (events, received) = channel();
         let positions = PositionLane::default();
 
         core.command(
@@ -1416,7 +1447,7 @@ mod tests {
             DecoderPoll::Samples(vec![0.1, -0.1, 0.2, -0.2]),
         ]));
         let mut core = WorkerCore::new(backend);
-        let (events, received) = sync_channel(8);
+        let (events, received) = channel();
         let positions = PositionLane::default();
 
         core.command(
@@ -1479,7 +1510,7 @@ mod tests {
             DecoderPoll::End,
         ]));
         let mut core = WorkerCore::new(backend);
-        let (events, received) = sync_channel(8);
+        let (events, received) = channel();
         let positions = PositionLane::default();
         core.command(
             AudioCommand::Play {
@@ -1521,7 +1552,7 @@ mod tests {
     fn gain_changes_reach_the_fake_output() {
         let (backend, fixture) = fixture_backend(VecDeque::new());
         let mut core = WorkerCore::new(backend);
-        let (events, _received) = sync_channel(4);
+        let (events, _received) = channel();
         let positions = PositionLane::default();
         core.command(
             AudioCommand::Play {
@@ -1569,7 +1600,7 @@ mod tests {
             DecoderPoll::Samples(vec![0.1; 512]),
         ]));
         let mut core = WorkerCore::new(backend);
-        let (events, received) = sync_channel(16);
+        let (events, received) = channel();
         let positions = PositionLane::default();
         core.command(
             AudioCommand::Play {
@@ -1649,7 +1680,7 @@ mod tests {
             DecoderPoll::End,
         ]));
         let mut core = WorkerCore::new(backend);
-        let (events, received) = sync_channel(16);
+        let (events, received) = channel();
         let positions = PositionLane::default();
         core.command(
             AudioCommand::Play {

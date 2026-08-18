@@ -11,7 +11,7 @@ publish = false
 
 [dependencies]
 clap = { version = "=4.6.6", default-features = false, features = ["help", "std", "usage"] }
-cpal = { version = "=0.18.1", default-features = false }
+cpal = { version = "=0.18.1", default-features = false, features = ["pipewire", "realtime-dbus"] }
 crossterm = { version = "=0.29.0", default-features = false, features = ["events"] }
 lofty = { version = "=0.24.0", default-features = false }
 ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm_0_29"] }

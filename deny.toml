@@ -18,6 +18,17 @@ allow = [
   "Zlib",
 ]
 
+# Build-time only: both generate the PipeWire FFI bindings and never link into
+# the shipped binary. Scoped per crate so neither license is allowed repository
+# wide.
+[[licenses.exceptions]]
+name = "bindgen"
+allow = ["BSD-3-Clause"]
+
+[[licenses.exceptions]]
+name = "libloading"
+allow = ["ISC"]
+
 [sources]
 unknown-git = "deny"
 unknown-registry = "deny"

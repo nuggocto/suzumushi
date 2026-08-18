@@ -19,7 +19,7 @@ use ratatui::layout::Rect;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use crate::app::{AppState, PlaybackIntent};
-use crate::audio::{AudioCommand, AudioEvent, AudioRuntime};
+use crate::audio::{AudioCommand, AudioDiagnostics, AudioEvent, AudioRuntime};
 use crate::config::{Config, TERMINAL_BUFFER_BYTES};
 use crate::errors::{AppError, AppResult};
 use crate::event::{AppEvent, EventSource};
@@ -113,9 +113,11 @@ fn run_terminal_session(
 
     let events = EventSource::new();
     let mut event_time = Duration::ZERO;
+    let mut audio_diagnostics = AudioDiagnosticsReporter::default();
 
     while !app.should_quit {
         drain_audio_events(app, root, audio)?;
+        audio_diagnostics.report(audio, event_time);
         drain_mpris_actions(app, root, audio, mpris)?;
         publish_mpris(app, mpris)?;
         state_sync.sync(app, state_store, event_time)?;
@@ -324,6 +326,73 @@ fn drain_audio_events(
         }
     }
     Ok(())
+}
+
+/// Rate limit for audio diagnostics. The event loop turns every `MAX_POLL`, so an
+/// ongoing dropout would otherwise warn ten times a second and rotate the bounded
+/// log files clean of every other record.
+const DIAGNOSTICS_REPORT_INTERVAL: Duration = Duration::from_secs(30);
+
+#[derive(Default)]
+struct AudioDiagnosticsReporter {
+    reported: AudioDiagnostics,
+    last_report: Option<Duration>,
+}
+
+impl AudioDiagnosticsReporter {
+    /// Logs the counters that grew since the last report, at most once per
+    /// [`DIAGNOSTICS_REPORT_INTERVAL`]. Suppressed growth is not lost: it accrues
+    /// into the next report's delta, because `reported` only advances when one is
+    /// actually emitted.
+    fn report(&mut self, audio: &AudioRuntime, now: Duration) {
+        let current = audio.diagnostics();
+        if current == self.reported {
+            return;
+        }
+        let due = self
+            .last_report
+            .is_none_or(|last| now.saturating_sub(last) >= DIAGNOSTICS_REPORT_INTERVAL);
+        if !due {
+            return;
+        }
+
+        let underruns = current.underrun_samples - self.reported.underrun_samples;
+        if underruns != 0 {
+            tracing::warn!(
+                samples = underruns,
+                total_samples = current.underrun_samples,
+                "audio output ring underrun"
+            );
+        }
+        let xruns = current.xruns - self.reported.xruns;
+        if xruns != 0 {
+            tracing::warn!(
+                count = xruns,
+                total = current.xruns,
+                "audio backend reported an xrun"
+            );
+        }
+        let realtime_denied = current.realtime_denied - self.reported.realtime_denied;
+        if realtime_denied != 0 {
+            tracing::warn!(
+                count = realtime_denied,
+                total = current.realtime_denied,
+                "audio thread real-time scheduling was denied"
+            );
+        }
+        // The backend reroutes the stream itself, so this is expected, not a fault.
+        let device_changes = current.device_changes - self.reported.device_changes;
+        if device_changes != 0 {
+            tracing::info!(
+                count = device_changes,
+                total = current.device_changes,
+                "audio output was rerouted to a new default device"
+            );
+        }
+
+        self.reported = current;
+        self.last_report = Some(now);
+    }
 }
 
 fn dispatch_playback(

@@ -19,6 +19,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compatible.
 - Disabled release-tool caching, stopped checkout credential persistence, and
   moved the validated release version out of inline shell expansion.
+- Preferred CPAL's native PipeWire backend with RTKit scheduling when available,
+  while retaining ALSA as the fallback backend.
+- Removed bounded audio-event backpressure so terminal event delivery cannot
+  stall the PCM-producing worker.
+
+### Fixed
+
+- Kept recoverable CPAL XRUN, device-change, and real-time-denial reports from
+  terminating playback, counting and logging each one while preserving fatal
+  stream-error handling.
+- Counted and logged genuine PCM-ring underruns without treating expected
+  end-of-track padding as a dropout.
 
 ## [1.0.2] - 2026-08-13
 

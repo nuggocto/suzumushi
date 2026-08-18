@@ -6,9 +6,14 @@ Suzumushi publishes one prebuilt target:
 binary, the relative `suzu -> suzumushi` symlink, the README, changelog, and
 Apache 2.0 license.
 
-The binary dynamically uses glibc, libgcc, and ALSA. It has no network runtime.
-The release target is verified on the GitHub runner and current Arch Linux; it
-is not a musl, ARM, macOS, or Windows compatibility claim.
+The binary dynamically uses glibc, libgcc, ALSA, PipeWire, and D-Bus. It has no
+network runtime. The release target is verified on the GitHub runner and current
+Arch Linux; it is not a musl, ARM, macOS, or Windows compatibility claim.
+
+PipeWire and D-Bus are linked unconditionally, not loaded on demand: the dynamic
+linker resolves `libpipewire-0.3.so.0` and `libdbus-1.so.3` before any backend
+selection happens, so the ALSA fallback does not make them optional at runtime.
+Releases before 1.0.3 linked only ALSA.
 
 ## GitHub release procedure
 
@@ -71,3 +76,10 @@ When writes are available:
 For a stable release, update the Cargo version and changelog first. Publish and
 verify the final GitHub artifact, then replace the prior version, URL, and
 checksum in the AUR recipe. Regenerate `.SRCINFO`; never edit it by hand.
+
+`depends` must match what the published archive actually links, which is why it
+is only ever changed together with the archive it describes. The 1.0.3 recipe is
+the first that must add `pipewire` and `dbus` to the existing `alsa-lib`,
+`glibc`, and `libgcc`; without them the installed binary fails at exec with
+`error while loading shared libraries: libpipewire-0.3.so.0`. Confirm the list
+against `ldd` on the extracted release binary, and let `namcap` corroborate it.

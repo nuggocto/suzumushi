@@ -7,13 +7,13 @@ use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{
-    Device, FromSample, I24, OutputCallbackInfo, SampleFormat, SizedSample, Stream, StreamConfig,
-    U24,
+    Device, Error, ErrorKind, FromSample, I24, OutputCallbackInfo, SampleFormat, SizedSample,
+    Stream, StreamConfig, U24,
 };
 use rtrb::{Consumer, Producer, RingBuffer};
 
 use super::spectrum::{SpectrumAnalyzer, SpectrumLane};
-use super::{AudioFormat, OutputStream};
+use super::{AudioFormat, AudioMetrics, OutputStream};
 
 const PCM_RING_SAMPLES: usize = 262_144;
 const MIN_SAMPLE_RATE: u32 = 8_000;
@@ -27,24 +27,28 @@ pub(super) struct CpalOutput {
     stream: Option<Stream>,
     producer: Option<Producer<f32>>,
     consumed: Arc<AtomicU64>,
+    written_samples: Arc<AtomicU64>,
     failure: Arc<AtomicU8>,
     gain: Arc<AtomicU32>,
     spectrum: Arc<SpectrumLane>,
+    metrics: Arc<AudioMetrics>,
     written: u64,
     stream_active: bool,
 }
 
 impl CpalOutput {
-    pub(super) fn new(spectrum: Arc<SpectrumLane>) -> Self {
+    pub(super) fn with_metrics(spectrum: Arc<SpectrumLane>, metrics: Arc<AudioMetrics>) -> Self {
         Self {
             source: None,
             output_channels: 0,
             stream: None,
             producer: None,
             consumed: Arc::new(AtomicU64::new(0)),
+            written_samples: Arc::new(AtomicU64::new(0)),
             failure: Arc::new(AtomicU8::new(0)),
             gain: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
             spectrum,
+            metrics,
             written: 0,
             stream_active: false,
         }
@@ -92,14 +96,17 @@ impl OutputStream for CpalOutput {
         let config = supported.config();
         let (producer, pcm_reader) = RingBuffer::new(PCM_RING_SAMPLES);
         self.consumed.store(0, Ordering::Release);
+        self.written_samples.store(0, Ordering::Release);
         self.failure.store(0, Ordering::Release);
         self.written = 0;
         self.stream_active = false;
         self.spectrum.clear();
         let frames_read = Arc::clone(&self.consumed);
+        let written_samples = Arc::clone(&self.written_samples);
         let failure = Arc::clone(&self.failure);
         let gain = Arc::clone(&self.gain);
         let spectrum = Arc::clone(&self.spectrum);
+        let metrics = Arc::clone(&self.metrics);
         let stream = build_stream(
             &device,
             &config,
@@ -107,9 +114,11 @@ impl OutputStream for CpalOutput {
             pcm_reader,
             CallbackState {
                 frames_read,
+                written_samples,
                 failure,
                 gain,
                 spectrum,
+                metrics,
             },
         )?;
         self.source = Some(source);
@@ -140,6 +149,22 @@ impl OutputStream for CpalOutput {
             .as_mut()
             .ok_or_else(|| "audio output ring is unavailable".to_owned())?;
         let frames = (samples.len() / source_channels).min(producer.slots() / self.output_channels);
+        // Publish the committed total before enqueueing it. The callback compares what
+        // it has consumed against this counter to separate a real dropout from expected
+        // end-of-track padding, and a total published only after the pushes would still
+        // read as fully consumed while the ring was running dry. Every error below ends
+        // the track, so the two counts cannot drift apart on a surviving stream.
+        let output_samples = frames
+            .checked_mul(self.output_channels)
+            .ok_or_else(|| "audio output sample count overflow".to_owned())?;
+        self.written = self
+            .written
+            .checked_add(
+                u64::try_from(output_samples)
+                    .map_err(|_| "audio output sample count overflow".to_owned())?,
+            )
+            .ok_or_else(|| "audio output sample generation exhausted".to_owned())?;
+        self.written_samples.store(self.written, Ordering::Release);
         for frame in samples.chunks_exact(source_channels).take(frames) {
             match (source_channels, self.output_channels) {
                 (1, output_channels) => {
@@ -170,16 +195,6 @@ impl OutputStream for CpalOutput {
                 _ => return Err("unsupported channel conversion".into()),
             }
         }
-        let output_samples = frames
-            .checked_mul(self.output_channels)
-            .ok_or_else(|| "audio output sample count overflow".to_owned())?;
-        self.written = self
-            .written
-            .checked_add(
-                u64::try_from(output_samples)
-                    .map_err(|_| "audio output sample count overflow".to_owned())?,
-            )
-            .ok_or_else(|| "audio output sample generation exhausted".to_owned())?;
         Ok(frames * source_channels)
     }
 
@@ -266,9 +281,11 @@ fn build_stream(
 
 struct CallbackState {
     frames_read: Arc<AtomicU64>,
+    written_samples: Arc<AtomicU64>,
     failure: Arc<AtomicU8>,
     gain: Arc<AtomicU32>,
     spectrum: Arc<SpectrumLane>,
+    metrics: Arc<AudioMetrics>,
 }
 
 fn typed_stream<T>(
@@ -282,41 +299,111 @@ where
 {
     let CallbackState {
         frames_read,
+        written_samples,
         failure,
         gain,
         spectrum,
+        metrics,
     } = callback;
     let mut analyzer = SpectrumAnalyzer::new(config.sample_rate, config.channels);
+    let callback_metrics = Arc::clone(&metrics);
+    let error_metrics = Arc::clone(&metrics);
     device
         .build_output_stream(
             *config,
             move |output: &mut [T], _: &OutputCallbackInfo| {
-                let mut read = 0_u64;
                 let gain = f32::from_bits(gain.load(Ordering::Relaxed));
-                let mut published = None;
-                for sample in output {
-                    let value = if let Ok(value) = pcm_reader.pop() {
-                        read += 1;
-                        finite_or_silence(value * gain)
-                    } else {
-                        0.0
-                    };
-                    *sample = T::from_sample(value);
-                    if let Some(levels) = analyzer.push_interleaved(value) {
-                        published = Some(levels);
-                    }
-                }
-                if let Some(levels) = published {
-                    spectrum.publish(levels);
-                }
-                frames_read.fetch_add(read, Ordering::Release);
+                render_output(
+                    output,
+                    RenderContext {
+                        pcm_reader: &mut pcm_reader,
+                        gain,
+                        analyzer: &mut analyzer,
+                        frames_read: &frames_read,
+                        written_samples: &written_samples,
+                        metrics: &callback_metrics,
+                        spectrum: &spectrum,
+                    },
+                );
             },
-            move |_| {
-                failure.store(1, Ordering::Release);
-            },
+            move |error| record_stream_error(&error, &failure, &error_metrics),
             None,
         )
         .map_err(|error| format!("cannot build the audio output stream: {error}"))
+}
+
+struct RenderContext<'a> {
+    pcm_reader: &'a mut Consumer<f32>,
+    gain: f32,
+    analyzer: &'a mut SpectrumAnalyzer,
+    frames_read: &'a AtomicU64,
+    written_samples: &'a AtomicU64,
+    metrics: &'a AudioMetrics,
+    spectrum: &'a SpectrumLane,
+}
+
+fn render_output<T>(output: &mut [T], context: RenderContext<'_>)
+where
+    T: SizedSample + FromSample<f32>,
+{
+    let RenderContext {
+        pcm_reader,
+        gain,
+        analyzer,
+        frames_read,
+        written_samples,
+        metrics,
+        spectrum,
+    } = context;
+    let mut read = 0_u64;
+    let mut underruns = 0_u64;
+    let mut published = None;
+    for sample in output {
+        let value = if let Ok(value) = pcm_reader.pop() {
+            read += 1;
+            finite_or_silence(value * gain)
+        } else {
+            let consumed = frames_read.load(Ordering::Relaxed).saturating_add(read);
+            if consumed < written_samples.load(Ordering::Acquire) {
+                underruns += 1;
+            }
+            0.0
+        };
+        *sample = T::from_sample(value);
+        if let Some(levels) = analyzer.push_interleaved(value) {
+            published = Some(levels);
+        }
+    }
+    if let Some(levels) = published {
+        spectrum.publish(levels);
+    }
+    if underruns != 0 {
+        metrics
+            .underrun_samples
+            .fetch_add(underruns, Ordering::Relaxed);
+    }
+    frames_read.fetch_add(read, Ordering::Release);
+}
+
+/// Records one CPAL error callback.
+///
+/// The first three kinds are recoverable: CPAL keeps the stream running, so they
+/// are counted for diagnostics only. `DeviceChanged` means the route moved and
+/// CPAL rerouted the stream itself; a stream that genuinely needs rebuilding is
+/// reported as `StreamInvalidated`, which falls through to the fatal arm.
+fn record_stream_error(error: &Error, failure: &AtomicU8, metrics: &AudioMetrics) {
+    match error.kind() {
+        ErrorKind::RealtimeDenied => {
+            metrics.realtime_denied.fetch_add(1, Ordering::Relaxed);
+        }
+        ErrorKind::Xrun => {
+            metrics.xruns.fetch_add(1, Ordering::Relaxed);
+        }
+        ErrorKind::DeviceChanged => {
+            metrics.device_changes.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => failure.store(1, Ordering::Release),
+    }
 }
 
 fn is_pcm_format(format: SampleFormat) -> bool {
@@ -348,20 +435,114 @@ fn finite_or_silence(sample: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
     use crate::audio::{AudioSpectrum, SPECTRUM_BANDS};
 
-    use super::{CpalOutput, OutputStream, SpectrumLane};
+    use super::{
+        AudioMetrics, CpalOutput, Error, ErrorKind, OutputStream, SpectrumLane,
+        record_stream_error, render_output,
+    };
 
     #[test]
     fn inactive_pause_clears_spectrum_and_remains_idempotent() {
         let spectrum = Arc::new(SpectrumLane::default());
         spectrum.publish(AudioSpectrum::new([5; SPECTRUM_BANDS]));
-        let mut output = CpalOutput::new(Arc::clone(&spectrum));
+        let mut output =
+            CpalOutput::with_metrics(Arc::clone(&spectrum), Arc::new(AudioMetrics::default()));
         output
             .pause()
             .expect("an inactive stream is already paused");
         assert_eq!(spectrum.latest(), AudioSpectrum::default());
         output.stop().expect("an inactive stream stops cleanly");
+    }
+
+    #[test]
+    fn an_empty_ring_is_rendered_as_silence_and_counted_without_waiting() {
+        let (_producer, mut consumer) = rtrb::RingBuffer::new(8);
+        let metrics = AudioMetrics::default();
+        let frames_read = AtomicU64::new(0);
+        let written_samples = AtomicU64::new(4);
+        let spectrum = SpectrumLane::default();
+        let mut analyzer = super::SpectrumAnalyzer::new(48_000, 2);
+        let mut output = [1.0_f32; 4];
+
+        render_output(
+            &mut output,
+            super::RenderContext {
+                pcm_reader: &mut consumer,
+                gain: 1.0,
+                analyzer: &mut analyzer,
+                frames_read: &frames_read,
+                written_samples: &written_samples,
+                metrics: &metrics,
+                spectrum: &spectrum,
+            },
+        );
+
+        assert_eq!(output.map(f32::to_bits), [0; 4]);
+        assert_eq!(frames_read.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            metrics.underrun_samples.load(Ordering::Relaxed),
+            output.len() as u64
+        );
+    }
+
+    #[test]
+    fn expected_tail_padding_is_not_counted_as_an_underrun() {
+        let (mut producer, mut consumer) = rtrb::RingBuffer::new(8);
+        producer.push(0.25).expect("first scheduled sample");
+        producer.push(-0.25).expect("second scheduled sample");
+        let metrics = AudioMetrics::default();
+        let frames_read = AtomicU64::new(0);
+        let written_samples = AtomicU64::new(2);
+        let spectrum = SpectrumLane::default();
+        let mut analyzer = super::SpectrumAnalyzer::new(48_000, 1);
+        let mut output = [1.0_f32; 4];
+
+        render_output(
+            &mut output,
+            super::RenderContext {
+                pcm_reader: &mut consumer,
+                gain: 1.0,
+                analyzer: &mut analyzer,
+                frames_read: &frames_read,
+                written_samples: &written_samples,
+                metrics: &metrics,
+                spectrum: &spectrum,
+            },
+        );
+
+        assert_eq!(frames_read.load(Ordering::Relaxed), 2);
+        assert_eq!(metrics.underrun_samples.load(Ordering::Relaxed), 0);
+        let bits = output.map(f32::to_bits);
+        assert_eq!(&bits[2..], &[0, 0]);
+    }
+
+    #[test]
+    fn recoverable_cpal_errors_are_counted_without_stopping_the_stream() {
+        let metrics = AudioMetrics::default();
+        let failure = AtomicU8::new(0);
+
+        record_stream_error(&Error::from(ErrorKind::Xrun), &failure, &metrics);
+        record_stream_error(&Error::from(ErrorKind::RealtimeDenied), &failure, &metrics);
+        record_stream_error(&Error::from(ErrorKind::DeviceChanged), &failure, &metrics);
+
+        assert_eq!(failure.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.xruns.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.realtime_denied.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.device_changes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn fatal_cpal_errors_still_fail_the_stream() {
+        for kind in [ErrorKind::DeviceNotAvailable, ErrorKind::StreamInvalidated] {
+            let metrics = AudioMetrics::default();
+            let failure = AtomicU8::new(0);
+
+            record_stream_error(&Error::from(kind), &failure, &metrics);
+
+            assert_eq!(failure.load(Ordering::Relaxed), 1, "{kind:?} must be fatal");
+        }
     }
 }

@@ -48,11 +48,12 @@ relative packaging symlink; `suzumushi` remains the one canonical executable.
 
 ## Install the current checkout
 
-You need Rust 1.95 or newer and the ALSA development files:
+You need Rust 1.95 or newer plus the ALSA, PipeWire, D-Bus, and Clang
+development files:
 
-- Arch Linux: `alsa-lib`
-- Debian or Ubuntu: `libasound2-dev`
-- Fedora: `alsa-lib-devel`
+- Arch Linux: `alsa-lib dbus pipewire clang pkgconf`
+- Debian or Ubuntu: `libasound2-dev libpipewire-0.3-dev libspa-0.2-dev libdbus-1-dev libclang-dev pkg-config`
+- Fedora: `alsa-lib-devel pipewire-devel dbus-devel libclang-devel pkgconf-pkg-config`
 
 Install and create a local Suzumushi root:
 
