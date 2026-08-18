@@ -33,6 +33,13 @@ jobs:
             libclang-dev \
             pkg-config
 
+      # Materialise the pinned toolchain in one process first. Without this the
+      # parallel `cargo install` jobs below each trigger their own rustup sync and
+      # race in ~/.rustup/downloads, failing with "could not rename 'downloaded'
+      # file ... No such file or directory". CI does the same for the same reason.
+      - name: Install pinned Rust toolchain
+        run: rustc --version
+
       - name: Install mise and project tools
         uses: jdx/mise-action@7e36c90d9ab29c415a2384db3006f3ec8a8cc654 # v4.2.4
         with:

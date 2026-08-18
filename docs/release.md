@@ -78,7 +78,7 @@ verify the final GitHub artifact, then replace the prior version, URL, and
 checksum in the AUR recipe. Regenerate `.SRCINFO`; never edit it by hand.
 
 `depends` must match what the published archive actually links, which is why it
-is only ever changed together with the archive it describes. The 1.1.0 recipe is
+is only ever changed together with the archive it describes. The 1.1.1 recipe is
 the first that must add `pipewire` and `dbus` to the existing `alsa-lib`,
 `glibc`, and `libgcc`; without them the installed binary fails at exec with
 `error while loading shared libraries: libpipewire-0.3.so.0`. Confirm the list
