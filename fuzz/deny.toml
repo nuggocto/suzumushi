@@ -19,6 +19,17 @@ allow = [
   "Zlib",
 ]
 
+# Inherited from suzumushi's PipeWire backend. Build-time only: both generate the
+# FFI bindings and never link into a fuzz target. Kept in step with the root
+# deny.toml, which carries the same two exceptions.
+[[licenses.exceptions]]
+name = "bindgen"
+allow = ["BSD-3-Clause"]
+
+[[licenses.exceptions]]
+name = "libloading"
+allow = ["ISC"]
+
 [sources]
 unknown-git = "deny"
 unknown-registry = "deny"
