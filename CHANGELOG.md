@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.1.0] - 2026-08-18
 
 ### Changed
 
@@ -26,11 +26,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Opened the output stream at the track's own sample rate when the device
+  advertises only its current graph rate, so 44.1 kHz tracks keep playing on a
+  48 kHz PipeWire graph instead of being refused as unsupported.
 - Kept recoverable CPAL XRUN, device-change, and real-time-denial reports from
   terminating playback, counting and logging each one while preserving fatal
   stream-error handling.
 - Counted and logged genuine PCM-ring underruns without treating expected
-  end-of-track padding as a dropout.
+  end-of-track padding as a dropout, rate limiting the reports so a sustained
+  dropout cannot rotate the bounded log files clean of other records.
 
 ## [1.0.2] - 2026-08-13
 

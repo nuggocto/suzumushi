@@ -117,7 +117,7 @@ fn run_terminal_session(
 
     while !app.should_quit {
         drain_audio_events(app, root, audio)?;
-        audio_diagnostics.report(audio, event_time);
+        audio_diagnostics.report(audio.diagnostics(), event_time);
         drain_mpris_actions(app, root, audio, mpris)?;
         publish_mpris(app, mpris)?;
         state_sync.sync(app, state_store, event_time)?;
@@ -337,15 +337,14 @@ const DIAGNOSTICS_REPORT_INTERVAL: Duration = Duration::from_secs(30);
 struct AudioDiagnosticsReporter {
     reported: AudioDiagnostics,
     last_report: Option<Duration>,
+    realtime_denial_logged: bool,
 }
 
 impl AudioDiagnosticsReporter {
     /// Logs the counters that grew since the last report, at most once per
-    /// [`DIAGNOSTICS_REPORT_INTERVAL`]. Suppressed growth is not lost: it accrues
-    /// into the next report's delta, because `reported` only advances when one is
-    /// actually emitted.
-    fn report(&mut self, audio: &AudioRuntime, now: Duration) {
-        let current = audio.diagnostics();
+    /// [`DIAGNOSTICS_REPORT_INTERVAL`]. The interval only advances when something
+    /// was actually logged, so a quiet counter cannot delay a real dropout report.
+    fn report(&mut self, current: AudioDiagnostics, now: Duration) {
         if current == self.reported {
             return;
         }
@@ -355,43 +354,64 @@ impl AudioDiagnosticsReporter {
         if !due {
             return;
         }
+        let mut emitted = false;
 
-        let underruns = current.underrun_samples - self.reported.underrun_samples;
+        let underruns = current
+            .underrun_samples
+            .saturating_sub(self.reported.underrun_samples);
         if underruns != 0 {
             tracing::warn!(
                 samples = underruns,
                 total_samples = current.underrun_samples,
                 "audio output ring underrun"
             );
+            emitted = true;
         }
-        let xruns = current.xruns - self.reported.xruns;
+        let xruns = current.xruns.saturating_sub(self.reported.xruns);
         if xruns != 0 {
             tracing::warn!(
                 count = xruns,
                 total = current.xruns,
                 "audio backend reported an xrun"
             );
-        }
-        let realtime_denied = current.realtime_denied - self.reported.realtime_denied;
-        if realtime_denied != 0 {
-            tracing::warn!(
-                count = realtime_denied,
-                total = current.realtime_denied,
-                "audio thread real-time scheduling was denied"
-            );
+            emitted = true;
         }
         // The backend reroutes the stream itself, so this is expected, not a fault.
-        let device_changes = current.device_changes - self.reported.device_changes;
+        let device_changes = current
+            .device_changes
+            .saturating_sub(self.reported.device_changes);
         if device_changes != 0 {
             tracing::info!(
                 count = device_changes,
                 total = current.device_changes,
                 "audio output was rerouted to a new default device"
             );
+            // A new route can mean a different backend, where a refusal is no longer
+            // the harmless redundant one described below. Let it be said again.
+            self.realtime_denial_logged = false;
+            emitted = true;
+        }
+        // Real-time promotion is a property of the audio path rather than an incident:
+        // it either succeeds when a stream starts or it does not. PipeWire promotes its
+        // own data thread and then refuses CPAL's redundant attempt on every callback,
+        // so this is said once per path and the counter accrues in silence.
+        let denials = current
+            .realtime_denied
+            .saturating_sub(self.reported.realtime_denied);
+        if !self.realtime_denial_logged && denials != 0 {
+            tracing::warn!(
+                total = current.realtime_denied,
+                "audio thread real-time promotion was refused; the backend may already \
+                 schedule its own audio thread"
+            );
+            self.realtime_denial_logged = true;
+            emitted = true;
         }
 
         self.reported = current;
-        self.last_report = Some(now);
+        if emitted {
+            self.last_report = Some(now);
+        }
     }
 }
 
@@ -559,6 +579,7 @@ mod tests {
     use rustix::fd::AsFd;
 
     use super::{
+        AudioDiagnostics, AudioDiagnosticsReporter, DIAGNOSTICS_REPORT_INTERVAL,
         STATE_HEARTBEAT_INTERVAL, StateSynchronizer, TerminalControl, TerminalGuard, apply_event,
         finish_session, validate_terminal_area,
     };
@@ -578,6 +599,67 @@ mod tests {
             warnings: Vec::new(),
             counters: ScanCounters::default(),
         }
+    }
+
+    #[test]
+    fn a_persistent_real_time_denial_is_reported_only_once() {
+        let mut reporter = AudioDiagnosticsReporter::default();
+        let mut counters = AudioDiagnostics {
+            realtime_denied: 50,
+            ..AudioDiagnostics::default()
+        };
+
+        reporter.report(counters, Duration::ZERO);
+        assert!(reporter.realtime_denial_logged, "the first denial is said");
+        assert_eq!(reporter.last_report, Some(Duration::ZERO));
+
+        // PipeWire refuses CPAL's redundant promotion on every callback, so the
+        // counter keeps climbing. That must stay silent, and it must not consume the
+        // report interval, or a real dropout would be left waiting behind it.
+        counters.realtime_denied = 5_000;
+        reporter.report(counters, DIAGNOSTICS_REPORT_INTERVAL * 2);
+
+        assert_eq!(reporter.last_report, Some(Duration::ZERO));
+        assert_eq!(reporter.reported.realtime_denied, 5_000);
+    }
+
+    #[test]
+    fn a_rerouted_device_lets_a_real_time_denial_be_said_again() {
+        let mut reporter = AudioDiagnosticsReporter::default();
+        let mut counters = AudioDiagnostics {
+            realtime_denied: 10,
+            ..AudioDiagnostics::default()
+        };
+        reporter.report(counters, Duration::ZERO);
+        assert!(reporter.realtime_denial_logged);
+
+        // The route moved, so the next refusal may come from a different backend
+        // where it is a real cause of dropouts rather than a redundant attempt.
+        counters.device_changes = 1;
+        reporter.report(counters, DIAGNOSTICS_REPORT_INTERVAL);
+        assert!(!reporter.realtime_denial_logged, "the latch is re-armed");
+
+        counters.realtime_denied = 11;
+        reporter.report(counters, DIAGNOSTICS_REPORT_INTERVAL * 2);
+        assert!(reporter.realtime_denial_logged, "a new refusal is said");
+    }
+
+    #[test]
+    fn a_dropout_is_reported_even_after_a_silent_denial_flood() {
+        let mut reporter = AudioDiagnosticsReporter::default();
+        let mut counters = AudioDiagnostics {
+            realtime_denied: 1,
+            ..AudioDiagnostics::default()
+        };
+        reporter.report(counters, Duration::ZERO);
+        counters.realtime_denied = 9_000;
+        reporter.report(counters, DIAGNOSTICS_REPORT_INTERVAL);
+
+        counters.underrun_samples = 128;
+        reporter.report(counters, DIAGNOSTICS_REPORT_INTERVAL);
+
+        assert_eq!(reporter.reported.underrun_samples, 128);
+        assert_eq!(reporter.last_report, Some(DIAGNOSTICS_REPORT_INTERVAL));
     }
 
     #[test]

@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{
-    Device, Error, ErrorKind, FromSample, I24, OutputCallbackInfo, SampleFormat, SizedSample,
-    Stream, StreamConfig, U24,
+    BufferSize, Device, Error, ErrorKind, FromSample, I24, OutputCallbackInfo, SampleFormat,
+    SizedSample, Stream, StreamConfig, SupportedStreamConfigRange, U24,
 };
 use rtrb::{Consumer, Producer, RingBuffer};
 
@@ -74,26 +74,18 @@ impl OutputStream for CpalOutput {
         let device = host
             .default_output_device()
             .ok_or_else(|| "no default audio output device is available".to_owned())?;
-        let range = device
+        let ranges = device
             .supported_output_configs()
-            .map_err(|error| format!("cannot query the default output device: {error}"))?
-            .filter(|range| {
-                range.contains_rate(source.sample_rate)
-                    && range.channels() > 0
-                    && range.channels() <= MAX_OUTPUT_CHANNELS
-                    && is_pcm_format(range.sample_format())
-            })
-            .max_by(cpal::SupportedStreamConfigRange::cmp_default_heuristics)
-            .ok_or_else(|| {
-                format!(
-                    "the default output device has no supported PCM configuration at {} Hz",
-                    source.sample_rate
-                )
-            })?;
-        let supported = range.with_sample_rate(source.sample_rate);
-        self.output_channels = usize::from(supported.channels());
-        let sample_format = supported.sample_format();
-        let config = supported.config();
+            .map_err(|error| format!("cannot query the default output device: {error}"))?;
+        let choice = select_output_config(ranges, source.sample_rate).ok_or_else(|| {
+            format!(
+                "the default output device has no supported PCM configuration for {} channel audio",
+                source.channels
+            )
+        })?;
+        self.output_channels = usize::from(choice.channels);
+        let sample_format = choice.sample_format;
+        let config = choice.config;
         let (producer, pcm_reader) = RingBuffer::new(PCM_RING_SAMPLES);
         self.consumed.store(0, Ordering::Release);
         self.written_samples.store(0, Ordering::Release);
@@ -120,7 +112,15 @@ impl OutputStream for CpalOutput {
                 spectrum,
                 metrics,
             },
-        )?;
+        )
+        .map_err(|error| {
+            // The device may not advertise this rate at all: name it, so a genuine
+            // rate refusal is not left behind an opaque backend message.
+            format!(
+                "{error} (requested {} Hz on {} channels as {sample_format})",
+                source.sample_rate, choice.channels
+            )
+        })?;
         self.source = Some(source);
         self.producer = Some(producer);
         self.stream = Some(stream);
@@ -406,6 +406,53 @@ fn record_stream_error(error: &Error, failure: &AtomicU8, metrics: &AudioMetrics
     }
 }
 
+/// The output stream settings chosen for one track.
+struct OutputChoice {
+    channels: u16,
+    sample_format: SampleFormat,
+    config: StreamConfig,
+}
+
+/// Picks the output configuration for a track recorded at `sample_rate`.
+///
+/// A device that advertises the track's rate is preferred. When none does, the
+/// best remaining configuration is opened at the track's rate anyway, because an
+/// advertised range is not the same as a hard limit: `PipeWire` reports only its
+/// current graph rate yet resamples internally, so refusing here would reject
+/// every 44.1 kHz track on an otherwise working 48 kHz graph. A backend that
+/// truly cannot accept the rate still fails, but later and with its own message.
+fn select_output_config(
+    ranges: impl Iterator<Item = SupportedStreamConfigRange>,
+    sample_rate: u32,
+) -> Option<OutputChoice> {
+    let usable: Vec<SupportedStreamConfigRange> = ranges
+        .filter(|range| {
+            range.channels() > 0
+                && range.channels() <= MAX_OUTPUT_CHANNELS
+                && is_pcm_format(range.sample_format())
+        })
+        .collect();
+    let chosen = usable
+        .iter()
+        .filter(|range| range.contains_rate(sample_rate))
+        .max_by(|left, right| left.cmp_default_heuristics(right))
+        .or_else(|| {
+            usable
+                .iter()
+                .max_by(|left, right| left.cmp_default_heuristics(right))
+        })?;
+    let channels = chosen.channels();
+    Some(OutputChoice {
+        channels,
+        sample_format: chosen.sample_format(),
+        config: StreamConfig {
+            channels,
+            sample_rate,
+            buffer_size: BufferSize::Default,
+        },
+    })
+}
+
 fn is_pcm_format(format: SampleFormat) -> bool {
     matches!(
         format,
@@ -439,10 +486,64 @@ mod tests {
 
     use crate::audio::{AudioSpectrum, SPECTRUM_BANDS};
 
+    use cpal::{SampleFormat, SupportedBufferSize, SupportedStreamConfigRange};
+
     use super::{
         AudioMetrics, CpalOutput, Error, ErrorKind, OutputStream, SpectrumLane,
-        record_stream_error, render_output,
+        record_stream_error, render_output, select_output_config,
     };
+
+    fn range(
+        channels: u16,
+        min_rate: u32,
+        max_rate: u32,
+        format: SampleFormat,
+    ) -> SupportedStreamConfigRange {
+        SupportedStreamConfigRange::new(
+            channels,
+            min_rate,
+            max_rate,
+            SupportedBufferSize::Unknown,
+            format,
+        )
+    }
+
+    #[test]
+    fn a_device_advertising_only_its_graph_rate_still_opens_at_the_track_rate() {
+        // What PipeWire reports: one fixed 48 kHz node that resamples internally.
+        let ranges = [range(2, 48_000, 48_000, SampleFormat::F32)];
+
+        let choice = select_output_config(ranges.into_iter(), 44_100)
+            .expect("a 48 kHz graph must still accept a 44.1 kHz track");
+
+        assert_eq!(choice.config.sample_rate, 44_100);
+        assert_eq!(choice.config.channels, 2);
+        assert_eq!(choice.channels, 2);
+    }
+
+    #[test]
+    fn an_advertised_rate_match_wins_over_the_resampling_fallback() {
+        // What ALSA reports: a wide plug range alongside a fixed one.
+        let ranges = [
+            range(6, 48_000, 48_000, SampleFormat::F32),
+            range(2, 8_000, 192_000, SampleFormat::F32),
+        ];
+
+        let choice = select_output_config(ranges.into_iter(), 44_100).expect("a config");
+
+        assert_eq!(choice.config.sample_rate, 44_100);
+        assert_eq!(choice.channels, 2, "the range covering 44.1 kHz must win");
+    }
+
+    #[test]
+    fn ranges_outside_the_supported_channel_bounds_are_refused() {
+        let ranges = [
+            range(0, 8_000, 192_000, SampleFormat::F32),
+            range(64, 8_000, 192_000, SampleFormat::F32),
+        ];
+
+        assert!(select_output_config(ranges.into_iter(), 44_100).is_none());
+    }
 
     #[test]
     fn inactive_pause_clears_spectrum_and_remains_idempotent() {

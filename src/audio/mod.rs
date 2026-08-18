@@ -46,6 +46,12 @@ pub(crate) struct AudioDiagnostics {
 
 /// The counters behind [`AudioDiagnostics`], written by the audio callback and
 /// the CPAL error callback, and read by the terminal loop.
+///
+/// These accumulate for the whole life of the runtime and must never be reset
+/// when a stream is prepared, unlike the per-stream `consumed`, `written_samples`
+/// and `failure` cells that sit beside them in `CpalOutput`. The terminal reports
+/// them as deltas against its own last snapshot, so zeroing one here would make
+/// that snapshot larger than the counter it is subtracted from.
 #[derive(Default)]
 pub(crate) struct AudioMetrics {
     pub(crate) underrun_samples: AtomicU64,

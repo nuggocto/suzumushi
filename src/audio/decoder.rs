@@ -987,6 +987,35 @@ mod tests {
     }
 
     #[test]
+    fn a_track_below_the_usual_graph_rate_decodes_at_its_own_rate() {
+        // Every other fixture is 48 kHz, which hid the output stage assuming the
+        // device would advertise the track's rate. Keep one 44.1 kHz track here so
+        // rate handling is never again exercised only at the common graph rate.
+        let bytes = include_bytes!("../../tests/fixtures/audio/tone-44100.wav").as_slice();
+        let mut sink = CollectSink::default();
+
+        decode_source(Cursor::new(bytes.to_vec()), &mut sink, None, Duration::ZERO)
+            .expect("decode the 44.1 kHz fixture");
+
+        assert_eq!(
+            sink.format,
+            Some(AudioFormat {
+                sample_rate: 44_100,
+                channels: 2
+            })
+        );
+        assert!(
+            (20_000..=25_000).contains(&sink.samples.len()),
+            "emitted {} samples",
+            sink.samples.len()
+        );
+        assert!(
+            sink.duration
+                .is_some_and(|duration| duration > Duration::ZERO)
+        );
+    }
+
+    #[test]
     fn accurate_seek_discards_preroll_for_every_verified_container() {
         let fixtures: BTreeMap<&str, &[u8]> = BTreeMap::from([
             (
