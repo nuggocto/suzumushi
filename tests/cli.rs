@@ -7,6 +7,7 @@ use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -102,6 +103,47 @@ fn bare_command_requires_a_selected_root() {
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8(output.stderr).expect("UTF-8 error");
     assert!(stderr.contains("suzumushi init ./suzumushi"), "{stderr}");
+}
+
+#[test]
+fn unresponsive_session_bus_does_not_prevent_terminal_use_or_shutdown() {
+    let temp = TempDir::new().expect("temporary directory");
+    let root = temp.path().join("root");
+    initialize_root(&root);
+    let runtime = temp.path().join("runtime");
+    fs::create_dir(&runtime).expect("runtime directory");
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).expect("private runtime");
+    let bus_path = temp.path().join("bus");
+    let listener = UnixListener::bind(&bus_path).expect("isolated bus");
+    listener.set_nonblocking(true).expect("bounded accept");
+    let (mut master, slave) = open_test_pty(80, 24);
+    let mut child = terminal_command(&root, &runtime)
+        .env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={}", bus_path.display()),
+        )
+        .stdin(Stdio::from(duplicate_file(&slave)))
+        .stdout(Stdio::from(duplicate_file(&slave)))
+        .stderr(Stdio::from(slave))
+        .spawn()
+        .expect("terminal with stalled bus");
+
+    // The listener accepts no authentication data. Its open socket stays alive
+    // through startup and shutdown, so only the player's deadline can unblock it.
+    read_pty_until_with_timeout(&mut master, &mut child, b"Library", Duration::from_secs(5));
+    let (mut connection, _) = listener.accept().expect("player contacted the fake bus");
+    connection
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("read deadline");
+    let mut authentication = Vec::new();
+    connection
+        .read_to_end(&mut authentication)
+        .expect("timed-out connection was closed");
+    assert!(authentication.starts_with(b"\0AUTH"));
+    master.write_all(b"q").expect("quit");
+    read_pty_to_exit(&mut master, &mut child);
+    let log = fs::read_to_string(root.join("logs/suzumushi.log")).expect("startup log");
+    assert!(log.contains("session bus connection timed out"), "{log}");
 }
 
 #[test]
@@ -866,7 +908,16 @@ fn duplicate_file(file: &File) -> File {
 }
 
 fn read_pty_until(master: &mut File, child: &mut Child, needle: &[u8]) -> Vec<u8> {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    read_pty_until_with_timeout(master, child, needle, Duration::from_secs(2))
+}
+
+fn read_pty_until_with_timeout(
+    master: &mut File,
+    child: &mut Child,
+    needle: &[u8],
+    timeout: Duration,
+) -> Vec<u8> {
+    let deadline = Instant::now() + timeout;
     let mut bytes = Vec::new();
     while Instant::now() < deadline {
         read_available(master, &mut bytes);

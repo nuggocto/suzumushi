@@ -693,6 +693,36 @@ fn files_directly_below_playlists_are_not_playlist_folders() {
 }
 
 #[test]
+fn enumeration_exhaustion_preserves_admitted_tracks_within_other_limits() {
+    let (_temp, root) = root();
+    for name in ["a.wav", "b.wav", "c.wav"] {
+        fs::write(root.join("audio/library").join(name), b"fake media").expect("media");
+    }
+    // Every name has the same cost, so this does not depend on readdir ordering.
+    for path_limit in [false, true] {
+        let mut config = Config::default();
+        config.scan.max_files = 2;
+        if path_limit {
+            config.scan.max_total_path_bytes =
+                "library".len() + "playlists".len() + 2 * "library/a.wav".len();
+        } else {
+            config.scan.max_entries = 4;
+        }
+        let mut reader = FakeMetadata::default();
+        let index = scan(&root, &config, &mut reader);
+        assert!(!index.complete);
+        assert_eq!(index.entries.len(), 2, "path limit: {path_limit}");
+        assert_eq!(reader.attempts, 2);
+        assert!(index.counters.encountered_entries <= config.scan.max_entries);
+        assert!(index.counters.path_bytes <= config.scan.max_total_path_bytes);
+
+        config.scan.max_files = 1;
+        let limited = scan(&root, &config, &mut FakeMetadata::default());
+        assert_eq!(limited.entries.len(), 1, "media cap still applies");
+    }
+}
+
+#[test]
 fn scan_counters_stop_at_limit_and_report_limit_plus_one() {
     let (_temp, root) = root();
     fs::write(root.join("audio/library/a.mp3"), b"a").expect("first media");

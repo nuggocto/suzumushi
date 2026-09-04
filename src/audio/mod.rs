@@ -35,6 +35,11 @@ const COMMAND_CAPACITY: usize = 32;
 const WORKER_POLL: Duration = Duration::from_millis(5);
 const POSITION_INTERVAL: Duration = Duration::from_millis(250);
 
+/// Match the decoder protocol's whole-microsecond position representation.
+pub(crate) fn decoder_position(position: Duration) -> Duration {
+    Duration::from_micros(u64::try_from(position.as_micros()).unwrap_or(u64::MAX))
+}
+
 /// Counters that can be read without touching the audio callback's control path.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct AudioDiagnostics {
@@ -112,6 +117,11 @@ pub enum AudioCommand {
         position: Duration,
         settings: PlaybackSettings,
         paused: bool,
+    },
+    /// Supersedes previous playback even when opening the replacement failed.
+    LoadFailed {
+        generation: u64,
+        message: String,
     },
     Pause {
         generation: u64,
@@ -519,6 +529,22 @@ impl<B: Backend> WorkerCore<B> {
                 settings,
                 paused,
             } => self.play(generation, file, position, settings, paused, events),
+            AudioCommand::LoadFailed {
+                generation,
+                mut message,
+            } => {
+                if let Err(error) = self.stop_active() {
+                    message.push_str("; playback cleanup failed: ");
+                    message.push_str(&error);
+                }
+                emit(
+                    events,
+                    AudioEvent::Failed {
+                        generation,
+                        message,
+                    },
+                );
+            }
             AudioCommand::Pause { generation } => {
                 self.pause(generation, events, positions);
             }
@@ -1268,6 +1294,48 @@ mod tests {
         for _ in 0..steps {
             core.drive(events, positions);
         }
+    }
+
+    #[test]
+    fn failed_replacement_stops_the_previous_generation_before_reporting_failure() {
+        let (backend, fixture) = fixture_backend(VecDeque::new());
+        let mut core = WorkerCore::new(backend);
+        let (events, received) = channel();
+        let positions = PositionLane::default();
+        core.command(
+            AudioCommand::Play {
+                generation: 1,
+                file: harmless_file(),
+                position: Duration::ZERO,
+                settings: PlaybackSettings::default(),
+                paused: false,
+            },
+            &events,
+            &positions,
+        )
+        .expect("previous track");
+
+        core.command(
+            AudioCommand::LoadFailed {
+                generation: 2,
+                message: "replacement disappeared".into(),
+            },
+            &events,
+            &positions,
+        )
+        .expect("failed replacement is handled");
+
+        assert_eq!(
+            received.try_recv().expect("failure"),
+            AudioEvent::Failed {
+                generation: 2,
+                message: "replacement disappeared".into(),
+            }
+        );
+        assert!(fixture.decoder_stopped.load(Ordering::Acquire));
+        assert_eq!(*fixture.calls.lock().expect("output calls"), ["stop"]);
+        assert!(core.active.is_none());
+        assert!(received.try_recv().is_err(), "no obsolete stopped event");
     }
 
     #[test]

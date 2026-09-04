@@ -260,10 +260,15 @@ struct PendingEntry {
 enum ScanProgress {
     Clean,
     Degraded,
+    EnumerationExhausted,
     Stopped,
 }
 
 impl ScanProgress {
+    const fn can_enumerate(self) -> bool {
+        matches!(self, Self::Clean | Self::Degraded)
+    }
+
     const fn is_stopped(self) -> bool {
         matches!(self, Self::Stopped)
     }
@@ -342,7 +347,7 @@ impl<'a> Scanner<'a> {
     // Ownership keeps the pinned directory descriptor alive for the full enumeration.
     #[allow(clippy::needless_pass_by_value)]
     fn walk_directory(&mut self, fd: OwnedFd, relative: PathBuf, depth: usize) -> AppResult<()> {
-        if self.progress.is_stopped() {
+        if !self.progress.can_enumerate() {
             return Ok(());
         }
         if !self.acquire_open_slots(1, &relative) {
@@ -363,7 +368,7 @@ impl<'a> Scanner<'a> {
         self.counters.directory_enumerations += 1;
         let mut names = Vec::new();
         for result in &mut directory {
-            if self.progress.is_stopped() {
+            if !self.progress.can_enumerate() {
                 break;
             }
             let entry = match result {
@@ -383,7 +388,7 @@ impl<'a> Scanner<'a> {
             }
             let child = relative.join(&name);
             if !self.encounter(&child) {
-                if self.progress.is_stopped() {
+                if !self.progress.can_enumerate() {
                     break;
                 }
                 continue;
@@ -828,7 +833,7 @@ impl<'a> Scanner<'a> {
 
     fn encounter(&mut self, path: &Path) -> bool {
         if self.counters.encountered_entries >= self.limits.max_entries {
-            self.limit(path, "scan.max_entries");
+            self.enumeration_limit(path, "scan.max_entries");
             return false;
         }
         let bytes = path_bytes(path);
@@ -842,7 +847,7 @@ impl<'a> Scanner<'a> {
             return false;
         }
         if self.counters.path_bytes.saturating_add(bytes) > self.limits.max_total_path_bytes {
-            self.limit(path, "scan.max_total_path_bytes");
+            self.enumeration_limit(path, "scan.max_total_path_bytes");
             return false;
         }
         self.counters.encountered_entries += 1;
@@ -879,6 +884,19 @@ impl<'a> Scanner<'a> {
         } else {
             self.counters.index_bytes += bytes;
         }
+    }
+
+    fn enumeration_limit(&mut self, path: &Path, name: &str) {
+        // Already admitted names may still be inspected. Other exhausted budgets
+        // must retain their stronger stop condition, including warning storage.
+        if !self.progress.is_stopped() {
+            self.progress = ScanProgress::EnumerationExhausted;
+        }
+        self.warn(
+            ScanWarningCode::LimitReached,
+            path,
+            format!("{name} limit reached"),
+        );
     }
 
     fn limit(&mut self, path: &Path, name: &str) {

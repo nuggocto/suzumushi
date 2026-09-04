@@ -206,8 +206,8 @@ fn progress_bar(
         if duration.is_zero() {
             0
         } else {
-            let numerator = position.as_millis().min(duration.as_millis());
-            usize::try_from(numerator.saturating_mul(width as u128) / duration.as_millis())
+            let numerator = position.as_nanos().min(duration.as_nanos());
+            usize::try_from(numerator.saturating_mul(width as u128) / duration.as_nanos())
                 .unwrap_or(width)
                 .min(width)
         }
@@ -451,6 +451,28 @@ mod tests {
     fn snapshot(width: u16, height: u16) -> String {
         let app = AppState::new(&Config::default(), empty_index()).expect("app state");
         rendered(&app, width, height, Duration::ZERO)
+    }
+
+    #[test]
+    fn progress_handles_sub_millisecond_audio_and_clamps_at_completion() {
+        let duration = Some(Duration::from_micros(20));
+        assert_eq!(super::progress_bar(Duration::ZERO, duration, 4), "[----]");
+        assert_eq!(
+            super::progress_bar(Duration::from_micros(10), duration, 4),
+            "[==--]"
+        );
+        assert_eq!(
+            super::progress_bar(Duration::from_micros(20), duration, 4),
+            "[====]"
+        );
+        assert_eq!(
+            super::progress_bar(Duration::from_secs(1), duration, 4),
+            "[====]"
+        );
+        assert_eq!(
+            super::progress_bar(Duration::ZERO, Some(Duration::ZERO), 4),
+            "[----]"
+        );
     }
 
     #[test]

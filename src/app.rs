@@ -196,6 +196,7 @@ struct PlaybackState {
     position: Duration,
     duration: Option<Duration>,
     start_paused: bool,
+    finished: bool,
     spectrum: AudioSpectrum,
 }
 
@@ -210,7 +211,16 @@ impl PlaybackState {
             position: Duration::ZERO,
             duration: None,
             start_paused: false,
+            finished: false,
             spectrum: AudioSpectrum::silent(),
+        }
+    }
+
+    fn resume_position(&self) -> Duration {
+        if self.finished || self.duration.is_some_and(|end| self.position >= end) {
+            Duration::ZERO
+        } else {
+            self.position
         }
     }
 }
@@ -685,12 +695,7 @@ impl AppState {
         let position = self
             .current_queue_index()
             .filter(|index| *index == identity.current_index)
-            .map_or(Duration::ZERO, |_| self.playback.position);
-        let position = self
-            .playback
-            .duration
-            .filter(|duration| position >= *duration)
-            .map_or(position, |_| Duration::ZERO);
+            .map_or(Duration::ZERO, |_| self.playback.resume_position());
         Ok(Some(crate::state::SessionSnapshot::new(
             queue_entry_ids,
             identity.current_index,
@@ -776,6 +781,7 @@ impl AppState {
         let current = self.queue[current_index];
         self.queue_selection = current_index;
         self.playback.current = Some(current);
+        self.playback.finished = false;
         self.playback.position_hint = current_index;
         self.playback.position = position;
         self.playback.duration = None;
@@ -1136,7 +1142,7 @@ impl AppState {
                     let position = self
                         .current_queue_index()
                         .filter(|current| *current == index)
-                        .map_or(Duration::ZERO, |_| self.playback.position);
+                        .map_or(Duration::ZERO, |_| self.playback.resume_position());
                     self.start_new_shuffle_round_at(index, position)
                 }
             }
@@ -1244,6 +1250,7 @@ impl AppState {
                 self.playback.position = duration;
             }
             self.set_status("Queue finished");
+            self.playback.finished = true;
             None
         }
     }
@@ -1273,6 +1280,7 @@ impl AppState {
         };
         self.playback_generation = generation;
         self.playback.current = Some(item);
+        self.playback.finished = false;
         self.playback.position_hint = index;
         if self.shuffle {
             self.shuffle_cursor = self
@@ -1324,6 +1332,7 @@ impl AppState {
         self.playback.position = Duration::ZERO;
         self.playback.duration = None;
         self.playback.start_paused = false;
+        self.playback.finished = false;
         self.playback.spectrum = AudioSpectrum::default();
         self.set_playback_status(PlaybackStatus::Stopped);
         let title = self.queue_item_title(item, self.status_text_max_bytes);
@@ -1517,6 +1526,7 @@ impl AppState {
             .playback
             .duration
             .map_or(position, |duration| position.min(duration));
+        let position = crate::audio::decoder_position(position);
         self.playback.seek_target = Some(position);
         self.playback.position = position;
         let status = if forward {
@@ -1553,6 +1563,7 @@ impl AppState {
         {
             return None;
         }
+        let position = crate::audio::decoder_position(position);
         self.playback.seek_target = Some(position);
         self.playback.position = position;
         self.set_status("Seeked");
@@ -1858,6 +1869,11 @@ impl AppState {
         }
         let removed = self.queue[self.queue_selection];
         let title = self.entry_title(removed.entry_index);
+        if self.current_queue_index().is_none()
+            && self.queue_selection < self.playback.position_hint
+        {
+            self.playback.position_hint -= 1;
+        }
         self.queue.remove(self.queue_selection);
         if let Some(queued) = self
             .index
@@ -3116,6 +3132,31 @@ mod tests {
     }
 
     #[test]
+    fn removing_entries_before_an_absent_playing_item_preserves_its_successor() {
+        let mut app = AppState::new(
+            &Config::default(),
+            fixture_index_with_distinct_context_assets(),
+        )
+        .expect("app state");
+        for index in 0..4 {
+            select_entry(&mut app, index);
+            app.apply(AppAction::Activate);
+        }
+        app.apply(AppAction::Next);
+        let successor = app.queue[2].entry_id;
+        app.focus = Focus::Queue;
+        app.queue_selection = 1;
+        app.apply(AppAction::QueueRemove);
+        app.queue_selection = 0;
+        app.apply(AppAction::QueueRemove);
+
+        let next = app.audio_event(AudioEvent::Finished { generation: 2 });
+
+        assert!(matches!(next, Some(PlaybackIntent::Load { item, .. })
+            if item.entry_id == successor));
+    }
+
+    #[test]
     fn stop_clears_a_failed_playback_without_waiting_for_a_dead_worker_track() {
         let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
         select_entry(&mut app, 0);
@@ -3432,6 +3473,45 @@ mod tests {
     }
 
     #[test]
+    fn fractional_seek_acknowledgements_allow_progress_to_continue() {
+        let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+        app.apply(AppAction::Activate);
+        app.audio_event(AudioEvent::Started {
+            generation: 1,
+            timeline_revision: 1,
+            format: AudioFormat {
+                sample_rate: 48_000,
+                channels: 2,
+            },
+            duration: Some(Duration::from_mins(1)),
+            position: Duration::ZERO,
+        });
+        app.audio_position(AudioPosition {
+            generation: 1,
+            timeline_revision: 1,
+            position: Duration::from_nanos(256_020_833),
+            duration: Some(Duration::from_mins(1)),
+        });
+        let intent = app.apply(AppAction::SeekForward);
+        app.audio_event(AudioEvent::Seeked {
+            generation: 1,
+            timeline_revision: 2,
+            position: Duration::from_micros(5_256_020),
+        });
+        app.audio_position(AudioPosition {
+            generation: 1,
+            timeline_revision: 2,
+            position: Duration::from_secs(6),
+            duration: Some(Duration::from_mins(1)),
+        });
+
+        assert_eq!(app.playback_position(), Duration::from_secs(6));
+        assert!(matches!(intent, Some(PlaybackIntent::Seek { position, .. })
+            if position == Duration::from_micros(5_256_020)));
+        assert_eq!(app.seek_revision(), 1);
+    }
+
+    #[test]
     fn repeated_seeks_keep_the_latest_target_until_it_is_acknowledged() {
         let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
         select_entry(&mut app, 0);
@@ -3629,27 +3709,39 @@ mod tests {
 
     #[test]
     fn a_finished_track_resumes_from_the_beginning() {
-        let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
-        select_entry(&mut app, 0);
-        app.apply(AppAction::Activate);
-        app.audio_event(AudioEvent::Started {
-            generation: 1,
-            timeline_revision: 1,
-            format: AudioFormat {
-                sample_rate: 48_000,
-                channels: 2,
-            },
-            duration: Some(Duration::from_secs(10)),
-            position: Duration::ZERO,
-        });
-        app.audio_event(AudioEvent::Finished { generation: 1 });
+        for duration in [Some(Duration::from_secs(10)), None] {
+            let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+            select_entry(&mut app, 0);
+            app.apply(AppAction::Activate);
+            app.audio_event(AudioEvent::Started {
+                generation: 1,
+                timeline_revision: 1,
+                format: AudioFormat {
+                    sample_rate: 48_000,
+                    channels: 2,
+                },
+                duration,
+                position: Duration::ZERO,
+            });
+            app.audio_position(AudioPosition {
+                generation: 1,
+                timeline_revision: 1,
+                position: Duration::from_secs(7),
+                duration,
+            });
+            app.audio_event(AudioEvent::Finished { generation: 1 });
 
-        let snapshot = app
-            .session_snapshot()
-            .expect("session snapshot")
-            .expect("saved queue");
+            let snapshot = app
+                .session_snapshot()
+                .expect("session snapshot")
+                .expect("saved queue");
 
-        assert_eq!(snapshot.position_ms, 0);
+            assert_eq!(snapshot.position_ms, 0);
+
+            let replay = app.apply(AppAction::PlayPause);
+            assert!(matches!(replay, Some(PlaybackIntent::Load { position, .. })
+                if position == Duration::ZERO));
+        }
     }
 
     #[test]

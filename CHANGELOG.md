@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.2] - 2026-09-05
+
+### Fixed
+
+- Stopped previous playback before reporting a failed track replacement, so a
+  missing or changed next file cannot leave audio playing behind an error state.
+- Matched seek targets to the decoder protocol's microsecond precision so
+  successful seeks keep updating playback progress and saved positions.
+- Rendered progress safely for valid tracks shorter than one millisecond.
+- Restarted the completed last track from the beginning when Play is pressed.
+- Preserved the next queue item when the playing item and earlier entries are
+  removed while playback continues.
+- Retained admitted tracks when directory enumeration reaches its entry or
+  path-byte limit, while continuing to enforce the remaining scan budgets.
+- Cancelled session-bus connection setup after two seconds so an unresponsive
+  desktop service cannot indefinitely block terminal startup.
+- Updated rtrb to 0.3.5 in both dependency lockfiles for RUSTSEC-2026-0274.
+
 ## [1.1.1] - 2026-08-18
 
 ### Fixed

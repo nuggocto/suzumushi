@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use zbus::blocking::connection;
+use zbus::connection;
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{ObjectPath, OwnedValue, Value};
 
@@ -24,6 +24,7 @@ const NO_TRACK_PATH: &str = "/org/mpris/MediaPlayer2/TrackList/NoTrack";
 pub(crate) const REQUEST_CAPACITY: usize = 32;
 const BUS_MESSAGE_CAPACITY: usize = 8;
 const WORKER_POLL: Duration = Duration::from_millis(25);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const TEXT_MAX_BYTES: usize = 1_024;
 const CAN_GO_NEXT: u8 = 1 << 0;
 const CAN_GO_PREVIOUS: u8 = 1 << 1;
@@ -185,11 +186,12 @@ fn worker_main(
         .and_then(|builder| builder.max_queued(BUS_MESSAGE_CAPACITY).name(BUS_NAME))
         .and_then(|builder| builder.serve_at(OBJECT_PATH, root))
         .and_then(|builder| builder.serve_at(OBJECT_PATH, player))
-        .and_then(connection::Builder::build);
+        .map_err(|error| error.to_string())
+        .and_then(|builder| connect_with_timeout(builder, CONNECT_TIMEOUT));
     let connection = match built {
         Ok(connection) => connection,
         Err(error) => {
-            let _ = ready.send(Err(error.to_string()));
+            let _ = ready.send(Err(error));
             return;
         }
     };
@@ -222,6 +224,22 @@ fn worker_main(
         let _ = emit_changes(&connection, &previous, &next);
     }
     drop(connection);
+}
+
+fn connect_with_timeout(
+    builder: connection::Builder<'_>,
+    timeout: Duration,
+) -> Result<zbus::blocking::Connection, String> {
+    // Dropping the losing build future closes its socket and cancels setup.
+    // The worker then returns its startup error and can be joined normally.
+    async_io::block_on(futures_lite::future::or(
+        async { builder.build().await.map_err(|error| error.to_string()) },
+        async {
+            async_io::Timer::after(timeout).await;
+            Err("session bus connection timed out".into())
+        },
+    ))
+    .map(zbus::blocking::Connection::from)
 }
 
 struct RootInterface {
@@ -688,6 +706,8 @@ fn mpris_text(input: &str, max_bytes: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
+    use std::os::unix::net::UnixStream;
     use std::sync::{Arc, RwLock, mpsc};
     use std::time::Duration;
 
@@ -715,6 +735,35 @@ mod tests {
             capabilities: CAN_GO_NEXT | CAN_GO_PREVIOUS | CAN_PLAY | CAN_PAUSE | CAN_SEEK,
             seek_revision: 0,
         }
+    }
+
+    #[test]
+    fn stalled_bus_authentication_times_out_and_closes_the_connection() {
+        let (client, mut server) = UnixStream::pair().expect("isolated bus socket");
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("test deadline");
+        let worker = std::thread::spawn(move || {
+            super::connect_with_timeout(
+                zbus::connection::Builder::async_io_unix_stream(client),
+                Duration::from_millis(100),
+            )
+        });
+        let mut request = Vec::new();
+        server
+            .read_to_end(&mut request)
+            .expect("cancelled setup closes its socket");
+        assert!(
+            request.starts_with(b"\0AUTH"),
+            "real authentication was attempted"
+        );
+        assert_eq!(
+            worker
+                .join()
+                .expect("connection worker")
+                .expect_err("stalled bus"),
+            "session bus connection timed out"
+        );
     }
 
     #[test]

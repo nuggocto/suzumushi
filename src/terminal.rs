@@ -19,7 +19,7 @@ use ratatui::layout::Rect;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use crate::app::{AppState, PlaybackIntent};
-use crate::audio::{AudioCommand, AudioDiagnostics, AudioEvent, AudioRuntime};
+use crate::audio::{AudioCommand, AudioDiagnostics, AudioRuntime};
 use crate::config::{Config, TERMINAL_BUFFER_BYTES};
 use crate::errors::{AppError, AppResult};
 use crate::event::{AppEvent, EventSource};
@@ -421,7 +421,11 @@ fn dispatch_playback(
     audio: &AudioRuntime,
     intent: PlaybackIntent,
 ) -> AppResult<()> {
-    let command = match intent {
+    audio.send(playback_command(app, root, intent))
+}
+
+fn playback_command(app: &AppState, root: BorrowedFd<'_>, intent: PlaybackIntent) -> AudioCommand {
+    match intent {
         PlaybackIntent::Load {
             generation,
             item,
@@ -441,13 +445,10 @@ fn dispatch_playback(
                     settings,
                     paused,
                 },
-                Err(error) => {
-                    let _ = app.audio_event(AudioEvent::Failed {
-                        generation,
-                        message: error.to_string(),
-                    });
-                    return Ok(());
-                }
+                Err(error) => AudioCommand::LoadFailed {
+                    generation,
+                    message: error.to_string(),
+                },
             }
         }
         PlaybackIntent::Pause { generation } => AudioCommand::Pause { generation },
@@ -469,8 +470,7 @@ fn dispatch_playback(
             generation,
             position,
         },
-    };
-    audio.send(command)
+    }
 }
 
 trait TerminalControl {
@@ -599,6 +599,33 @@ mod tests {
             warnings: Vec::new(),
             counters: ScanCounters::default(),
         }
+    }
+
+    #[test]
+    fn unavailable_media_is_rejected_by_the_worker_before_app_failure() {
+        let app = AppState::new(&Config::default(), empty_index()).expect("app state");
+        let root = tempfile::tempfile().expect("unused root descriptor");
+        let command = super::playback_command(
+            &app,
+            root.as_fd(),
+            crate::app::PlaybackIntent::Load {
+                generation: 2,
+                item: crate::app::QueueItem {
+                    instance_id: 1,
+                    entry_index: 0,
+                    entry_id: crate::model::TrackEntryId(1),
+                    scan_generation: 1,
+                },
+                position: Duration::ZERO,
+                settings: crate::audio::PlaybackSettings::default(),
+                paused: false,
+            },
+        );
+        assert!(
+            matches!(command, crate::audio::AudioCommand::LoadFailed { generation: 2, message }
+            if message.contains("queued track became stale"))
+        );
+        assert_eq!(app.playback_status, PlaybackStatus::Stopped);
     }
 
     #[test]
