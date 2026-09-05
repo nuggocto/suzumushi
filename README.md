@@ -25,20 +25,20 @@ The verified archive below remains available for direct installation.
 
 The verified binary archive is built for 64-bit GNU/Linux. Download the archive
 and `SHA256SUMS` from the
-[`v1.1.2` release](https://github.com/nuggocto/suzumushi/releases/tag/v1.1.2),
+[`v1.1.3` release](https://github.com/nuggocto/suzumushi/releases/tag/v1.1.3),
 either in your browser or with:
 
 ```sh
 curl -fLO \
-  'https://github.com/nuggocto/suzumushi/releases/download/v1.1.2/{SHA256SUMS,suzumushi-v1.1.2-x86_64-unknown-linux-gnu.tar.xz}'
+  'https://github.com/nuggocto/suzumushi/releases/download/v1.1.3/{SHA256SUMS,suzumushi-v1.1.3-x86_64-unknown-linux-gnu.tar.xz}'
 ```
 
 Then verify and install the downloaded archive:
 
 ```sh
 sha256sum --check --ignore-missing SHA256SUMS
-tar -xf suzumushi-v1.1.2-x86_64-unknown-linux-gnu.tar.xz
-cd suzumushi-v1.1.2-x86_64-unknown-linux-gnu
+tar -xf suzumushi-v1.1.3-x86_64-unknown-linux-gnu.tar.xz
+cd suzumushi-v1.1.3-x86_64-unknown-linux-gnu
 sudo install -Dm755 suzumushi /usr/local/bin/suzumushi
 sudo ln -s suzumushi /usr/local/bin/suzu
 ```
@@ -92,6 +92,11 @@ suzumushi/audio/
 Every immediate folder below `audio/playlists/` is a playlist. It may contain
 copied audio files or file symlinks. Suzumushi never scans `~/Music`
 automatically.
+
+Unchanged files reuse metadata saved during the previous terminal startup.
+The disposable cache at `state/metadata.jsonl` holds at most 4 MiB and 10,000
+entries. Delete it while the player is closed to force a fresh metadata read.
+`diagnose` can read the cache but never writes it.
 
 Press `Enter` on a Library folder to collapse or expand it. This only changes
 the current terminal view: search still finds tracks inside collapsed folders,
@@ -178,7 +183,7 @@ automatic resampling are not current support claims.
 
 ## Status
 
-Version `1.1.2` is the current stable release. Its tag-driven Linux archive is
+Version `1.1.3` is the current stable release. Its tag-driven Linux archive is
 fully verified before GitHub publishes it. Arch users can install the matching
 `suzumushi-bin` package from AUR.
 

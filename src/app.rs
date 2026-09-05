@@ -840,7 +840,7 @@ impl AppState {
                 } else {
                     PlaybackStatus::Playing
                 };
-                self.set_playback_status(status);
+                self.playback_status = status;
                 self.playback.seek_target = None;
                 self.playback.format = Some(format);
                 self.playback.duration = duration;
@@ -854,17 +854,17 @@ impl AppState {
                 None
             }
             AudioEvent::Paused { .. } => {
-                self.set_playback_status(PlaybackStatus::Paused);
+                self.playback_status = PlaybackStatus::Paused;
                 self.set_status("Paused");
                 None
             }
             AudioEvent::Resumed { .. } => {
-                self.set_playback_status(PlaybackStatus::Playing);
+                self.playback_status = PlaybackStatus::Playing;
                 self.set_status("Playing");
                 None
             }
             AudioEvent::Stopped { .. } => {
-                self.set_playback_status(PlaybackStatus::Stopped);
+                self.playback_status = PlaybackStatus::Stopped;
                 self.playback.seek_target = None;
                 self.playback.format = None;
                 self.playback.position = Duration::ZERO;
@@ -896,7 +896,7 @@ impl AppState {
                 self.advance_after_finish()
             }
             AudioEvent::Failed { message, .. } => {
-                self.set_playback_status(PlaybackStatus::Error);
+                self.playback_status = PlaybackStatus::Error;
                 self.playback.seek_target = None;
                 self.playback.format = None;
                 let message = terminal_safe(message.as_bytes(), self.status_text_max_bytes);
@@ -1173,7 +1173,7 @@ impl AppState {
             return None;
         }
         if self.playback_status == PlaybackStatus::Error {
-            self.set_playback_status(PlaybackStatus::Stopped);
+            self.playback_status = PlaybackStatus::Stopped;
             self.playback.seek_target = None;
             self.playback.format = None;
             self.set_status("Stopped");
@@ -1207,7 +1207,7 @@ impl AppState {
                 generation: self.playback_generation,
             })
         } else {
-            self.set_playback_status(PlaybackStatus::Stopped);
+            self.playback_status = PlaybackStatus::Stopped;
             self.playback.format = None;
             self.set_status("End of queue");
             None
@@ -1244,7 +1244,7 @@ impl AppState {
             self.queue_selection = next;
             self.start_queue_index(next)
         } else {
-            self.set_playback_status(PlaybackStatus::Stopped);
+            self.playback_status = PlaybackStatus::Stopped;
             self.playback.format = None;
             if let Some(duration) = self.playback.duration {
                 self.playback.position = duration;
@@ -1295,7 +1295,7 @@ impl AppState {
         self.playback.duration = None;
         self.playback.start_paused = paused;
         self.playback.spectrum = AudioSpectrum::default();
-        self.set_playback_status(PlaybackStatus::Loading);
+        self.playback_status = PlaybackStatus::Loading;
         let title = self.queue_item_title(item, self.status_text_max_bytes);
         self.set_persistent_status(&format!("Loading: {title}"));
         Some(PlaybackIntent::Load {
@@ -1334,7 +1334,7 @@ impl AppState {
         self.playback.start_paused = false;
         self.playback.finished = false;
         self.playback.spectrum = AudioSpectrum::default();
-        self.set_playback_status(PlaybackStatus::Stopped);
+        self.playback_status = PlaybackStatus::Stopped;
         let title = self.queue_item_title(item, self.status_text_max_bytes);
         self.set_status(&format!("Selected: {title}"));
     }
@@ -1693,10 +1693,6 @@ impl AppState {
         } else {
             self.playback.position_hint = self.playback.position_hint.min(self.queue.len());
         }
-    }
-
-    fn set_playback_status(&mut self, status: PlaybackStatus) {
-        self.playback_status = status;
     }
 
     fn queue_entry(&mut self, entry_index: usize) -> Option<PlaybackIntent> {
@@ -2376,7 +2372,7 @@ pub fn run(root: &SelectedRoot, config: &Config) -> AppResult<()> {
     let _root_lease = RootWriterLease::acquire_from(root.descriptor(), &root.path)?;
     let logging = crate::logging::initialize_from(root.descriptor(), &root.path, &config.logging)?;
     tracing::info!("terminal session starting");
-    let result = crate::scan::scan_from(root.descriptor(), &root.path, config, 1)
+    let result = crate::scan::scan_for_session(root.descriptor(), &root.path, config)
         .and_then(|index| crate::terminal::run(root.descriptor(), &root.path, config, index));
     if result.is_ok() {
         tracing::info!("terminal session stopped cleanly");
@@ -2451,7 +2447,7 @@ mod tests {
                 id: playlist_id,
                 name: "Favorites".into(),
                 path: PathBuf::from("playlists/Favorites"),
-                entries: vec![TrackEntryId(40), TrackEntryId(50)],
+                entry_count: 2,
             }],
             warnings: Vec::new(),
             counters: ScanCounters {
@@ -2508,7 +2504,6 @@ mod tests {
                     .into_owned(),
                 relative_path: path.into(),
             },
-            scan_generation: 7,
         };
         vec![
             entry(

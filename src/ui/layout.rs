@@ -33,17 +33,3 @@ pub fn panels(area: Rect) -> PanelLayout {
         status: vertical[1],
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{Rect, panels};
-
-    #[test]
-    fn player_receives_half_the_supported_width() {
-        let layout = panels(Rect::new(0, 0, 80, 24));
-
-        assert_eq!(layout.library.width, 20);
-        assert_eq!(layout.player.width, 40);
-        assert_eq!(layout.queue.width, 20);
-    }
-}

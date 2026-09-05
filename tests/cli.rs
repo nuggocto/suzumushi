@@ -9,10 +9,14 @@ use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
-use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::process::{Child as ProcessChild, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
+use rustix::fd::{AsFd, OwnedFd};
+use rustix::fs::inotify;
 use rustix::fs::{CWD, Mode, OFlags, mkfifoat};
+use rustix::process::{PidfdFlags, pidfd_open};
 use rustix::process::{Signal, kill_process};
 use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
 use rustix::termios::{Pid, Winsize, tcsetwinsize};
@@ -21,6 +25,79 @@ use tempfile::TempDir;
 const FOCUSED_PLAYER: &[u8] = b"> Player";
 const FOCUSED_QUEUE: &[u8] = b"> Queue";
 const FIRST_QUEUE_ITEM: &[u8] = b"1. Night";
+
+// Assertions must not leave a terminal process or its leases alive.
+struct Child {
+    process: Option<ProcessChild>,
+    exited: OwnedFd,
+}
+
+impl std::ops::Deref for Child {
+    type Target = ProcessChild;
+    fn deref(&self) -> &ProcessChild {
+        self.process.as_ref().expect("owned test child")
+    }
+}
+
+impl std::ops::DerefMut for Child {
+    fn deref_mut(&mut self) -> &mut ProcessChild {
+        self.process.as_mut().expect("owned test child")
+    }
+}
+
+impl Child {
+    fn wait_with_output(mut self) -> std::io::Result<Output> {
+        self.process
+            .take()
+            .expect("owned test child")
+            .wait_with_output()
+    }
+}
+
+impl Drop for Child {
+    fn drop(&mut self) {
+        if let Some(process) = &mut self.process {
+            let _ = process.kill();
+            let _ = process.wait();
+        }
+    }
+}
+
+trait SpawnOwned {
+    fn spawn_owned(&mut self) -> std::io::Result<Child>;
+}
+
+impl SpawnOwned for Command {
+    fn spawn_owned(&mut self) -> std::io::Result<Child> {
+        let mut process = self.spawn()?;
+        match pidfd_open(Pid::from_child(&process), PidfdFlags::empty()) {
+            Ok(exited) => Ok(Child {
+                process: Some(process),
+                exited,
+            }),
+            Err(error) => {
+                let _ = process.kill();
+                let _ = process.wait();
+                Err(error.into())
+            }
+        }
+    }
+}
+
+fn wait_readable(fd: impl AsFd, deadline: Instant) {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let timeout = Timespec {
+            tv_sec: i64::try_from(remaining.as_secs()).expect("bounded test timeout"),
+            tv_nsec: i64::from(remaining.subsec_nanos()),
+        };
+        match poll(&mut [PollFd::new(&fd, PollFlags::IN)], Some(&timeout)) {
+            Ok(_) => return,
+            Err(rustix::io::Errno::INTR) => {}
+            Err(error) => panic!("wait for test readiness: {error}"),
+        }
+    }
+}
 
 #[test]
 fn help_succeeds_and_names_the_canonical_command() {
@@ -125,7 +202,7 @@ fn unresponsive_session_bus_does_not_prevent_terminal_use_or_shutdown() {
         .stdin(Stdio::from(duplicate_file(&slave)))
         .stdout(Stdio::from(duplicate_file(&slave)))
         .stderr(Stdio::from(slave))
-        .spawn()
+        .spawn_owned()
         .expect("terminal with stalled bus");
 
     // The listener accepts no authentication data. Its open socket stays alive
@@ -163,7 +240,7 @@ fn terminal_session_restores_the_pty_and_holds_both_leases() {
         .stdin(Stdio::from(duplicate_file(&slave)))
         .stdout(Stdio::from(duplicate_file(&slave)))
         .stderr(Stdio::from(slave))
-        .spawn()
+        .spawn_owned()
         .expect("start terminal session");
     let mut transcript = read_pty_until(&mut master, &mut child, b"Library");
 
@@ -257,7 +334,7 @@ fn terminal_user_can_search_and_build_a_queue_without_audio() {
         .stdin(Stdio::from(duplicate_file(&slave)))
         .stdout(Stdio::from(duplicate_file(&slave)))
         .stderr(Stdio::from(slave))
-        .spawn()
+        .spawn_owned()
         .expect("start terminal session");
     let mut transcript = read_pty_until(&mut master, &mut child, b"Night Song");
 
@@ -304,7 +381,7 @@ fn terminal_user_can_collapse_and_expand_a_library_folder() {
         .stdin(Stdio::from(duplicate_file(&slave)))
         .stdout(Stdio::from(duplicate_file(&slave)))
         .stderr(Stdio::from(slave))
-        .spawn()
+        .spawn_owned()
         .expect("start terminal session");
     read_pty_until(&mut master, &mut child, b"Night Song");
 
@@ -337,7 +414,7 @@ fn terminal_reopens_the_last_queue_without_autoplay() {
         .stdin(Stdio::from(duplicate_file(&first_slave)))
         .stdout(Stdio::from(duplicate_file(&first_slave)))
         .stderr(Stdio::from(first_slave))
-        .spawn()
+        .spawn_owned()
         .expect("start first terminal session");
     read_pty_until(&mut first_master, &mut first, b"Night Song");
     first_master.write_all(b"\r").expect("queue the track");
@@ -346,6 +423,26 @@ fn terminal_reopens_the_last_queue_without_autoplay() {
         .write_all(b"q")
         .expect("close the first session");
     read_pty_to_exit(&mut first_master, &mut first);
+
+    let cache_path = root.join("state/metadata.jsonl");
+    let cache = fs::read(&cache_path).expect("terminal startup saves metadata cache");
+    assert!(
+        cache
+            .windows(b"Night Song".len())
+            .any(|bytes| bytes == b"Night Song")
+    );
+    let diagnosis = Command::new(env!("CARGO_BIN_EXE_suzumushi"))
+        .arg("--root")
+        .arg(&root)
+        .arg("diagnose")
+        .output()
+        .expect("diagnose cached root");
+    assert!(diagnosis.status.success());
+    assert_eq!(
+        fs::read(&cache_path).expect("cache remains"),
+        cache,
+        "diagnose must not rewrite cache"
+    );
 
     let saved: serde_json::Value = serde_json::from_slice(
         &fs::read(root.join("state/session.json")).expect("read saved session"),
@@ -358,7 +455,7 @@ fn terminal_reopens_the_last_queue_without_autoplay() {
         .stdin(Stdio::from(duplicate_file(&second_slave)))
         .stdout(Stdio::from(duplicate_file(&second_slave)))
         .stderr(Stdio::from(second_slave))
-        .spawn()
+        .spawn_owned()
         .expect("reopen terminal session");
     let mut transcript = read_pty_until(&mut second_master, &mut second, b"Stopped");
     second_master
@@ -404,7 +501,7 @@ fn terminal_user_can_play_a_queued_file_on_the_real_device() {
         .stdin(Stdio::from(duplicate_file(&slave)))
         .stdout(Stdio::from(duplicate_file(&slave)))
         .stderr(Stdio::from(slave))
-        .spawn()
+        .spawn_owned()
         .expect("start terminal session");
     let mut transcript = read_pty_until(&mut master, &mut child, b"tone");
     master
@@ -433,7 +530,7 @@ fn oversized_terminal_resize_is_refused_before_buffer_growth() {
         .stdin(Stdio::from(duplicate_file(&slave)))
         .stdout(Stdio::from(duplicate_file(&slave)))
         .stderr(Stdio::from(slave))
-        .spawn()
+        .spawn_owned()
         .expect("start terminal session");
     let mut transcript = read_pty_until(&mut master, &mut child, b"Library");
     master
@@ -482,7 +579,7 @@ fn background_log_failure_is_reported_after_terminal_restoration() {
         .stdin(Stdio::from(duplicate_file(&slave)))
         .stdout(Stdio::from(duplicate_file(&slave)))
         .stderr(Stdio::from(slave))
-        .spawn()
+        .spawn_owned()
         .expect("start terminal session");
     let mut transcript = read_pty_until(&mut master, &mut child, b"Library");
 
@@ -930,7 +1027,7 @@ fn read_pty_until_with_timeout(
                 String::from_utf8_lossy(&bytes)
             );
         }
-        std::thread::yield_now();
+        wait_readable(&*master, deadline);
     }
     child.kill().expect("kill timed-out terminal");
     child.wait().expect("reap timed-out terminal");
@@ -957,7 +1054,7 @@ fn read_pty_to_status(master: &mut File, child: &mut Child) -> (Vec<u8>, ExitSta
                 read_available(master, &mut bytes);
                 return (bytes, status);
             }
-            Ok(None) if Instant::now() < deadline => std::thread::yield_now(),
+            Ok(None) if Instant::now() < deadline => wait_readable(&*master, deadline),
             Ok(None) => {
                 child.kill().expect("kill timed-out terminal");
                 child.wait().expect("reap timed-out terminal");
@@ -969,6 +1066,14 @@ fn read_pty_to_status(master: &mut File, child: &mut Child) -> (Vec<u8>, ExitSta
 }
 
 fn wait_for_nonempty_file(path: &std::path::Path, child: &mut Child) {
+    let changes = inotify::init(inotify::CreateFlags::NONBLOCK | inotify::CreateFlags::CLOEXEC)
+        .expect("watch startup log");
+    inotify::add_watch(
+        &changes,
+        path.parent().expect("log directory"),
+        inotify::WatchFlags::MODIFY | inotify::WatchFlags::CREATE,
+    )
+    .expect("watch log creation and writes");
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         if fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0) {
@@ -977,7 +1082,8 @@ fn wait_for_nonempty_file(path: &std::path::Path, child: &mut Child) {
         if let Some(status) = child.try_wait().expect("inspect terminal child") {
             panic!("terminal exited before writing its startup log: {status}");
         }
-        std::thread::yield_now();
+        wait_readable(&changes, deadline);
+        let _ = rustix::io::read(&changes, &mut [0_u8; 4_096]);
     }
     child.kill().expect("kill terminal without startup log");
     child.wait().expect("reap terminal without startup log");
@@ -1016,13 +1122,13 @@ fn output_with_timeout(command: &mut Command) -> Output {
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_owned()
         .expect("spawn command");
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         match child.try_wait() {
             Ok(Some(_)) => return child.wait_with_output().expect("collect command output"),
-            Ok(None) if Instant::now() < deadline => std::thread::yield_now(),
+            Ok(None) if Instant::now() < deadline => wait_readable(&child.exited, deadline),
             Ok(None) => {
                 child.kill().expect("kill timed-out command");
                 let output = child.wait_with_output().expect("reap timed-out command");

@@ -447,6 +447,7 @@ trait OutputStream: Send {
     fn prepare(&mut self, source: AudioFormat) -> Result<(), String>;
     fn set_gain(&mut self, volume_percent: u8, muted: bool);
     fn write(&mut self, samples: &[f32]) -> Result<usize, String>;
+    fn finish_input(&mut self);
     fn play(&mut self) -> Result<(), String>;
     fn pause(&mut self) -> Result<(), String>;
     fn resume(&mut self) -> Result<(), String>;
@@ -801,6 +802,7 @@ impl<B: Backend> WorkerCore<B> {
                 true
             }
             DecoderPoll::End => {
+                active.output.finish_input();
                 active.ended = true;
                 true
             }
@@ -1093,7 +1095,14 @@ fn worker_main<B: Backend>(
         if core.drive(events, positions) {
             continue;
         }
-        match commands.recv_timeout(WORKER_POLL) {
+        let command = if core.active.is_none() {
+            commands
+                .recv()
+                .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
+        } else {
+            commands.recv_timeout(WORKER_POLL)
+        };
+        match command {
             Ok(command) => {
                 if core
                     .command(command, events, positions)
@@ -1171,6 +1180,13 @@ mod tests {
         fn write(&mut self, samples: &[f32]) -> Result<usize, String> {
             self.calls.lock().expect("fake output log").push("write");
             Ok(samples.len())
+        }
+
+        fn finish_input(&mut self) {
+            self.calls
+                .lock()
+                .expect("fake output log")
+                .push("finish_input");
         }
 
         fn play(&mut self) -> Result<(), String> {

@@ -133,7 +133,6 @@ mod tests {
                     filename: "tone".into(),
                     relative_path: relative.into(),
                 },
-                scan_generation: 1,
             },
             MediaAsset {
                 tags: TrackTags::default(),

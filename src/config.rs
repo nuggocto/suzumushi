@@ -20,16 +20,15 @@ pub(crate) const SCAN_PARSER_SCRATCH_BYTES: usize = 32 * 1_048_576;
 pub(crate) const UI_STATE_SCRATCH_BYTES: usize = 8 * 1_048_576;
 pub(crate) const TERMINAL_BUFFER_BYTES: usize = 8 * 1_048_576;
 pub(crate) const AUDIO_WORKER_BYTES: usize = 6 * 1_048_576;
+// Cache tags, at most 10,000 tree nodes, bounded record parsing and a 4 MiB write buffer.
+pub(crate) const METADATA_CACHE_BYTES: usize = 16 * 1_048_576;
 pub(crate) const MAX_LOG_FILES: usize = 5;
 const QUEUE_ITEM_ACCOUNTING_BYTES: usize = 32;
 
-pub(crate) fn scan_reservation_bytes(
-    active_index_bytes: usize,
-    replacement_index_bytes: usize,
-) -> AppResult<usize> {
-    active_index_bytes
-        .checked_add(replacement_index_bytes)
-        .and_then(|value| value.checked_add(SCAN_PARSER_SCRATCH_BYTES))
+pub(crate) fn scan_reservation_bytes(index_bytes: usize) -> AppResult<usize> {
+    index_bytes
+        .checked_add(SCAN_PARSER_SCRATCH_BYTES)
+        .and_then(|bytes| bytes.checked_add(METADATA_CACHE_BYTES))
         .ok_or_else(|| AppError::InvalidConfig("scan reservation overflow".into()))
 }
 
@@ -585,19 +584,16 @@ impl Config {
             4_096,
         )?;
         validate_logging(&self.logging)?;
-        let reserved_app =
-            scan_reservation_bytes(self.scan.max_index_bytes, self.scan.max_index_bytes)?
-                .checked_add(self.logging.queue_max_bytes)
-                .and_then(|value| value.checked_add(UI_STATE_SCRATCH_BYTES))
-                .and_then(|value| value.checked_add(TERMINAL_BUFFER_BYTES))
-                .and_then(|value| value.checked_add(AUDIO_WORKER_BYTES))
-                .and_then(|value| value.checked_add(self.queue.max_bytes))
-                .ok_or_else(|| {
-                    AppError::InvalidConfig("application reservation overflow".into())
-                })?;
+        let reserved_app = scan_reservation_bytes(self.scan.max_index_bytes)?
+            .checked_add(self.logging.queue_max_bytes)
+            .and_then(|value| value.checked_add(UI_STATE_SCRATCH_BYTES))
+            .and_then(|value| value.checked_add(TERMINAL_BUFFER_BYTES))
+            .and_then(|value| value.checked_add(AUDIO_WORKER_BYTES))
+            .and_then(|value| value.checked_add(self.queue.max_bytes))
+            .ok_or_else(|| AppError::InvalidConfig("application reservation overflow".into()))?;
         if reserved_app > r.process_memory_budget_bytes {
             return Err(AppError::InvalidConfig(
-                "indexes, scan/parser scratch, queues, terminal buffers, audio buffers, and UI/state scratch exceed process_memory_budget_bytes".into(),
+                "index, scan/parser scratch, metadata cache, queues, terminal buffers, audio buffers, and UI/state scratch exceed process_memory_budget_bytes".into(),
             ));
         }
         Ok(())

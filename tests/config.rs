@@ -18,13 +18,13 @@ fn an_absent_config_uses_the_compiled_safe_defaults() {
 }
 
 #[test]
-fn config_reserves_current_app_state_with_both_indexes() {
-    let text = config::DEFAULT_CONFIG.replacen(
-        "process_memory_budget_bytes = 402653184",
-        "process_memory_budget_bytes = 285212671",
-        1,
-    );
-
-    let error = config::parse(text.as_bytes()).expect_err("current app reservation must fit");
-    assert!(error.to_string().contains("UI/state scratch"), "{error}");
+fn one_index_and_metadata_cache_fit_a_192_mib_process_budget() {
+    let mut config = config::Config::default();
+    config.runtime.process_memory_budget_bytes = 192 * 1_048_576;
+    config.validate().expect("one index and cache fit");
+    config.runtime.process_memory_budget_bytes = 160 * 1_048_576;
+    let error = config
+        .validate()
+        .expect_err("all application reservations must fit");
+    assert!(error.to_string().contains("UI/state scratch"));
 }

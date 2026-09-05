@@ -39,8 +39,6 @@ pub enum SecureOpenMode {
 pub struct ScanOptions {
     /// Secure-open availability seam.
     pub secure_open: SecureOpenMode,
-    /// Bytes already retained by the currently active index.
-    pub active_index_bytes: usize,
     /// Deterministic mount-identity seam used only by verification.
     pub root_device_override: Option<u64>,
     /// Cumulative wall time allowed for isolated metadata helpers.
@@ -51,7 +49,6 @@ impl Default for ScanOptions {
     fn default() -> Self {
         Self {
             secure_open: SecureOpenMode::Auto,
-            active_index_bytes: 0,
             root_device_override: None,
             metadata_time_budget: METADATA_TIME_BUDGET,
         }
@@ -118,26 +115,6 @@ pub fn fuzz_classify(bytes: &[u8]) {
     let _ = classify_relative_path(&path);
 }
 
-/// Checks that an active and replacement index can coexist in the process ledger.
-///
-/// # Errors
-///
-/// Returns an error on arithmetic overflow or insufficient process budget.
-pub fn reserve_replacement(config: &Config, active_index_bytes: usize) -> AppResult<()> {
-    if active_index_bytes > config.scan.max_index_bytes {
-        return Err(AppError::InvalidConfig(
-            "active index exceeds scan.max_index_bytes".into(),
-        ));
-    }
-    let required = scan_reservation_bytes(active_index_bytes, config.scan.max_index_bytes)?;
-    if required > config.runtime.process_memory_budget_bytes {
-        return Err(AppError::InvalidConfig(format!(
-            "active index, replacement index, and scan/parser scratch require {required} bytes, above process_memory_budget_bytes"
-        )));
-    }
-    Ok(())
-}
-
 /// Scans one selected canonical root with production secure-open behavior.
 ///
 /// # Errors
@@ -158,17 +135,39 @@ pub fn scan_from<Fd: AsFd>(
     config: &Config,
     generation: u64,
 ) -> AppResult<ScanIndex> {
-    let mut reader = metadata::HelperMetadataReader;
+    scan_cached_from(root_file, root, config, generation, false)
+}
+
+pub(crate) fn scan_for_session<Fd: AsFd>(
+    root_file: Fd,
+    root: &Path,
+    config: &Config,
+) -> AppResult<ScanIndex> {
+    scan_cached_from(root_file, root, config, 1, true)
+}
+
+fn scan_cached_from<Fd: AsFd>(
+    root_file: Fd,
+    root: &Path,
+    config: &Config,
+    generation: u64,
+    save_cache: bool,
+) -> AppResult<ScanIndex> {
+    let mut reader = crate::metadata_cache::CachedMetadataReader::load(root_file.as_fd(), root);
     let mut observer = NoopObserver;
-    scan_with_components_from(
-        root_file,
+    let result = scan_with_components_from(
+        &root_file,
         root,
         config,
         generation,
         ScanOptions::default(),
         &mut reader,
         &mut observer,
-    )
+    );
+    if save_cache && result.is_ok() {
+        reader.save(root_file.as_fd(), root);
+    }
+    result
 }
 
 /// Scans one root with explicit instrumentation seams.
@@ -228,7 +227,13 @@ fn scan_with_components_from<Fd: AsFd>(
     reader: &mut dyn metadata::MetadataReader,
     observer: &mut dyn ScanObserver,
 ) -> AppResult<ScanIndex> {
-    reserve_replacement(config, options.active_index_bytes)?;
+    if scan_reservation_bytes(config.scan.max_index_bytes)?
+        > config.runtime.process_memory_budget_bytes
+    {
+        return Err(AppError::InvalidConfig(
+            "index and scan scratch exceed process memory budget".into(),
+        ));
+    }
     let audio_fd = open_direct_directory(root_file, OsStr::new("audio"), false)
         .map_err(|error| AppError::io("open audio root", root.join("audio"), error.into()))?;
     let root_device = options.root_device_override.unwrap_or(
@@ -671,7 +676,7 @@ impl<'a> Scanner<'a> {
             if self
                 .playlists
                 .get(key)
-                .is_some_and(|value| value.entries.len() >= self.limits.max_entries_per_playlist)
+                .is_some_and(|value| value.entry_count >= self.limits.max_entries_per_playlist)
             {
                 self.limit(&child, "scan.max_entries_per_playlist");
                 return Ok(());
@@ -748,12 +753,15 @@ impl<'a> Scanner<'a> {
         if let Some(key) = playlist
             && let Some(playlist) = self.playlists.get_mut(&key)
         {
-            playlist.entries.push(id);
+            playlist.entry_count += 1;
         }
         Ok(())
     }
 
     fn read_tags(&mut self, file: &File, path: &Path) -> TrackTags {
+        if let Some(tags) = self.reader.cached(file) {
+            return self.validate_tags(Ok(tags), path);
+        }
         if self.metadata_elapsed >= self.options.metadata_time_budget {
             if !self.metadata_budget_reported {
                 self.metadata_budget_reported = true;
@@ -778,6 +786,10 @@ impl<'a> Scanner<'a> {
         let parsed = self.reader.read(file);
         self.metadata_elapsed = self.metadata_elapsed.saturating_add(started.elapsed());
         self.release_open_slots(2);
+        self.validate_tags(parsed, path)
+    }
+
+    fn validate_tags(&mut self, parsed: Result<TrackTags, String>, path: &Path) -> TrackTags {
         match parsed {
             Ok(tags) if fields_within_limit(&tags, self.limits.max_metadata_field_bytes) => {
                 let bytes = tag_bytes(&tags);
@@ -825,7 +837,7 @@ impl<'a> Scanner<'a> {
                 id,
                 name,
                 path: path.to_path_buf(),
-                entries: Vec::new(),
+                entry_count: 0,
             },
         );
         true
@@ -953,21 +965,10 @@ impl<'a> Scanner<'a> {
                     filename,
                     relative_path,
                 },
-                scan_generation: self.generation,
             });
         }
         contextual.sort_by(|left, right| natural_path_cmp(&left.display_path, &right.display_path));
-        let ranks: BTreeMap<_, _> = contextual
-            .iter()
-            .enumerate()
-            .map(|(rank, entry)| (entry.id, rank))
-            .collect();
         let mut playlists: Vec<_> = self.playlists.into_values().collect();
-        for playlist in &mut playlists {
-            playlist
-                .entries
-                .sort_by_key(|entry| ranks.get(entry).copied().unwrap_or(usize::MAX));
-        }
         playlists.sort_by(|left, right| natural_path_cmp(&left.path, &right.path));
         ScanIndex {
             generation: self.generation,

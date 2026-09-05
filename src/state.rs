@@ -34,12 +34,18 @@ const STATE_TEMPORARY_CREATE_ATTEMPTS: usize = 16;
 /// Stable app-owned playback fields written to private local state.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct NowPlayingProjection {
+    pub(crate) position_ms: u64,
+    #[serde(flatten)]
+    state: NowPlayingState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct NowPlayingState {
     version: u32,
     playback_generation: u64,
     status: &'static str,
     title: String,
     creator: String,
-    position_ms: u64,
     duration_ms: Option<u64>,
     volume_percent: u8,
     muted: bool,
@@ -50,23 +56,29 @@ pub(crate) struct NowPlayingProjection {
 }
 
 impl NowPlayingProjection {
+    pub(crate) fn same_playback_state(&self, other: &Self) -> bool {
+        self.state == other.state
+    }
+
     #[must_use]
     pub(crate) fn from_app(app: &AppState) -> Self {
         let (title, creator) = app.state_identity(STATE_IDENTITY_MAX_BYTES);
         Self {
-            version: STATE_VERSION,
-            playback_generation: app.playback_generation,
-            status: playback_status(app.playback_status),
-            title,
-            creator,
             position_ms: duration_millis(app.playback_position()),
-            duration_ms: app.playback_duration().map(duration_millis),
-            volume_percent: app.volume_percent,
-            muted: app.muted,
-            shuffle: app.shuffle,
-            repeat: app.repeat.label(),
-            queue_position: app.queue_position(),
-            queue_length: app.queue.len(),
+            state: NowPlayingState {
+                version: STATE_VERSION,
+                playback_generation: app.playback_generation,
+                status: playback_status(app.playback_status),
+                title,
+                creator,
+                duration_ms: app.playback_duration().map(duration_millis),
+                volume_percent: app.volume_percent,
+                muted: app.muted,
+                shuffle: app.shuffle,
+                repeat: app.repeat.label(),
+                queue_position: app.queue_position(),
+                queue_length: app.queue.len(),
+            },
         }
     }
 }
@@ -115,6 +127,9 @@ pub(crate) struct StateStore {
 }
 
 impl StateStore {
+    pub(crate) fn open_file(&self, name: &str, description: &str) -> AppResult<Option<File>> {
+        open_verified_state_file(&self.directory, &self.directory_path, name, description)
+    }
     pub(crate) fn open(root: BorrowedFd<'_>, root_path: &Path) -> AppResult<Self> {
         let directory_path = root_path.join("state");
         let directory = rustix::fs::openat(
@@ -233,7 +248,7 @@ impl StateStore {
         }
     }
 
-    fn write_bytes(
+    pub(crate) fn write_bytes(
         &mut self,
         file_name: &str,
         temporary_stem: &str,
@@ -472,7 +487,6 @@ mod tests {
                     filename: "fixture".into(),
                     relative_path: "library/fixture.wav".into(),
                 },
-                scan_generation: 1,
             }],
             playlists: Vec::new(),
             warnings: Vec::new(),
@@ -493,7 +507,7 @@ mod tests {
         let mut writer = StateStore::open(root_file.as_fd(), root.path()).expect("state writer");
 
         let mut projection = NowPlayingProjection::from_app(&app());
-        projection.title = "quiet\u{1b}[31m".into();
+        projection.state.title = "quiet\u{1b}[31m".into();
         writer
             .write_now_playing(&projection)
             .expect("write projection");
@@ -582,7 +596,7 @@ mod tests {
         let path = root.path().join("state/now-playing.json");
         let before = fs::read(&path).expect("initial bytes");
         let mut oversized = valid;
-        oversized.title = "x".repeat(20_000);
+        oversized.state.title = "x".repeat(20_000);
 
         assert!(writer.write_now_playing(&oversized).is_err());
         assert_eq!(fs::read(path).expect("retained projection"), before);

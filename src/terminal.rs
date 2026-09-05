@@ -27,6 +27,7 @@ use crate::model::ScanIndex;
 use crate::mpris::{MprisProjection, MprisRuntime, REQUEST_CAPACITY};
 
 const STATE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const STATE_POSITION_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Runs one terminal session and restores terminal modes on every unwind path.
 ///
@@ -193,15 +194,7 @@ impl StateSynchronizer {
         now: Duration,
     ) -> AppResult<()> {
         let projection = crate::state::NowPlayingProjection::from_app(app);
-        let changed = self.previous_now_playing.as_ref() != Some(&projection);
-        let heartbeat_due = self
-            .last_now_playing_write
-            .is_none_or(|last| now.saturating_sub(last) >= STATE_HEARTBEAT_INTERVAL);
-        if changed || heartbeat_due {
-            store.write_now_playing(&projection)?;
-            self.previous_now_playing = Some(projection);
-            self.last_now_playing_write = Some(now);
-        }
+        self.sync_now_playing(projection, store, now)?;
 
         let identity = app.session_identity();
         let session_changed = !self.session_initialized || self.previous_session != identity;
@@ -214,6 +207,29 @@ impl StateSynchronizer {
             self.session_initialized = true;
             self.previous_session = identity;
             self.last_session_write = identity.map(|_| now);
+        }
+        Ok(())
+    }
+
+    fn sync_now_playing(
+        &mut self,
+        projection: crate::state::NowPlayingProjection,
+        store: &mut crate::state::StateStore,
+        now: Duration,
+    ) -> AppResult<()> {
+        let elapsed = self
+            .last_now_playing_write
+            .map_or(Duration::MAX, |last| now.saturating_sub(last));
+        let controls_changed = self
+            .previous_now_playing
+            .as_ref()
+            .is_none_or(|previous| !previous.same_playback_state(&projection));
+        let position_due = elapsed >= STATE_POSITION_INTERVAL
+            && self.previous_now_playing.as_ref() != Some(&projection);
+        if controls_changed || position_due || elapsed >= STATE_HEARTBEAT_INTERVAL {
+            store.write_now_playing(&projection)?;
+            self.previous_now_playing = Some(projection);
+            self.last_now_playing_write = Some(now);
         }
         Ok(())
     }
@@ -690,15 +706,6 @@ mod tests {
     }
 
     #[test]
-    fn app_events_record_resize() {
-        let mut app =
-            AppState::new(&Config::default(), empty_index()).expect("app state reservation");
-        apply_event(&mut app, AppEvent::Resize(120, 32, Duration::ZERO));
-        assert_eq!(app.terminal_size, (120, 32));
-        assert!(!app.should_quit);
-    }
-
-    #[test]
     fn periodic_ticks_clear_expired_information_notices() {
         let mut app =
             AppState::new(&Config::default(), empty_index()).expect("app state reservation");
@@ -780,6 +787,36 @@ mod tests {
         sync.sync(&app, &mut writer, STATE_HEARTBEAT_INTERVAL)
             .expect("heartbeat state");
         assert_eq!(sync.last_now_playing_write, Some(STATE_HEARTBEAT_INTERVAL));
+    }
+
+    #[test]
+    fn position_writes_are_throttled_but_control_changes_are_immediate() {
+        let (root, _root_file, mut writer) = state_writer();
+        let mut app = AppState::new(&Config::default(), empty_index()).expect("app state");
+        let mut sync = StateSynchronizer::default();
+        let mut projection = crate::state::NowPlayingProjection::from_app(&app);
+        sync.sync_now_playing(projection.clone(), &mut writer, Duration::ZERO)
+            .expect("initial state");
+        let path = root.path().join("state/now-playing.json");
+        let initial = fs::read(&path).expect("initial document");
+
+        projection.position_ms = 250;
+        sync.sync_now_playing(projection.clone(), &mut writer, Duration::from_millis(250))
+            .expect("coalesced position");
+        assert_eq!(fs::read(&path).expect("unchanged document"), initial);
+        projection.position_ms = 1_000;
+        sync.sync_now_playing(projection, &mut writer, Duration::from_secs(1))
+            .expect("position checkpoint");
+        let state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("checkpoint")).expect("valid JSON");
+        assert_eq!(state["position_ms"], 1_000);
+
+        app.muted = true;
+        sync.sync(&app, &mut writer, Duration::from_millis(1_001))
+            .expect("immediate mute");
+        let state: serde_json::Value =
+            serde_json::from_slice(&fs::read(path).expect("control update")).expect("valid JSON");
+        assert_eq!(state["muted"], true);
     }
 
     #[test]

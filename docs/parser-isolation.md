@@ -8,7 +8,7 @@ Suzumushi uses one pipeline:
 
 ```text
 verified file descriptor -> Symphonia 0.6.1 helper -> bounded f32 PCM ->
-owned worker -> rtrb 0.3.4 -> CPAL 0.18.1 -> Linux audio device
+owned worker -> rtrb 0.3.5 -> CPAL 0.18.1 -> Linux audio device
 ```
 
 Symphonia is pure Rust and covers the four formats wanted for the first

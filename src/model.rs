@@ -7,15 +7,15 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 /// Stable-within-context browser entry identifier.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct TrackEntryId(pub u64);
 
 /// Stable-within-path playlist identifier.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct PlaylistId(pub u64);
 
 /// Linux identity captured from the verified media descriptor.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct FileIdentity {
     pub device: u64,
     pub inode: u64,
@@ -35,14 +35,14 @@ pub struct TrackTags {
 }
 
 /// One canonical media file.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MediaAsset {
     pub tags: TrackTags,
     pub file_identity: FileIdentity,
 }
 
 /// The context through which a user encountered an asset.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TrackEntrySource {
     LibraryFile,
     LibrarySymlink,
@@ -51,38 +51,36 @@ pub enum TrackEntrySource {
 }
 
 /// A contextual browser entry. Several entries may name one asset.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TrackEntry {
     pub id: TrackEntryId,
     pub asset_index: usize,
     pub display_path: PathBuf,
     pub source: TrackEntrySource,
     pub search: SearchFields,
-    pub scan_generation: u64,
 }
 
 /// Searchable path fields owned by one contextual entry.
 ///
 /// Metadata remains on [`MediaAsset`], so playlist entries can share it instead
 /// of retaining another copy for every path that names the same file.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SearchFields {
     pub filename: String,
     pub relative_path: String,
 }
 
 /// One filesystem playlist.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Playlist {
     pub id: PlaylistId,
     pub name: String,
     pub path: PathBuf,
-    pub entries: Vec<TrackEntryId>,
+    pub entry_count: usize,
 }
 
 /// Stable warning category emitted by a bounded scan.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ScanWarningCode {
     BrokenSymlink,
     IgnoredDirectorySymlink,
@@ -96,7 +94,7 @@ pub enum ScanWarningCode {
 }
 
 /// A bounded diagnostic tied to a root-relative entry when available.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScanWarning {
     pub code: ScanWarningCode,
     pub path: PathBuf,
@@ -104,7 +102,7 @@ pub struct ScanWarning {
 }
 
 /// Observable counters proving scanner bounds and traversal behavior.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ScanCounters {
     pub directory_enumerations: usize,
     pub encountered_entries: usize,
@@ -120,8 +118,8 @@ pub struct ScanCounters {
     pub open_files_high_water: usize,
 }
 
-/// Complete or visibly partial replacement index.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+/// Complete or visibly partial library index.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScanIndex {
     pub generation: u64,
     pub complete: bool,

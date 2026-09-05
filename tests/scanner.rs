@@ -12,9 +12,7 @@ use suzumushi::config::Config;
 use suzumushi::init::initialize;
 use suzumushi::metadata::MetadataReader;
 use suzumushi::model::{ScanWarningCode, TrackEntrySource, TrackTags};
-use suzumushi::scan::{
-    ScanObserver, ScanOptions, SecureOpenMode, reserve_replacement, scan_with_components,
-};
+use suzumushi::scan::{ScanObserver, ScanOptions, SecureOpenMode, scan_with_components};
 use tempfile::TempDir;
 
 #[derive(Default)]
@@ -65,7 +63,7 @@ fn retained_counter_cases(baseline: &suzumushi::model::ScanIndex) -> Vec<Counter
     let playlist_entries = baseline
         .playlists
         .iter()
-        .map(|value| value.entries.len())
+        .map(|value| value.entry_count)
         .max()
         .expect("at least the demo playlist");
     let symlinks = baseline.counters.symlink_resolutions;
@@ -210,19 +208,12 @@ fn one_pass_finds_context_metadata_and_symlinks() {
         .iter()
         .find(|value| value.name == "focus")
         .expect("focus playlist");
-    assert_eq!(focus.entries.len(), 2);
-    let playlist_paths: Vec<_> = focus
+    assert_eq!(focus.entry_count, 2);
+    let playlist_paths: Vec<_> = index
         .entries
         .iter()
-        .map(|id| {
-            index
-                .entries
-                .iter()
-                .find(|entry| entry.id == *id)
-                .expect("playlist entry model")
-                .display_path
-                .as_path()
-        })
+        .filter(|entry| matches!(entry.source, TrackEntrySource::PlaylistCopy { playlist } | TrackEntrySource::PlaylistSymlink { playlist } if playlist == focus.id))
+        .map(|entry| entry.display_path.as_path())
         .collect();
     assert_eq!(
         playlist_paths,
@@ -870,13 +861,24 @@ fn symlink_parser_metadata_warning_and_mount_counters_are_bounded() {
         },
         attempts: 0,
     };
-    config.scan.max_metadata_field_bytes = 8;
     let index = scan(&root, &config, &mut reader);
     assert!(!index.complete);
-    assert!(index.warnings.iter().any(
-        |warning| warning.message.contains("max_symlink_resolutions")
-            || warning.code == ScanWarningCode::MetadataRead
-    ));
+    assert!(
+        index
+            .warnings
+            .iter()
+            .any(|warning| warning.message.contains("max_symlink_resolutions"))
+    );
+    config.scan.max_symlink_resolutions = Config::default().scan.max_symlink_resolutions;
+    config.scan.max_metadata_field_bytes = 8;
+    let index = scan(&root, &config, &mut reader);
+    assert!(
+        index
+            .warnings
+            .iter()
+            .any(|warning| warning.code == ScanWarningCode::MetadataRead)
+    );
+    assert!(index.assets.iter().all(|asset| asset.tags.title.is_none()));
 
     let mut reader = FakeMetadata::default();
     let mut observer = Noop;
@@ -899,14 +901,4 @@ fn symlink_parser_metadata_warning_and_mount_counters_are_bounded() {
             .iter()
             .any(|warning| warning.code == ScanWarningCode::CrossMountSkipped)
     );
-}
-
-#[test]
-fn active_and_replacement_indexes_share_one_process_budget() {
-    let mut config = Config::default();
-    reserve_replacement(&config, config.scan.max_index_bytes)
-        .expect("reviewed default partition fits");
-    config.runtime.process_memory_budget_bytes =
-        config.scan.max_index_bytes * 2 + 8 * 1_048_576 - 1;
-    assert!(reserve_replacement(&config, config.scan.max_index_bytes).is_err());
 }

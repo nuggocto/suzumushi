@@ -3,7 +3,7 @@
 //! CPAL output fed by one realtime-safe SPSC ring.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{
@@ -27,7 +27,7 @@ pub(super) struct CpalOutput {
     stream: Option<Stream>,
     producer: Option<Producer<f32>>,
     consumed: Arc<AtomicU64>,
-    written_samples: Arc<AtomicU64>,
+    end_of_stream: Arc<AtomicBool>,
     failure: Arc<AtomicU8>,
     gain: Arc<AtomicU32>,
     spectrum: Arc<SpectrumLane>,
@@ -44,7 +44,7 @@ impl CpalOutput {
             stream: None,
             producer: None,
             consumed: Arc::new(AtomicU64::new(0)),
-            written_samples: Arc::new(AtomicU64::new(0)),
+            end_of_stream: Arc::new(AtomicBool::new(false)),
             failure: Arc::new(AtomicU8::new(0)),
             gain: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
             spectrum,
@@ -88,13 +88,13 @@ impl OutputStream for CpalOutput {
         let config = choice.config;
         let (producer, pcm_reader) = RingBuffer::new(PCM_RING_SAMPLES);
         self.consumed.store(0, Ordering::Release);
-        self.written_samples.store(0, Ordering::Release);
+        self.end_of_stream.store(false, Ordering::Release);
         self.failure.store(0, Ordering::Release);
         self.written = 0;
         self.stream_active = false;
         self.spectrum.clear();
         let frames_read = Arc::clone(&self.consumed);
-        let written_samples = Arc::clone(&self.written_samples);
+        let end_of_stream = Arc::clone(&self.end_of_stream);
         let failure = Arc::clone(&self.failure);
         let gain = Arc::clone(&self.gain);
         let spectrum = Arc::clone(&self.spectrum);
@@ -106,7 +106,7 @@ impl OutputStream for CpalOutput {
             pcm_reader,
             CallbackState {
                 frames_read,
-                written_samples,
+                end_of_stream,
                 failure,
                 gain,
                 spectrum,
@@ -149,11 +149,6 @@ impl OutputStream for CpalOutput {
             .as_mut()
             .ok_or_else(|| "audio output ring is unavailable".to_owned())?;
         let frames = (samples.len() / source_channels).min(producer.slots() / self.output_channels);
-        // Publish the committed total before enqueueing it. The callback compares what
-        // it has consumed against this counter to separate a real dropout from expected
-        // end-of-track padding, and a total published only after the pushes would still
-        // read as fully consumed while the ring was running dry. Every error below ends
-        // the track, so the two counts cannot drift apart on a surviving stream.
         let output_samples = frames
             .checked_mul(self.output_channels)
             .ok_or_else(|| "audio output sample count overflow".to_owned())?;
@@ -164,7 +159,6 @@ impl OutputStream for CpalOutput {
                     .map_err(|_| "audio output sample count overflow".to_owned())?,
             )
             .ok_or_else(|| "audio output sample generation exhausted".to_owned())?;
-        self.written_samples.store(self.written, Ordering::Release);
         for frame in samples.chunks_exact(source_channels).take(frames) {
             match (source_channels, self.output_channels) {
                 (1, output_channels) => {
@@ -196,6 +190,10 @@ impl OutputStream for CpalOutput {
             }
         }
         Ok(frames * source_channels)
+    }
+
+    fn finish_input(&mut self) {
+        self.end_of_stream.store(true, Ordering::Release);
     }
 
     fn play(&mut self) -> Result<(), String> {
@@ -281,7 +279,7 @@ fn build_stream(
 
 struct CallbackState {
     frames_read: Arc<AtomicU64>,
-    written_samples: Arc<AtomicU64>,
+    end_of_stream: Arc<AtomicBool>,
     failure: Arc<AtomicU8>,
     gain: Arc<AtomicU32>,
     spectrum: Arc<SpectrumLane>,
@@ -299,7 +297,7 @@ where
 {
     let CallbackState {
         frames_read,
-        written_samples,
+        end_of_stream,
         failure,
         gain,
         spectrum,
@@ -320,7 +318,7 @@ where
                         gain,
                         analyzer: &mut analyzer,
                         frames_read: &frames_read,
-                        written_samples: &written_samples,
+                        end_of_stream: &end_of_stream,
                         metrics: &callback_metrics,
                         spectrum: &spectrum,
                     },
@@ -337,7 +335,7 @@ struct RenderContext<'a> {
     gain: f32,
     analyzer: &'a mut SpectrumAnalyzer,
     frames_read: &'a AtomicU64,
-    written_samples: &'a AtomicU64,
+    end_of_stream: &'a AtomicBool,
     metrics: &'a AudioMetrics,
     spectrum: &'a SpectrumLane,
 }
@@ -351,7 +349,7 @@ where
         gain,
         analyzer,
         frames_read,
-        written_samples,
+        end_of_stream,
         metrics,
         spectrum,
     } = context;
@@ -363,8 +361,7 @@ where
             read += 1;
             finite_or_silence(value * gain)
         } else {
-            let consumed = frames_read.load(Ordering::Relaxed).saturating_add(read);
-            if consumed < written_samples.load(Ordering::Acquire) {
+            if !end_of_stream.load(Ordering::Acquire) {
                 underruns += 1;
             }
             0.0
@@ -482,7 +479,7 @@ fn finite_or_silence(sample: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
     use crate::audio::{AudioSpectrum, SPECTRUM_BANDS};
 
@@ -563,7 +560,7 @@ mod tests {
         let (_producer, mut consumer) = rtrb::RingBuffer::new(8);
         let metrics = AudioMetrics::default();
         let frames_read = AtomicU64::new(0);
-        let written_samples = AtomicU64::new(4);
+        let end_of_stream = AtomicBool::new(false);
         let spectrum = SpectrumLane::default();
         let mut analyzer = super::SpectrumAnalyzer::new(48_000, 2);
         let mut output = [1.0_f32; 4];
@@ -575,7 +572,7 @@ mod tests {
                 gain: 1.0,
                 analyzer: &mut analyzer,
                 frames_read: &frames_read,
-                written_samples: &written_samples,
+                end_of_stream: &end_of_stream,
                 metrics: &metrics,
                 spectrum: &spectrum,
             },
@@ -596,7 +593,7 @@ mod tests {
         producer.push(-0.25).expect("second scheduled sample");
         let metrics = AudioMetrics::default();
         let frames_read = AtomicU64::new(0);
-        let written_samples = AtomicU64::new(2);
+        let end_of_stream = AtomicBool::new(true);
         let spectrum = SpectrumLane::default();
         let mut analyzer = super::SpectrumAnalyzer::new(48_000, 1);
         let mut output = [1.0_f32; 4];
@@ -608,7 +605,7 @@ mod tests {
                 gain: 1.0,
                 analyzer: &mut analyzer,
                 frames_read: &frames_read,
-                written_samples: &written_samples,
+                end_of_stream: &end_of_stream,
                 metrics: &metrics,
                 spectrum: &spectrum,
             },
@@ -618,6 +615,35 @@ mod tests {
         assert_eq!(metrics.underrun_samples.load(Ordering::Relaxed), 0);
         let bits = output.map(f32::to_bits);
         assert_eq!(&bits[2..], &[0, 0]);
+    }
+
+    #[test]
+    fn decoder_starvation_after_consuming_committed_samples_is_counted() {
+        let (mut producer, mut consumer) = rtrb::RingBuffer::new(8);
+        producer.push(0.25).expect("committed sample");
+        let metrics = AudioMetrics::default();
+        let frames_read = AtomicU64::new(0);
+        let end_of_stream = AtomicBool::new(false);
+        let spectrum = SpectrumLane::default();
+        let mut analyzer = super::SpectrumAnalyzer::new(48_000, 1);
+        let mut output = [1.0_f32; 4];
+        render_output(
+            &mut output,
+            super::RenderContext {
+                pcm_reader: &mut consumer,
+                gain: 1.0,
+                analyzer: &mut analyzer,
+                frames_read: &frames_read,
+                end_of_stream: &end_of_stream,
+                metrics: &metrics,
+                spectrum: &spectrum,
+            },
+        );
+        assert_eq!(
+            output.map(f32::to_bits),
+            [0.25_f32, 0.0, 0.0, 0.0].map(f32::to_bits)
+        );
+        assert_eq!(metrics.underrun_samples.load(Ordering::Relaxed), 3);
     }
 
     #[test]

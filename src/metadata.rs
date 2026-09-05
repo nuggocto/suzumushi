@@ -28,6 +28,11 @@ const HELPER_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Metadata seam used to keep scanner tests deterministic.
 pub trait MetadataReader {
+    /// Returns previously parsed tags without starting a parser or consuming its time budget.
+    fn cached(&mut self, _file: &File) -> Option<TrackTags> {
+        None
+    }
+
     /// Reads bounded tags from one already verified regular descriptor.
     ///
     /// # Errors

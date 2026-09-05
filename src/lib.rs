@@ -14,6 +14,7 @@ pub mod input;
 pub mod locks;
 pub mod logging;
 pub mod metadata;
+mod metadata_cache;
 pub mod model;
 pub mod mpris;
 pub mod paths;

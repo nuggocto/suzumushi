@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.3] - 2026-09-05
+
+### Fixed
+
+- Counted audio underruns when the decoder falls behind after all committed
+  samples have played. Explicit decoder completion keeps normal end-of-track
+  silence out of the underrun count.
+
+### Changed
+
+- Cached metadata for unchanged files across terminal sessions, avoiding a new
+  parser process per cached track. The disposable private cache is bounded to
+  4 MiB and 10,000 entries; changed files are reparsed and diagnose only reads it.
+- Parked the audio worker while no track is active, eliminating its idle polling.
+- Limited position-only now-playing file updates to once per second while
+  preserving immediate control changes and the existing idle heartbeat.
+- Removed duplicate playlist membership storage, unused track generations and
+  serialization derives, trivial wrappers, and the unused live-rescan reservation.
+  Memory validation now reserves one index plus explicit parser and cache space.
+- Removed tests that only repeated assignments or snapshot coverage. Strengthened
+  scanner limit assertions and added cache, state-write, and underrun regressions.
+- Replaced terminal-test busy polling with readiness waits and ensured test child
+  processes are killed and reaped when an assertion fails.
+
 ## [1.1.2] - 2026-09-05
 
 ### Fixed

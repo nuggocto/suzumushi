@@ -80,22 +80,6 @@ impl LoggingReport {
     }
 }
 
-/// Installs one process-wide file-only subscriber beneath a verified root.
-///
-/// # Errors
-///
-/// Returns an error for unsafe storage, rotation failure, or an existing global
-/// tracing subscriber.
-pub fn initialize(root: &Path, config: &LoggingConfig) -> AppResult<LoggingGuard> {
-    let root_fd = rustix::fs::open(
-        root,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|error| AppError::io("open root for logging", root, error.into()))?;
-    initialize_from(&root_fd, root, config)
-}
-
 /// Installs logging beneath an already pinned session root.
 ///
 /// # Errors
