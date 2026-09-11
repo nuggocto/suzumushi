@@ -1,4 +1,6 @@
 # Rust build and tool output
+/result
+/result-*
 target/
 **/*.rs.bk
 *.pdb

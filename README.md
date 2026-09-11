@@ -21,6 +21,30 @@ yay -S suzumushi-bin
 The package installs both `suzumushi` and the relative `suzu` command symlink.
 The verified archive below remains available for direct installation.
 
+## Install on NixOS
+
+On x86-64 NixOS with Nix installed, add the repository flake to your user profile:
+
+```sh
+nix --extra-experimental-features 'nix-command flakes' \
+  profile add github:nuggocto/suzumushi/shrek
+```
+
+This installs both `suzumushi` and `suzu`. Nix builds from source with pinned
+dependencies; the first installation may take a few minutes. It uses the current
+`shrek` branch, which includes the flake. The existing `v1.1.3` tag predates it.
+
+Create your library, add audio below `./suzumushi/audio/library/`, and start:
+
+```sh
+suzumushi init ./suzumushi
+suzumushi --root ./suzumushi
+```
+
+Your desktop needs a working audio session. See [Nix packaging](docs/nix.md) for
+declarative NixOS and Home Manager installation, running without installation,
+and local build checks.
+
 ## Install the Linux release
 
 The verified binary archive is built for 64-bit GNU/Linux. Download the archive
