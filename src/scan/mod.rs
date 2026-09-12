@@ -848,6 +848,9 @@ impl<'a> Scanner<'a> {
             self.enumeration_limit(path, "scan.max_entries");
             return false;
         }
+        // Rejected paths still cost enumeration work, even when warning storage
+        // is exhausted. Charge the entry before applying retention filters.
+        self.counters.encountered_entries += 1;
         let bytes = path_bytes(path);
         if bytes > self.limits.max_path_bytes {
             self.progress.degrade();
@@ -862,7 +865,6 @@ impl<'a> Scanner<'a> {
             self.enumeration_limit(path, "scan.max_total_path_bytes");
             return false;
         }
-        self.counters.encountered_entries += 1;
         self.counters.path_bytes += bytes;
         true
     }

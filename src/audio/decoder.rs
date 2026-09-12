@@ -31,6 +31,7 @@ const MAX_PCM_BLOCK_SAMPLES: usize = 32_768;
 const MAX_ERROR_BYTES: usize = 1_024;
 const MAX_CONSECUTIVE_DECODE_ERRORS: usize = 32;
 const MAX_FLAC_METADATA_BLOCKS: usize = 1_024;
+const MAX_WAV_HEADER_CHUNKS: usize = 1_024;
 const HELPER_NO_PROGRESS: Duration = Duration::from_secs(3);
 const FUZZ_SAMPLE_LIMIT: u64 = 1_000_000;
 const UNKNOWN_DURATION_MICROS: u64 = u64::MAX;
@@ -393,6 +394,9 @@ impl<S: MediaSource> PlaybackSource<S> {
         };
 
         let mut hidden_flac_headers = Vec::new();
+        if matches!(container, AudioContainer::Wav) {
+            validate_wav_channels(&mut inner)?;
+        }
         if matches!(container, AudioContainer::Flac) {
             inner
                 .seek(SeekFrom::Start(4))
@@ -438,6 +442,48 @@ impl<S: MediaSource> PlaybackSource<S> {
             hidden_flac_headers,
         })
     }
+}
+
+fn validate_wav_channels(source: &mut (impl Read + Seek)) -> Result<(), String> {
+    source
+        .seek(SeekFrom::Start(12))
+        .map_err(|error| format!("cannot inspect WAV chunks: {error}"))?;
+    for _ in 0..MAX_WAV_HEADER_CHUNKS {
+        let mut header = [0_u8; 8];
+        source
+            .read_exact(&mut header)
+            .map_err(|error| format!("cannot read WAV chunk header: {error}"))?;
+        let length = u32::from_le_bytes(header[4..].try_into().expect("four length bytes"));
+        if &header[..4] == b"data" {
+            return Ok(());
+        }
+        let consumed = if &header[..4] == b"fmt " {
+            if length < 4 {
+                return Err("WAV format chunk is truncated".into());
+            }
+            let mut format = [0_u8; 4];
+            source
+                .read_exact(&mut format)
+                .map_err(|error| format!("cannot read WAV channel count: {error}"))?;
+            let channels = u16::from_le_bytes([format[2], format[3]]);
+            // Symphonia 0.6.1 multiplies this untrusted u16 before validating it.
+            // Apply our mono/stereo contract to every fmt chunk before parsing.
+            if !(1..=2).contains(&channels) {
+                return Err(format!("unsupported WAV channel count: {channels}"));
+            }
+            4
+        } else {
+            0
+        };
+        // RIFF chunks include one padding byte when their payload length is odd.
+        let skip = i64::from(length) - consumed + i64::from(length & 1);
+        source
+            .seek(SeekFrom::Current(skip))
+            .map_err(|error| format!("cannot skip WAV header chunk: {error}"))?;
+    }
+    Err(format!(
+        "WAV header exceeded {MAX_WAV_HEADER_CHUNKS} chunks"
+    ))
 }
 
 fn id3v2_prefix_len(prefix: &[u8], source_len: Option<u64>) -> Result<Option<u64>, String> {
@@ -938,6 +984,70 @@ mod tests {
             self.samples.extend_from_slice(samples);
             Ok(())
         }
+    }
+
+    #[test]
+    fn malformed_wav_channel_counts_return_errors_without_panicking() {
+        let bytes = include_bytes!("../../tests/fixtures/audio/invalid-wav-channels.bin");
+        let mut sink = CollectSink::default();
+        let error = decode_source(Cursor::new(bytes.to_vec()), &mut sink, None, Duration::ZERO)
+            .expect_err("unsupported WAV channel count");
+        assert!(error.contains("channel count"), "{error}");
+        assert!(sink.samples.is_empty());
+    }
+
+    #[test]
+    fn wav_channel_validation_checks_later_format_chunks() {
+        let good = include_bytes!("../../tests/fixtures/audio/tone.wav");
+        let mut bytes =
+            include_bytes!("../../tests/fixtures/audio/invalid-wav-channels.bin").to_vec();
+        bytes.splice(12..12, good[12..36].iter().copied());
+        let error = decode_source(
+            Cursor::new(bytes),
+            &mut CollectSink::default(),
+            None,
+            Duration::ZERO,
+        )
+        .expect_err("a later format chunk must also be checked");
+        assert!(error.contains("channel count"), "{error}");
+    }
+
+    #[test]
+    fn wav_header_padding_preserves_pcm() {
+        let original = include_bytes!("../../tests/fixtures/audio/tone.wav");
+        let mut expected = CollectSink::default();
+        decode_source(
+            Cursor::new(original.to_vec()),
+            &mut expected,
+            None,
+            Duration::ZERO,
+        )
+        .expect("original WAV");
+        let mut padded = original.to_vec();
+        padded.splice(12..12, *b"JUNK\x01\0\0\0x\0");
+        let length = u32::try_from(padded.len() - 8).expect("small fixture");
+        padded[4..8].copy_from_slice(&length.to_le_bytes());
+        let mut actual = CollectSink::default();
+        decode_source(Cursor::new(padded), &mut actual, None, Duration::ZERO)
+            .expect("odd header chunk");
+        assert_eq!(actual.samples, expected.samples);
+    }
+
+    #[test]
+    fn excessive_wav_header_chunks_are_rejected() {
+        let original = include_bytes!("../../tests/fixtures/audio/tone.wav");
+        let mut excessive = original.to_vec();
+        excessive.splice(12..12, b"JUNK\0\0\0\0".repeat(super::MAX_WAV_HEADER_CHUNKS));
+        let length = u32::try_from(excessive.len() - 8).expect("bounded fixture");
+        excessive[4..8].copy_from_slice(&length.to_le_bytes());
+        let error = decode_source(
+            Cursor::new(excessive),
+            &mut CollectSink::default(),
+            None,
+            Duration::ZERO,
+        )
+        .expect_err("header work limit");
+        assert!(error.contains("WAV header exceeded"), "{error}");
     }
 
     #[test]

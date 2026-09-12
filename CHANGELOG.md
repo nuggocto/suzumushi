@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.4] - 2026-09-12
+
+### Fixed
+
+- Preserved the final audio buffer before reporting track completion, using
+  backend playback timing and a drain deadline that resets on pause and resume.
+- Kept newly loaded tracks silent until playback is requested, including next,
+  previous, and seeking while paused on native PipeWire.
+- Kept desktop play/pause and resume working after the queue is cleared while
+  its current track remains active.
+- Counted rejected paths against the scan entry limit so overlong filenames
+  cannot bypass the enumeration budget.
+- Rejected unsupported WAV channel counts before Symphonia parses them,
+  preventing the malformed-header overflow found by decoder fuzzing.
+
+### Added
+
+- Included the Nix flake in a stable release, with both `suzumushi` and `suzu`
+  commands and package installation checks.
+- Added regressions for output draining, paused callbacks, desktop controls
+  after queue removal, rejected scan entries, and malformed WAV headers.
+
+### Changed
+
+- Built Linux release archives with Rust 1.98.1 while retaining Rust 1.95 as
+  the minimum supported version.
+
 ## [1.1.3] - 2026-09-05
 
 ### Fixed

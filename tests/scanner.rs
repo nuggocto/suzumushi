@@ -714,6 +714,41 @@ fn enumeration_exhaustion_preserves_admitted_tracks_within_other_limits() {
 }
 
 #[test]
+fn rejected_paths_still_consume_the_enumeration_budget() {
+    let (_temp, root) = root();
+    for index in 0..20 {
+        fs::write(
+            root.join(format!("audio/library/overlong-filename-{index}.wav")),
+            b"unused media",
+        )
+        .expect("overlong path fixture");
+    }
+    let mut config = Config::default();
+    config.scan.max_entries = 10;
+    config.scan.max_files = 1;
+    config.scan.max_path_bytes = 16;
+    config.validate().expect("supported scan limits");
+
+    let index = scan(&root, &config, &mut FakeMetadata::default());
+
+    assert!(!index.complete);
+    assert!(index.entries.is_empty());
+    assert_eq!(index.counters.encountered_entries, 10);
+    assert!(index.warnings.iter().any(|warning| {
+        warning.code == ScanWarningCode::LimitReached
+            && warning.message == "scan.max_entries limit reached"
+    }));
+    assert!(index.warnings.len() <= 11);
+
+    config.scan.max_warning_bytes = 1;
+    config.validate().expect("bounded warning storage");
+    let silent = scan(&root, &config, &mut FakeMetadata::default());
+    assert!(silent.warnings.is_empty());
+    assert_eq!(silent.counters.encountered_entries, 10);
+    assert!(!silent.complete);
+}
+
+#[test]
 fn scan_counters_stop_at_limit_and_report_limit_plus_one() {
     let (_temp, root) = root();
     fs::write(root.join("audio/library/a.mp3"), b"a").expect("first media");

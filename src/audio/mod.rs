@@ -453,7 +453,7 @@ trait OutputStream: Send {
     fn resume(&mut self) -> Result<(), String>;
     fn stop(&mut self) -> Result<(), String>;
     fn consumed_frames(&self) -> u64;
-    fn drained(&self) -> bool;
+    fn drained(&mut self) -> bool;
     fn failure(&self) -> Option<String>;
 }
 
@@ -853,7 +853,7 @@ impl<B: Backend> WorkerCore<B> {
         positions: &PositionLane,
         generation: u64,
     ) -> bool {
-        let active = self.active.as_ref().expect("active playback is retained");
+        let active = self.active.as_mut().expect("active playback is retained");
         if !active.ended || active.pending.is_some() {
             return false;
         }
@@ -1213,7 +1213,7 @@ mod tests {
             self.consumed_frames.load(Ordering::Acquire)
         }
 
-        fn drained(&self) -> bool {
+        fn drained(&mut self) -> bool {
             self.drained.load(Ordering::Acquire)
         }
 

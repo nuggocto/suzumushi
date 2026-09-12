@@ -4,11 +4,12 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{
     BufferSize, Device, Error, ErrorKind, FromSample, I24, OutputCallbackInfo, SampleFormat,
-    SizedSample, Stream, StreamConfig, SupportedStreamConfigRange, U24,
+    SizedSample, Stream, StreamConfig, StreamInstant, SupportedStreamConfigRange, U24,
 };
 use rtrb::{Consumer, Producer, RingBuffer};
 
@@ -26,14 +27,21 @@ pub(super) struct CpalOutput {
     output_channels: usize,
     stream: Option<Stream>,
     producer: Option<Producer<f32>>,
-    consumed: Arc<AtomicU64>,
+    progress: Arc<OutputProgress>,
     end_of_stream: Arc<AtomicBool>,
     failure: Arc<AtomicU8>,
     gain: Arc<AtomicU32>,
     spectrum: Arc<SpectrumLane>,
     metrics: Arc<AudioMetrics>,
     written: u64,
-    stream_active: bool,
+    drain_deadline: Option<StreamInstant>,
+}
+
+#[derive(Default)]
+struct OutputProgress {
+    playing: AtomicBool,
+    consumed: AtomicU64,
+    playback_delay_nanos: AtomicU64,
 }
 
 impl CpalOutput {
@@ -43,15 +51,37 @@ impl CpalOutput {
             output_channels: 0,
             stream: None,
             producer: None,
-            consumed: Arc::new(AtomicU64::new(0)),
+            progress: Arc::new(OutputProgress::default()),
             end_of_stream: Arc::new(AtomicBool::new(false)),
             failure: Arc::new(AtomicU8::new(0)),
             gain: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
             spectrum,
             metrics,
             written: 0,
-            stream_active: false,
+            drain_deadline: None,
         }
+    }
+
+    fn drained_at(&mut self, now: StreamInstant) -> bool {
+        if !self.progress.playing.load(Ordering::Acquire)
+            || self.progress.consumed.load(Ordering::Acquire) < self.written
+        {
+            self.drain_deadline = None;
+            return false;
+        }
+        if let Some(deadline) = self.drain_deadline {
+            return now >= deadline;
+        }
+        // Ring consumption precedes hardware playback. Wait conservatively for
+        // the last callback's whole buffer plus its reported backend delay. The
+        // worker owns this deadline so pause/resume can restart the wait safely.
+        let delay =
+            Duration::from_nanos(self.progress.playback_delay_nanos.load(Ordering::Relaxed));
+        self.drain_deadline = now.checked_add(delay);
+        if self.drain_deadline.is_none() {
+            self.failure.store(1, Ordering::Release);
+        }
+        false
     }
 }
 
@@ -87,13 +117,13 @@ impl OutputStream for CpalOutput {
         let sample_format = choice.sample_format;
         let config = choice.config;
         let (producer, pcm_reader) = RingBuffer::new(PCM_RING_SAMPLES);
-        self.consumed.store(0, Ordering::Release);
+        self.progress = Arc::new(OutputProgress::default());
         self.end_of_stream.store(false, Ordering::Release);
         self.failure.store(0, Ordering::Release);
         self.written = 0;
-        self.stream_active = false;
+        self.drain_deadline = None;
         self.spectrum.clear();
-        let frames_read = Arc::clone(&self.consumed);
+        let progress = Arc::clone(&self.progress);
         let end_of_stream = Arc::clone(&self.end_of_stream);
         let failure = Arc::clone(&self.failure);
         let gain = Arc::clone(&self.gain);
@@ -105,7 +135,7 @@ impl OutputStream for CpalOutput {
             sample_format,
             pcm_reader,
             CallbackState {
-                frames_read,
+                progress,
                 end_of_stream,
                 failure,
                 gain,
@@ -121,6 +151,11 @@ impl OutputStream for CpalOutput {
                 source.sample_rate, choice.channels
             )
         })?;
+        // Some backends start callbacks immediately. The callback's playback
+        // gate remains closed even before this backend pause is processed.
+        stream
+            .pause()
+            .map_err(|error| format!("cannot prepare paused audio output: {error}"))?;
         self.source = Some(source);
         self.producer = Some(producer);
         self.stream = Some(stream);
@@ -159,6 +194,7 @@ impl OutputStream for CpalOutput {
                     .map_err(|_| "audio output sample count overflow".to_owned())?,
             )
             .ok_or_else(|| "audio output sample generation exhausted".to_owned())?;
+        self.drain_deadline = None;
         for frame in samples.chunks_exact(source_channels).take(frames) {
             match (source_channels, self.output_channels) {
                 (1, output_channels) => {
@@ -202,13 +238,15 @@ impl OutputStream for CpalOutput {
             .ok_or_else(|| "audio output stream is unavailable".to_owned())?
             .play()
             .map_err(|error| format!("cannot start the audio output stream: {error}"))?;
-        self.stream_active = true;
+        self.drain_deadline = None;
+        self.progress.playing.store(true, Ordering::Release);
         Ok(())
     }
 
     fn pause(&mut self) -> Result<(), String> {
-        if !self.stream_active {
-            self.spectrum.clear();
+        self.drain_deadline = None;
+        self.spectrum.clear();
+        if !self.progress.playing.swap(false, Ordering::AcqRel) {
             return Ok(());
         }
         self.stream
@@ -216,8 +254,6 @@ impl OutputStream for CpalOutput {
             .ok_or_else(|| "audio output stream is unavailable".to_owned())?
             .pause()
             .map_err(|error| format!("cannot pause the audio output stream: {error}"))?;
-        self.stream_active = false;
-        self.spectrum.clear();
         Ok(())
     }
 
@@ -230,21 +266,24 @@ impl OutputStream for CpalOutput {
         self.stream.take();
         self.producer.take();
         self.source = None;
-        self.stream_active = false;
         self.spectrum.clear();
         pause_error.map_or(Ok(()), Err)
     }
 
     fn consumed_frames(&self) -> u64 {
         let channels = u64::try_from(self.output_channels).unwrap_or(u64::MAX);
-        self.consumed
+        self.progress
+            .consumed
             .load(Ordering::Acquire)
             .checked_div(channels)
             .unwrap_or(0)
     }
 
-    fn drained(&self) -> bool {
-        self.consumed.load(Ordering::Acquire) >= self.written
+    fn drained(&mut self) -> bool {
+        let Some(now) = self.stream.as_ref().map(StreamTrait::now) else {
+            return false;
+        };
+        self.drained_at(now)
     }
 
     fn failure(&self) -> Option<String> {
@@ -278,7 +317,7 @@ fn build_stream(
 }
 
 struct CallbackState {
-    frames_read: Arc<AtomicU64>,
+    progress: Arc<OutputProgress>,
     end_of_stream: Arc<AtomicBool>,
     failure: Arc<AtomicU8>,
     gain: Arc<AtomicU32>,
@@ -296,7 +335,7 @@ where
     T: SizedSample + FromSample<f32>,
 {
     let CallbackState {
-        frames_read,
+        progress,
         end_of_stream,
         failure,
         gain,
@@ -304,12 +343,17 @@ where
         metrics,
     } = callback;
     let mut analyzer = SpectrumAnalyzer::new(config.sample_rate, config.channels);
+    let format = AudioFormat {
+        sample_rate: config.sample_rate,
+        channels: config.channels,
+    };
     let callback_metrics = Arc::clone(&metrics);
     let error_metrics = Arc::clone(&metrics);
     device
         .build_output_stream(
             *config,
-            move |output: &mut [T], _: &OutputCallbackInfo| {
+            move |output: &mut [T], info: &OutputCallbackInfo| {
+                let timestamp = info.timestamp();
                 let gain = f32::from_bits(gain.load(Ordering::Relaxed));
                 render_output(
                     output,
@@ -317,7 +361,11 @@ where
                         pcm_reader: &mut pcm_reader,
                         gain,
                         analyzer: &mut analyzer,
-                        frames_read: &frames_read,
+                        progress: &progress,
+                        timing: OutputTiming {
+                            format,
+                            backend_delay: timestamp.playback.duration_since(timestamp.callback),
+                        },
                         end_of_stream: &end_of_stream,
                         metrics: &callback_metrics,
                         spectrum: &spectrum,
@@ -334,10 +382,16 @@ struct RenderContext<'a> {
     pcm_reader: &'a mut Consumer<f32>,
     gain: f32,
     analyzer: &'a mut SpectrumAnalyzer,
-    frames_read: &'a AtomicU64,
+    progress: &'a OutputProgress,
+    timing: OutputTiming,
     end_of_stream: &'a AtomicBool,
     metrics: &'a AudioMetrics,
     spectrum: &'a SpectrumLane,
+}
+
+struct OutputTiming {
+    format: AudioFormat,
+    backend_delay: Duration,
 }
 
 fn render_output<T>(output: &mut [T], context: RenderContext<'_>)
@@ -348,11 +402,21 @@ where
         pcm_reader,
         gain,
         analyzer,
-        frames_read,
+        progress,
+        timing,
         end_of_stream,
         metrics,
         spectrum,
     } = context;
+    if !progress.playing.load(Ordering::Acquire) {
+        output.fill(T::EQUILIBRIUM);
+        return;
+    }
+    let frames = output.len().div_ceil(usize::from(timing.format.channels));
+    let buffer_nanos = u64::try_from(frames)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(1_000_000_000)
+        .div_ceil(u64::from(timing.format.sample_rate));
     let mut read = 0_u64;
     let mut underruns = 0_u64;
     let mut published = None;
@@ -379,7 +443,17 @@ where
             .underrun_samples
             .fetch_add(underruns, Ordering::Relaxed);
     }
-    frames_read.fetch_add(read, Ordering::Release);
+    if read != 0 {
+        let delay = timing
+            .backend_delay
+            .saturating_add(Duration::from_nanos(buffer_nanos));
+        progress.playback_delay_nanos.store(
+            u64::try_from(delay.as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        // Publish the delay before consumption makes the worker eligible to drain.
+        progress.consumed.fetch_add(read, Ordering::Release);
+    }
 }
 
 /// Records one CPAL error callback.
@@ -479,16 +553,35 @@ fn finite_or_silence(sample: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+    use std::time::Duration;
 
     use crate::audio::{AudioSpectrum, SPECTRUM_BANDS};
 
     use cpal::{SampleFormat, SupportedBufferSize, SupportedStreamConfigRange};
 
     use super::{
-        AudioMetrics, CpalOutput, Error, ErrorKind, OutputStream, SpectrumLane,
-        record_stream_error, render_output, select_output_config,
+        AudioFormat, AudioMetrics, CpalOutput, Error, ErrorKind, OutputProgress, OutputStream,
+        OutputTiming, SpectrumLane, StreamInstant, record_stream_error, render_output,
+        select_output_config,
     };
+
+    fn playing_progress() -> OutputProgress {
+        OutputProgress {
+            playing: AtomicBool::new(true),
+            ..OutputProgress::default()
+        }
+    }
+
+    fn timing(channels: u16) -> OutputTiming {
+        OutputTiming {
+            format: AudioFormat {
+                sample_rate: 48_000,
+                channels,
+            },
+            backend_delay: Duration::ZERO,
+        }
+    }
 
     fn range(
         channels: u16,
@@ -559,7 +652,7 @@ mod tests {
     fn an_empty_ring_is_rendered_as_silence_and_counted_without_waiting() {
         let (_producer, mut consumer) = rtrb::RingBuffer::new(8);
         let metrics = AudioMetrics::default();
-        let frames_read = AtomicU64::new(0);
+        let progress = playing_progress();
         let end_of_stream = AtomicBool::new(false);
         let spectrum = SpectrumLane::default();
         let mut analyzer = super::SpectrumAnalyzer::new(48_000, 2);
@@ -571,7 +664,8 @@ mod tests {
                 pcm_reader: &mut consumer,
                 gain: 1.0,
                 analyzer: &mut analyzer,
-                frames_read: &frames_read,
+                progress: &progress,
+                timing: timing(2),
                 end_of_stream: &end_of_stream,
                 metrics: &metrics,
                 spectrum: &spectrum,
@@ -579,7 +673,7 @@ mod tests {
         );
 
         assert_eq!(output.map(f32::to_bits), [0; 4]);
-        assert_eq!(frames_read.load(Ordering::Relaxed), 0);
+        assert_eq!(progress.consumed.load(Ordering::Relaxed), 0);
         assert_eq!(
             metrics.underrun_samples.load(Ordering::Relaxed),
             output.len() as u64
@@ -592,7 +686,7 @@ mod tests {
         producer.push(0.25).expect("first scheduled sample");
         producer.push(-0.25).expect("second scheduled sample");
         let metrics = AudioMetrics::default();
-        let frames_read = AtomicU64::new(0);
+        let progress = playing_progress();
         let end_of_stream = AtomicBool::new(true);
         let spectrum = SpectrumLane::default();
         let mut analyzer = super::SpectrumAnalyzer::new(48_000, 1);
@@ -604,14 +698,15 @@ mod tests {
                 pcm_reader: &mut consumer,
                 gain: 1.0,
                 analyzer: &mut analyzer,
-                frames_read: &frames_read,
+                progress: &progress,
+                timing: timing(1),
                 end_of_stream: &end_of_stream,
                 metrics: &metrics,
                 spectrum: &spectrum,
             },
         );
 
-        assert_eq!(frames_read.load(Ordering::Relaxed), 2);
+        assert_eq!(progress.consumed.load(Ordering::Relaxed), 2);
         assert_eq!(metrics.underrun_samples.load(Ordering::Relaxed), 0);
         let bits = output.map(f32::to_bits);
         assert_eq!(&bits[2..], &[0, 0]);
@@ -622,7 +717,7 @@ mod tests {
         let (mut producer, mut consumer) = rtrb::RingBuffer::new(8);
         producer.push(0.25).expect("committed sample");
         let metrics = AudioMetrics::default();
-        let frames_read = AtomicU64::new(0);
+        let progress = playing_progress();
         let end_of_stream = AtomicBool::new(false);
         let spectrum = SpectrumLane::default();
         let mut analyzer = super::SpectrumAnalyzer::new(48_000, 1);
@@ -633,7 +728,8 @@ mod tests {
                 pcm_reader: &mut consumer,
                 gain: 1.0,
                 analyzer: &mut analyzer,
-                frames_read: &frames_read,
+                progress: &progress,
+                timing: timing(1),
                 end_of_stream: &end_of_stream,
                 metrics: &metrics,
                 spectrum: &spectrum,
@@ -644,6 +740,117 @@ mod tests {
             [0.25_f32, 0.0, 0.0, 0.0].map(f32::to_bits)
         );
         assert_eq!(metrics.underrun_samples.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn callbacks_before_play_preserve_pcm_and_render_silence() {
+        let (mut producer, mut consumer) = rtrb::RingBuffer::new(8);
+        producer.push(0.25).expect("left sample");
+        producer.push(-0.25).expect("right sample");
+        let progress = OutputProgress::default();
+        let metrics = AudioMetrics::default();
+        let end_of_stream = AtomicBool::new(true);
+        let spectrum = SpectrumLane::default();
+        let mut analyzer = super::SpectrumAnalyzer::new(48_000, 2);
+        let mut output = [1.0_f32; 4];
+
+        render_output(
+            &mut output,
+            super::RenderContext {
+                pcm_reader: &mut consumer,
+                gain: 1.0,
+                analyzer: &mut analyzer,
+                progress: &progress,
+                timing: timing(2),
+                end_of_stream: &end_of_stream,
+                metrics: &metrics,
+                spectrum: &spectrum,
+            },
+        );
+
+        assert_eq!(output.map(f32::to_bits), [0; 4]);
+        assert_eq!(progress.consumed.load(Ordering::Acquire), 0);
+        assert_eq!(metrics.underrun_samples.load(Ordering::Relaxed), 0);
+
+        progress.playing.store(true, Ordering::Release);
+        render_output(
+            &mut output,
+            super::RenderContext {
+                pcm_reader: &mut consumer,
+                gain: 1.0,
+                analyzer: &mut analyzer,
+                progress: &progress,
+                timing: timing(2),
+                end_of_stream: &end_of_stream,
+                metrics: &metrics,
+                spectrum: &spectrum,
+            },
+        );
+        assert_eq!(
+            output.map(f32::to_bits),
+            [0.25_f32, -0.25, 0.0, 0.0].map(f32::to_bits)
+        );
+        assert_eq!(progress.consumed.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn ring_consumption_waits_for_backend_latency_and_the_final_buffer() {
+        let spectrum = Arc::new(SpectrumLane::default());
+        let metrics = Arc::new(AudioMetrics::default());
+        let mut device = CpalOutput::with_metrics(Arc::clone(&spectrum), Arc::clone(&metrics));
+        let (mut producer, mut consumer) = rtrb::RingBuffer::new(80);
+        for _ in 0..40 {
+            producer.push(0.25).expect("final PCM samples");
+        }
+        device.written = 40;
+        device.progress.playing.store(true, Ordering::Release);
+        let end_of_stream = AtomicBool::new(true);
+        let mut analyzer = super::SpectrumAnalyzer::new(8_000, 1);
+        let mut buffer = [0.0_f32; 80];
+        let now = StreamInstant::ZERO + Duration::from_secs(1);
+        assert!(!device.drained_at(now), "queued PCM has not been consumed");
+
+        render_output(
+            &mut buffer,
+            super::RenderContext {
+                pcm_reader: &mut consumer,
+                gain: 1.0,
+                analyzer: &mut analyzer,
+                progress: &device.progress,
+                timing: OutputTiming {
+                    format: AudioFormat {
+                        sample_rate: 8_000,
+                        channels: 1,
+                    },
+                    backend_delay: Duration::from_millis(40),
+                },
+                end_of_stream: &end_of_stream,
+                metrics: &metrics,
+                spectrum: &spectrum,
+            },
+        );
+
+        assert!(consumer.is_empty());
+        assert!(
+            !device.drained_at(now),
+            "an empty ring is not a drained device"
+        );
+        assert!(!device.drained_at(now + Duration::from_micros(49_999)));
+        assert!(device.drained_at(now + Duration::from_millis(50)));
+
+        device.progress.playing.store(false, Ordering::Release);
+        assert!(
+            !device.drained_at(now + Duration::from_secs(5)),
+            "paused output cannot finish"
+        );
+        device.progress.playing.store(true, Ordering::Release);
+        let resumed = now + Duration::from_secs(10);
+        assert!(
+            !device.drained_at(resumed),
+            "resuming restarts the drain deadline"
+        );
+        assert!(!device.drained_at(resumed + Duration::from_micros(49_999)));
+        assert!(device.drained_at(resumed + Duration::from_millis(50)));
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 Suzumushi publishes one prebuilt target:
 `x86_64-unknown-linux-gnu`. The archive is built on Ubuntu 24.04 with Rust
-1.97.1 from the exact tagged commit. It contains the canonical `suzumushi`
+1.98.1 from the exact tagged commit. It contains the canonical `suzumushi`
 binary, the relative `suzu -> suzumushi` symlink, the README, changelog, and
 Apache 2.0 license.
 
@@ -30,7 +30,7 @@ repository permission and performs these operations:
 
 1. Require the tag to equal `v` plus the Cargo package version.
 2. Run the complete `mise run ci` gate.
-3. Require Rust 1.97.1 and build the locked GNU/Linux release binary.
+3. Require Rust 1.98.1 and build the locked GNU/Linux release binary.
 4. Create and independently inspect the fixed-content archive.
 5. Produce and verify `SHA256SUMS`.
 

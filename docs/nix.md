@@ -7,15 +7,15 @@ the canonical `suzumushi` executable and a relative `suzu` symlink.
 `flake.lock` pins Nixpkgs, including Rust and the native libraries. The package
 uses `Cargo.lock` for Rust dependencies and reads the version from `Cargo.toml`.
 Adding or updating this packaging does not require an application version bump.
-Existing release tags do not gain the flake retroactively; use `shrek` or a
-commit containing it until a new release includes it.
+Version 1.1.4 is the first stable release containing the flake. Use its tag for
+the stable package, or `shrek` to follow development.
 
 ## Install or run
 
 With flakes enabled, install into your user profile:
 
 ```sh
-nix profile add github:nuggocto/suzumushi/shrek
+nix profile add github:nuggocto/suzumushi/v1.1.4
 ```
 
 To enable flakes for any command here, put
@@ -24,8 +24,8 @@ To enable flakes for any command here, put
 You can also run without adding anything to your profile:
 
 ```sh
-nix run github:nuggocto/suzumushi/shrek -- init ./suzumushi
-nix run github:nuggocto/suzumushi/shrek -- --root ./suzumushi
+nix run github:nuggocto/suzumushi/v1.1.4 -- init ./suzumushi
+nix run github:nuggocto/suzumushi/v1.1.4 -- --root ./suzumushi
 ```
 
 Add your audio below `./suzumushi/audio/library/` before starting playback.
@@ -37,7 +37,7 @@ and desktop D-Bus sessions.
 Add an input to your existing NixOS or Home Manager flake:
 
 ```nix
-inputs.suzumushi.url = "github:nuggocto/suzumushi/shrek";
+inputs.suzumushi.url = "github:nuggocto/suzumushi/v1.1.4";
 ```
 
 Make `inputs` available to your NixOS modules by passing

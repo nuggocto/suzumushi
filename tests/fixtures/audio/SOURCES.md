@@ -22,9 +22,15 @@ n9.0.1:
 ffmpeg -f lavfi -i 'sine=frequency=440:sample_rate=44100:duration=0.25' -ac 2 -c:a pcm_s16le tone-44100.wav
 ```
 
+`invalid-wav-channels.bin` is a 60-byte synthetic WAV header produced by the
+decoder fuzzer. Its channel count overflows Symphonia 0.6.1's unchecked block
+alignment multiplication. It is retained as a regression fixture and as
+`fuzz/corpus/audio_decoder/seed-invalid-wav-channels`.
+
 SHA-256:
 
 ```text
+fc0950913760e04414269cc245c9ee6cf85455d9ff85ccf42a50905bd6b79247  invalid-wav-channels.bin
 39c9c594c0481ca3d26035c79d09c48a17eed1b58a088639511d3fbc29256784  tone-44100.wav
 d91ab665afc30f802334b1a04f4e586b76f9b667f523528a9067a5fa2e69a5b5  tone.flac
 569086b7abf7857ee447bb3ac64632fa3772ec9c93fc5312f6b8bbf0e248d169  tone.mp3

@@ -67,7 +67,8 @@ impl MprisProjection {
         let mut capabilities = 0;
         capabilities |= u8::from(app.can_go_next()) * CAN_GO_NEXT;
         capabilities |= u8::from(app.current_track_token().is_some()) * CAN_GO_PREVIOUS;
-        capabilities |= u8::from(!app.queue.is_empty()) * CAN_PLAY;
+        capabilities |=
+            u8::from(!app.queue.is_empty() || (active && track_token.is_some())) * CAN_PLAY;
         capabilities |= u8::from(track_token.is_some()) * CAN_PAUSE;
         capabilities |= u8::from(active) * CAN_SEEK;
         Self {
@@ -352,7 +353,16 @@ impl PlayerInterface {
 
     fn play_pause(&self) -> zbus::fdo::Result<()> {
         self.enqueue_if(
-            |state| has_capability(state, CAN_PLAY),
+            |state| {
+                has_capability(
+                    state,
+                    if state.playback_status == PlaybackStatus::Playing {
+                        CAN_PAUSE
+                    } else {
+                        CAN_PLAY
+                    },
+                )
+            },
             AppAction::PlayPause,
         )
     }
@@ -839,6 +849,87 @@ mod tests {
             .set_position(path, -1)
             .expect("negative position is ignored");
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn clearing_the_queue_keeps_controls_for_the_current_track() {
+        use crate::app::{AppState, Focus};
+        use crate::audio::{AudioEvent, AudioFormat};
+        use crate::config::Config;
+        use crate::model::{
+            FileIdentity, MediaAsset, ScanCounters, ScanIndex, SearchFields, TrackEntry,
+            TrackEntryId, TrackEntrySource, TrackTags,
+        };
+
+        let index = ScanIndex {
+            generation: 1,
+            complete: true,
+            assets: vec![MediaAsset {
+                tags: TrackTags::default(),
+                file_identity: FileIdentity {
+                    device: 1,
+                    inode: 1,
+                    size: 1,
+                    modified_seconds: 0,
+                    modified_nanoseconds: 0,
+                },
+            }],
+            entries: vec![TrackEntry {
+                id: TrackEntryId(1),
+                asset_index: 0,
+                display_path: "library/tone.wav".into(),
+                source: TrackEntrySource::LibraryFile,
+                search: SearchFields {
+                    filename: "tone".into(),
+                    relative_path: "library/tone.wav".into(),
+                },
+            }],
+            playlists: Vec::new(),
+            warnings: Vec::new(),
+            counters: ScanCounters {
+                encountered_entries: 2,
+                ..ScanCounters::default()
+            },
+        };
+        let mut app = AppState::new(&Config::default(), index).expect("app state");
+        app.apply(AppAction::Activate)
+            .expect("start selected track");
+        app.audio_event(AudioEvent::Started {
+            generation: 1,
+            timeline_revision: 1,
+            format: AudioFormat {
+                sample_rate: 48_000,
+                channels: 2,
+            },
+            duration: Some(Duration::from_mins(1)),
+            position: Duration::ZERO,
+        });
+        app.focus = Focus::Queue;
+        app.apply(AppAction::QueueClear);
+        assert!(app.queue.is_empty());
+
+        let (sender, receiver) = mpsc::sync_channel(REQUEST_CAPACITY);
+        let player = PlayerInterface {
+            actions: sender,
+            state: Arc::new(RwLock::new(MprisProjection::from_app(&app))),
+        };
+        assert!(player.can_pause().expect("pause capability"));
+        player.play_pause().expect("pause current track");
+        assert_eq!(
+            receiver.try_recv().expect("toggle action"),
+            AppAction::PlayPause
+        );
+
+        app.audio_event(AudioEvent::Paused { generation: 1 });
+        *player.state.write().expect("projection") = MprisProjection::from_app(&app);
+        assert!(player.can_play().expect("resume capability"));
+        player.play().expect("resume current track");
+        assert_eq!(receiver.try_recv().expect("play action"), AppAction::Play);
+
+        app.apply(AppAction::Stop);
+        app.audio_event(AudioEvent::Stopped { generation: 1 });
+        *player.state.write().expect("projection") = MprisProjection::from_app(&app);
+        assert!(!player.can_play().expect("empty stopped queue"));
     }
 
     #[test]

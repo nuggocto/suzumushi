@@ -29,6 +29,9 @@ code hang.
   attachments, chapters, seek tables, or embedded pictures.
 - Leading ID3v2 data is similarly hidden from the playback decoder; only the
   MPEG audio frames are relevant to this path.
+- WAV format chunks are checked for supported channel counts before Symphonia
+  parses them. Header inspection stops at the audio data and is limited to
+  1,024 chunks, including RIFF padding and repeated format chunks.
 - A parent-death signal prevents an orphaned helper from surviving the terminal.
 - The parent stops and reaps a helper after three seconds without output
   progress, on track replacement, on stop, and during shutdown.
@@ -41,6 +44,11 @@ code hang.
   applies one atomic gain, writes silence on underrun, converts sample types,
   updates the fixed 16-band spectrum analyzer, and publishes atomic state. It
   does not allocate, block, log, take a lock, or send a message.
+- A callback playback gate keeps new and paused streams from consuming PCM,
+  even when a backend starts callbacks before `play` is called. After the ring
+  empties, the worker keeps output alive for the final buffer duration plus the
+  backend's reported playback delay. Pause/resume resets this conservative
+  drain deadline; playback does not promise gapless track transitions.
 - Seeking restarts the isolated helper before the requested source timestamp,
   then discards decoded preroll against packet presentation timestamps before
   emitting PCM. Automatic session resume enters through the same verified
