@@ -206,7 +206,7 @@ impl OutputStream for CpalOutput {
                 }
                 (2, 1) => {
                     producer
-                        .push(finite_or_silence((frame[0] + frame[1]) * 0.5))
+                        .push(finite_or_silence(frame[0].midpoint(frame[1])))
                         .map_err(|_| "audio output ring changed while writing".to_owned())?;
                 }
                 (2, output_channels) => {

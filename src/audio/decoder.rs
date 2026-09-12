@@ -226,10 +226,8 @@ fn read_protocol_inner(
         samples
             .try_reserve_exact(sample_count)
             .map_err(|error| format!("cannot reserve decoded samples: {error}"))?;
-        for chunk in bytes.chunks_exact(4) {
-            samples.push(f32::from_le_bytes(
-                chunk.try_into().expect("four-byte PCM sample"),
-            ));
+        for chunk in bytes.as_chunks::<4>().0 {
+            samples.push(f32::from_le_bytes(*chunk));
         }
         messages
             .send(DecoderPoll::Samples(samples))
