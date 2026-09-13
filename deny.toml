@@ -1,5 +1,9 @@
 [advisories]
 unmaintained = "all"
+# Preserve cargo-audit --deny warnings coverage for transitive unsound crates
+# and yanked versions when using cargo-deny as the only dependency checker.
+unsound = "all"
+yanked = "deny"
 # Transitive through Lofty; no released Lofty version removes this dependency.
 ignore = ["RUSTSEC-2024-0436"]
 

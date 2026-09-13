@@ -33,6 +33,9 @@ repository permission and performs these operations:
 3. Require Rust 1.98.1 and build the locked GNU/Linux release binary.
 4. Create and independently inspect the fixed-content archive.
 5. Produce and verify `SHA256SUMS`.
+6. Run the extracted binary's version and initialization commands, then scan
+   the MP3 fixture through the packaged `suzu` symlink. Each command has a
+   ten-second timeout, with forced termination one second later if needed.
 
 A separate job receives only those verified files and the permission needed to
 create the GitHub release. Prerelease versions are marked as prereleases and
@@ -45,9 +48,11 @@ checkout containing the annotated tag. Never rebuild the recovery artifact or
 move the tag.
 
 After publication, download both assets into a new temporary directory, run
-`scripts/verify-release-archive.sh`, and exercise the extracted binary and
-relative symlink. Record the tag, commit, workflow result, archive SHA-256, and
-QA environment.
+`scripts/verify-release-archive.sh` from a checkout containing the audio fixture
+in `tests/fixtures/audio/tone.mp3`. The verifier exercises the extracted binary
+and relative symlink using a temporary library, and requires a complete scan
+with one track and no warnings. Record the tag, commit, workflow result,
+archive SHA-256, and QA environment.
 
 ## AUR package publication
 

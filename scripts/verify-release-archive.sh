@@ -25,15 +25,18 @@ fi
 
 readonly ARCHIVE_ROOT="suzumushi-v$VERSION-$TARGET"
 readonly ARCHIVE_NAME="$ARCHIVE_ROOT.tar.xz"
-readonly ARCHIVE_DIR="$(cd "$(dirname -- "$ARCHIVE_PATH")" && pwd -P)"
+ARCHIVE_DIR="$(cd "$(dirname -- "$ARCHIVE_PATH")" && pwd -P)"
+readonly ARCHIVE_DIR
 
 if [[ "$(basename -- "$ARCHIVE_PATH")" != "$ARCHIVE_NAME" ]]; then
   echo "error: unexpected archive name: $(basename -- "$ARCHIVE_PATH")" >&2
   exit 1
 fi
 
-readonly EXPECTED_SUM="$(cd "$ARCHIVE_DIR" && sha256sum "$ARCHIVE_NAME")"
-readonly RECORDED_SUM="$(<"$CHECKSUM_PATH")"
+EXPECTED_SUM="$(cd "$ARCHIVE_DIR" && sha256sum "$ARCHIVE_NAME")"
+readonly EXPECTED_SUM
+RECORDED_SUM="$(cat -- "$CHECKSUM_PATH")"
+readonly RECORDED_SUM
 if [[ "$RECORDED_SUM" != "$EXPECTED_SUM" ]]; then
   echo "error: SHA256SUMS does not exactly match $ARCHIVE_NAME" >&2
   exit 1
@@ -45,7 +48,8 @@ $ARCHIVE_ROOT/LICENSE
 $ARCHIVE_ROOT/README.md
 $ARCHIVE_ROOT/suzu
 $ARCHIVE_ROOT/suzumushi"
-readonly ACTUAL_CONTENTS="$(LC_ALL=C tar --list --file "$ARCHIVE_PATH" | LC_ALL=C sort)"
+ACTUAL_CONTENTS="$(LC_ALL=C tar --list --file "$ARCHIVE_PATH" | LC_ALL=C sort)"
+readonly ACTUAL_CONTENTS
 if [[ "$ACTUAL_CONTENTS" != "$EXPECTED_CONTENTS" ]]; then
   echo "error: release archive contains unexpected paths" >&2
   diff -u <(printf '%s\n' "$EXPECTED_CONTENTS") <(printf '%s\n' "$ACTUAL_CONTENTS") >&2 || true
@@ -56,7 +60,10 @@ verify_dir="$(mktemp -d "${TMPDIR:-/tmp}/suzumushi-verify.XXXXXX")"
 cleanup() {
   rm -rf -- "${verify_dir:?}"
 }
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 tar --extract --file "$ARCHIVE_PATH" --directory "$verify_dir"
 
@@ -71,7 +78,20 @@ if [[ ! -L "$EXTRACTED/suzu" || "$(readlink "$EXTRACTED/suzu")" != "suzumushi" ]
   exit 1
 fi
 
-if [[ "$($EXTRACTED/suzumushi --version)" != "suzumushi $VERSION" ]]; then
+binary_version="$(timeout --kill-after=1s 10s "$EXTRACTED/suzumushi" --version)"
+if [[ "$binary_version" != "suzumushi $VERSION" ]]; then
   echo "error: extracted binary version does not match $VERSION" >&2
   exit 1
 fi
+
+# Resolve the fixture beside this script so downloaded archives can be checked
+# from any directory. Exercise metadata parsing through the packaged alias.
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+timeout --kill-after=1s 10s "$EXTRACTED/suzumushi" init "$verify_dir/root"
+cp -- "$script_dir/../tests/fixtures/audio/tone.mp3" \
+  "$verify_dir/root/audio/library/tone.mp3"
+timeout --kill-after=1s 10s "$EXTRACTED/suzu" \
+  --root "$verify_dir/root" diagnose >"$verify_dir/diagnosis.txt"
+grep -Fx 'complete: true' "$verify_dir/diagnosis.txt"
+grep -Fx 'tracks: 1' "$verify_dir/diagnosis.txt"
+grep -Fx 'warnings: 0' "$verify_dir/diagnosis.txt"

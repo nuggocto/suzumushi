@@ -31,14 +31,16 @@ fi
 readonly BINARY="target/$TARGET/release/suzumushi"
 readonly ARCHIVE_ROOT="suzumushi-v$VERSION-$TARGET"
 readonly ARCHIVE="$ARCHIVE_ROOT.tar.xz"
-readonly COMMIT_TIME="$(git show -s --format=%ct "$COMMIT")"
+COMMIT_TIME="$(git show -s --format=%ct "$COMMIT")"
+readonly COMMIT_TIME
 
 if [[ ! -x "$BINARY" ]]; then
   echo "error: release binary does not exist: $BINARY" >&2
   exit 1
 fi
 
-if [[ "$($BINARY --version)" != "suzumushi $VERSION" ]]; then
+binary_version="$(timeout --kill-after=1s 10s "$BINARY" --version)"
+if [[ "$binary_version" != "suzumushi $VERSION" ]]; then
   echo "error: release binary version does not match $VERSION" >&2
   exit 1
 fi
@@ -53,7 +55,10 @@ package_dir="$(mktemp -d "${TMPDIR:-/tmp}/suzumushi-release.XXXXXX")"
 cleanup() {
   rm -rf -- "${package_dir:?}"
 }
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 install -Dm755 "$BINARY" "$package_dir/$ARCHIVE_ROOT/suzumushi"
 install -Dm644 README.md "$package_dir/$ARCHIVE_ROOT/README.md"

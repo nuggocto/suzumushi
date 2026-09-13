@@ -1,5 +1,8 @@
 [advisories]
 unmaintained = "all"
+# Keep advisory and yank policy in step with the root deny.toml.
+unsound = "all"
+yanked = "deny"
 # Transitive through Lofty; no released Lofty version removes this dependency.
 ignore = ["RUSTSEC-2024-0436"]
 
