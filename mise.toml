@@ -25,9 +25,10 @@ run = "mise exec rust@1.95.0 -- cargo test --locked --workspace"
 [tasks.security]
 description = "Check dependency advisories, licenses, bans, and sources"
 # RUSTSEC-2024-0436 is transitive through Lofty; deny.toml records the exception.
+# Select the tool explicitly: Cargo's bin directory can contain an older copy.
 run = [
-  "cargo-deny --locked check advisories bans licenses sources",
-  "cargo-deny --locked --manifest-path fuzz/Cargo.toml check --config fuzz/deny.toml advisories bans licenses sources",
+  "mise exec cargo:cargo-deny@0.20.2 -- cargo-deny --locked check advisories bans licenses sources",
+  "mise exec cargo:cargo-deny@0.20.2 -- cargo-deny --locked --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml check advisories bans licenses sources",
 ]
 
 [tasks.fuzz-smoke]
