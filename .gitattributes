@@ -1,3 +1,4 @@
+*.nix -linguist-detectable
 *.sh -linguist-detectable
 packaging/aur/.SRCINFO -linguist-detectable
 packaging/aur/PKGBUILD -linguist-detectable
