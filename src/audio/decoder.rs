@@ -864,25 +864,20 @@ impl<W: Write> PcmSink for ProtocolSink<W> {
         if self.ready {
             return Err("decoder attempted to send two format headers".into());
         }
-        self.writer
-            .write_all(READY_MAGIC)
-            .and_then(|()| {
-                self.writer
-                    .write_all(&info.format.sample_rate.to_le_bytes())
-            })
-            .and_then(|()| self.writer.write_all(&info.format.channels.to_le_bytes()))
-            .and_then(|()| self.writer.write_all(&[0, 0]))
-            .and_then(|()| {
-                let duration = info
-                    .duration
-                    .map_or(UNKNOWN_DURATION_MICROS, duration_micros);
-                self.writer.write_all(&duration.to_le_bytes())
-            })
-            .and_then(|()| {
-                let position = duration_micros(info.position);
-                self.writer.write_all(&position.to_le_bytes())
-            })
-            .map_err(|error| format!("cannot write decoder format: {error}"))?;
+        let mut write_header = || -> std::io::Result<()> {
+            self.writer.write_all(READY_MAGIC)?;
+            self.writer
+                .write_all(&info.format.sample_rate.to_le_bytes())?;
+            self.writer.write_all(&info.format.channels.to_le_bytes())?;
+            self.writer.write_all(&[0, 0])?;
+            let duration = info
+                .duration
+                .map_or(UNKNOWN_DURATION_MICROS, duration_micros);
+            self.writer.write_all(&duration.to_le_bytes())?;
+            self.writer
+                .write_all(&duration_micros(info.position).to_le_bytes())
+        };
+        write_header().map_err(|error| format!("cannot write decoder format: {error}"))?;
         self.ready = true;
         Ok(())
     }
@@ -1161,13 +1156,16 @@ mod tests {
                 full.samples.len().saturating_sub(requested_samples),
                 "{container} sample count"
             );
-            if container == "WAV" {
-                assert_eq!(
-                    &sought.samples[..64],
-                    &full.samples[requested_samples..requested_samples + 64],
-                    "WAV first emitted frame must be the requested frame"
-                );
-            }
+            // MP3 synthesis needs one frame of history after a seek. Compare
+            // every subsequent sample exactly; lossless formats need no warmup.
+            let warmup_samples = if container == "MP3" { 1_152 * 2 } else { 0 };
+            let expected = &full.samples[requested_samples + warmup_samples..];
+            let actual = &sought.samples[warmup_samples..];
+            let mismatch = actual
+                .iter()
+                .zip(expected)
+                .position(|(a, b)| a.to_bits() != b.to_bits());
+            assert_eq!(mismatch, None, "{container} sample mismatch after seek");
         }
     }
 

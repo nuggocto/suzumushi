@@ -50,7 +50,7 @@ pub fn render(frame: &mut Frame<'_>, app: &AppState, animation_time: Duration) {
 fn render_library(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     let block = panel_block("Library", Focus::Library, app);
     let row_count = app.library_row_count();
-    if app.search.active && !app.search.query.is_empty() && row_count == 0 {
+    if app.search().active && !app.search().query.is_empty() && row_count == 0 {
         frame.render_widget(
             Paragraph::new("No matches\nTry artist, title, filename, or path.")
                 .wrap(Wrap { trim: false })
@@ -71,14 +71,14 @@ fn render_library(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
 
     let visible = usize::from(area.height.saturating_sub(2)).max(1);
     let max_row_bytes = row_text_max_bytes(area);
-    let offset = centered_offset(app.library_selection, row_count, visible);
+    let offset = centered_offset(app.library_selection(), row_count, visible);
     let end = offset.saturating_add(visible).min(row_count);
     let items: Vec<_> = (offset..end)
         .filter_map(|position| app.library_row(position))
         .map(|row| ListItem::new(library_row_text(app, row, max_row_bytes)))
         .collect();
     let mut state = ListState::default();
-    state.select(Some(app.library_selection.saturating_sub(offset)));
+    state.select(Some(app.library_selection().saturating_sub(offset)));
     let list = List::new(items)
         .block(block)
         .highlight_style(selection_style(app, Focus::Library));
@@ -89,7 +89,7 @@ fn render_player(frame: &mut Frame<'_>, area: Rect, app: &AppState, animation_ti
     let max_bytes = row_text_max_bytes(area);
     let title = app.player_title(max_bytes);
     let creator = app.player_creator(max_bytes);
-    let state = match app.playback_status {
+    let state = match app.playback_status() {
         PlaybackStatus::Stopped => "Stopped",
         PlaybackStatus::Loading => "Loading",
         PlaybackStatus::Playing => "Playing",
@@ -110,7 +110,7 @@ fn render_player(frame: &mut Frame<'_>, area: Rect, app: &AppState, animation_ti
     };
     let modes = format!(
         "Shuffle {}  Repeat {}",
-        if app.shuffle { "on" } else { "off" },
+        if app.shuffle_enabled() { "on" } else { "off" },
         app.repeat.label(),
     );
     let mut content = Vec::with_capacity(18);
@@ -120,7 +120,7 @@ fn render_player(frame: &mut Frame<'_>, area: Rect, app: &AppState, animation_ti
     }
     content.push(Line::default());
     content.extend(mascot::lines(
-        app.playback_status,
+        app.playback_status(),
         animation_time,
         app.color_mode,
     ));
@@ -129,7 +129,7 @@ fn render_player(frame: &mut Frame<'_>, area: Rect, app: &AppState, animation_ti
     content.push(Line::default());
     content.push(Line::styled(
         format!("State: {state}"),
-        playback_state_style(app, app.playback_status),
+        playback_state_style(app, app.playback_status()),
     ));
     content.push(Line::from(volume));
     content.push(Line::from(modes));
@@ -157,7 +157,7 @@ fn render_player(frame: &mut Frame<'_>, area: Rect, app: &AppState, animation_ti
 
 fn spectrum_line(app: &AppState) -> Line<'static> {
     const GLYPHS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    if app.playback_status != PlaybackStatus::Playing {
+    if app.playback_status() != PlaybackStatus::Playing {
         return Line::default();
     }
     let levels = app.audio_spectrum_levels();
@@ -217,7 +217,7 @@ fn progress_bar(
 
 fn render_queue(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     let block = panel_block("Queue", Focus::Queue, app);
-    if app.queue.is_empty() {
+    if app.queue().is_empty() {
         frame.render_widget(
             Paragraph::new("Queue is empty\nSelect a track and press Enter.")
                 .wrap(Wrap { trim: false })
@@ -229,9 +229,9 @@ fn render_queue(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
 
     let visible = usize::from(area.height.saturating_sub(2)).max(1);
     let max_row_bytes = row_text_max_bytes(area);
-    let offset = centered_offset(app.queue_selection, app.queue.len(), visible);
-    let end = offset.saturating_add(visible).min(app.queue.len());
-    let items: Vec<_> = app.queue[offset..end]
+    let offset = centered_offset(app.queue_selection(), app.queue().len(), visible);
+    let end = offset.saturating_add(visible).min(app.queue().len());
+    let items: Vec<_> = app.queue()[offset..end]
         .iter()
         .enumerate()
         .map(|(visible_index, item)| {
@@ -243,7 +243,7 @@ fn render_queue(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         })
         .collect();
     let mut state = ListState::default();
-    state.select(Some(app.queue_selection.saturating_sub(offset)));
+    state.select(Some(app.queue_selection().saturating_sub(offset)));
     let list = List::new(items)
         .block(block)
         .highlight_style(selection_style(app, Focus::Queue));
@@ -534,12 +534,12 @@ mod tests {
         let resting = rendered(&app, 80, 24, Duration::from_millis(200));
         assert!(resting.contains("▐▀• •▀▌"), "{resting}");
 
-        app.playback_status = crate::app::PlaybackStatus::Playing;
+        app.set_playback_status(crate::app::PlaybackStatus::Playing);
         let dancing = rendered(&app, 80, 24, Duration::from_millis(200));
         assert!(dancing.contains("▐▀^ ^▀▌"), "{dancing}");
         assert!(!dancing.contains("▐▀• •▀▌"), "{dancing}");
 
-        app.playback_status = crate::app::PlaybackStatus::Paused;
+        app.set_playback_status(crate::app::PlaybackStatus::Paused);
         let paused = rendered(&app, 80, 24, Duration::from_millis(200));
         assert!(paused.contains("▐▀• •▀▌"), "{paused}");
         assert!(!paused.contains("▐▀^ ^▀▌"), "{paused}");
@@ -548,7 +548,7 @@ mod tests {
     #[test]
     fn player_spectrum_moves_only_while_audio_is_playing() {
         let mut app = AppState::new(&Config::default(), empty_index()).expect("app state");
-        app.playback_status = crate::app::PlaybackStatus::Playing;
+        app.set_playback_status(crate::app::PlaybackStatus::Playing);
         app.audio_spectrum(AudioSpectrum::new([
             0, 1, 2, 3, 4, 5, 6, 7, 7, 6, 5, 4, 3, 2, 1, 0,
         ]));
@@ -559,7 +559,7 @@ mod tests {
             "{playing}"
         );
 
-        app.playback_status = crate::app::PlaybackStatus::Paused;
+        app.set_playback_status(crate::app::PlaybackStatus::Paused);
         let paused = rendered(&app, 80, 24, Duration::ZERO);
         assert!(
             !paused.contains("▁ ▂ ▃ ▄ ▅ ▆ ▇ █ █ ▇ ▆ ▅ ▄ ▃ ▂ ▁"),
@@ -570,18 +570,18 @@ mod tests {
     #[test]
     fn loading_warning_and_error_states_are_named_in_text() {
         let mut app = AppState::new(&Config::default(), empty_index()).expect("app state");
-        app.playback_status = crate::app::PlaybackStatus::Loading;
+        app.set_playback_status(crate::app::PlaybackStatus::Loading);
         let loading = rendered(&app, 80, 24, Duration::ZERO);
         assert!(loading.contains("State: Loading"), "{loading}");
 
-        app.playback_status = crate::app::PlaybackStatus::Error;
+        app.set_playback_status(crate::app::PlaybackStatus::Error);
         app.status_kind = crate::app::StatusKind::Error;
         app.status_message = "Output device unavailable".into();
         let error = rendered(&app, 80, 24, Duration::ZERO);
         assert!(error.contains("State: Error"), "{error}");
         assert!(error.contains("Error: Output device"), "{error}");
 
-        app.playback_status = crate::app::PlaybackStatus::Stopped;
+        app.set_playback_status(crate::app::PlaybackStatus::Stopped);
         app.status_kind = crate::app::StatusKind::Warning;
         app.status_message = "Scan incomplete".into();
         let warning = rendered(&app, 80, 24, Duration::ZERO);

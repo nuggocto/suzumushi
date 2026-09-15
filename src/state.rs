@@ -67,17 +67,17 @@ impl NowPlayingProjection {
             position_ms: duration_millis(app.playback_position()),
             state: NowPlayingState {
                 version: STATE_VERSION,
-                playback_generation: app.playback_generation,
-                status: playback_status(app.playback_status),
+                playback_generation: app.playback_generation(),
+                status: playback_status(app.playback_status()),
                 title,
                 creator,
                 duration_ms: app.playback_duration().map(duration_millis),
                 volume_percent: app.volume_percent,
                 muted: app.muted,
-                shuffle: app.shuffle,
+                shuffle: app.shuffle_enabled(),
                 repeat: app.repeat.label(),
                 queue_position: app.queue_position(),
-                queue_length: app.queue.len(),
+                queue_length: app.queue().len(),
             },
         }
     }

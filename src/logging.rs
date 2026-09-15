@@ -523,7 +523,6 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
-    use std::time::Duration;
 
     use super::{
         BoundedRecordWriter, LogQueue, LoggingGuard, RecordState, TRUNCATED, mark_truncated,
@@ -589,6 +588,12 @@ mod tests {
 
         let failed = Arc::new(AtomicBool::new(false));
         let (queue, receiver) = LogQueue::new(1, Arc::clone(&failed));
+        queue.enqueue(b"kept".to_vec());
+        queue.enqueue(b"dropped one".to_vec());
+        queue.enqueue(b"dropped two".to_vec());
+        assert_eq!(queue.dropped_records(), 2);
+        assert!(!failed.load(Ordering::Acquire));
+
         let worker = spawn_log_worker(
             BrokenWriter,
             receiver,
@@ -596,74 +601,39 @@ mod tests {
             std::path::Path::new("fixture.log"),
         )
         .expect("spawn fixture worker");
-        queue.enqueue(b"record".to_vec());
         queue.close();
         worker.join().expect("join fixture worker");
         assert!(failed.load(Ordering::Acquire));
 
         let mut warning = Vec::new();
-        report_dropped_records(&mut warning, 3).expect("write direct warning");
-        assert_eq!(warning, b"warning: 3 diagnostic records were dropped\n");
+        report_dropped_records(&mut warning, queue.dropped_records())
+            .expect("write direct warning");
+        assert_eq!(warning, b"warning: 2 diagnostic records were dropped\n");
     }
 
     #[test]
-    fn logging_guard_waits_for_its_worker_to_finish() {
-        struct HeldWriter {
-            entered: mpsc::SyncSender<()>,
-            release: mpsc::Receiver<()>,
-        }
-
-        impl Write for HeldWriter {
-            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                self.entered.send(()).expect("announce blocked write");
-                self.release.recv().expect("release blocked write");
-                Ok(bytes.len())
-            }
-
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-
+    fn logging_guard_reports_worker_panic_before_returning() {
         let failed = Arc::new(AtomicBool::new(false));
         let (queue, receiver) = LogQueue::new(1, Arc::clone(&failed));
-        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
-        let (release_tx, release_rx) = mpsc::sync_channel(0);
-        let worker = spawn_log_worker(
-            HeldWriter {
-                entered: entered_tx,
-                release: release_rx,
-            },
-            receiver,
-            Arc::clone(&failed),
-            std::path::Path::new("fixture.log"),
-        )
-        .expect("spawn held worker");
-        queue.enqueue(b"record".to_vec());
-        entered_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("worker starts writing");
+        let worker = std::thread::spawn(move || {
+            // Closing the queue starts this failure. Only joining the worker
+            // can observe its panic and include it in the returned report.
+            assert!(matches!(
+                receiver.recv_timeout(std::time::Duration::from_secs(1)),
+                Err(mpsc::RecvTimeoutError::Disconnected)
+            ));
+            panic!("fixture worker failed during shutdown");
+        });
         let guard = LoggingGuard {
             worker: Some(worker),
             queue,
             write_failed: failed,
             current_path: PathBuf::from("fixture.log"),
         };
-        let (finished_tx, finished_rx) = mpsc::sync_channel(0);
-        let finisher = std::thread::spawn(move || {
-            let report = guard.finish();
-            finished_tx.send(report).expect("report finish completion");
-        });
 
-        assert!(matches!(
-            finished_rx.try_recv(),
-            Err(mpsc::TryRecvError::Empty)
-        ));
-        release_tx.send(()).expect("release worker");
-        let report = finished_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("finish waits and then returns");
-        assert!(report.writer_error().is_none());
-        finisher.join().expect("join finisher");
+        let report = guard.finish();
+
+        assert!(report.writer_error().is_some());
+        assert_eq!(report.dropped_records, 0);
     }
 }

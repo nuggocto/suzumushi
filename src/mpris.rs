@@ -61,20 +61,20 @@ impl MprisProjection {
             (String::new(), String::new())
         };
         let active = matches!(
-            app.playback_status,
+            app.playback_status(),
             PlaybackStatus::Playing | PlaybackStatus::Paused
         );
         let mut capabilities = 0;
         capabilities |= u8::from(app.can_go_next()) * CAN_GO_NEXT;
         capabilities |= u8::from(app.current_track_token().is_some()) * CAN_GO_PREVIOUS;
         capabilities |=
-            u8::from(!app.queue.is_empty() || (active && track_token.is_some())) * CAN_PLAY;
+            u8::from(!app.queue().is_empty() || (active && track_token.is_some())) * CAN_PLAY;
         capabilities |= u8::from(track_token.is_some()) * CAN_PAUSE;
         capabilities |= u8::from(active) * CAN_SEEK;
         Self {
-            playback_status: app.playback_status,
+            playback_status: app.playback_status(),
             repeat: app.repeat,
-            shuffle: app.shuffle,
+            shuffle: app.shuffle_enabled(),
             volume_percent: app.volume_percent,
             title,
             creator,
@@ -482,10 +482,9 @@ impl PlayerInterface {
             ));
         }
         let scaled = volume.clamp(0.0, 1.0) * 100.0;
-        let mut percent = 0_u8;
-        while percent < 100 && f64::from(percent) + 0.5 <= scaled {
-            percent += 1;
-        }
+        // Finite input is clamped to 0..=100 before rounding and conversion.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let percent = scaled.round() as u8;
         enqueue(&self.actions, AppAction::SetVolume(percent))
     }
 
@@ -906,7 +905,7 @@ mod tests {
         });
         app.focus = Focus::Queue;
         app.apply(AppAction::QueueClear);
-        assert!(app.queue.is_empty());
+        assert!(app.queue().is_empty());
 
         let (sender, receiver) = mpsc::sync_channel(REQUEST_CAPACITY);
         let player = PlayerInterface {

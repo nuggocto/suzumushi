@@ -12,12 +12,12 @@ use crate::app::{AppState, ColorMode, StatusKind};
 use crate::display::bounded_text;
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
-    let lines = if app.search.active {
+    let lines = if app.search().active {
         let query_bytes = usize::from(area.width.saturating_sub(10)).saturating_mul(4);
         vec![
             Line::from(vec![
                 Span::raw(" Search: "),
-                Span::raw(bounded_text(&app.search.query, query_bytes)),
+                Span::raw(bounded_text(&app.search().query, query_bytes)),
             ]),
             Line::from(vec![
                 Span::raw(" Enter add · Esc close · Ctrl+c quit  "),

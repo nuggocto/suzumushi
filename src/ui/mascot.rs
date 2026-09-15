@@ -138,8 +138,7 @@ fn frame(status: PlaybackStatus, elapsed: Duration) -> &'static Frame {
 #[cfg(test)]
 mod tests {
     use super::{
-        DANCE_DOWN, DANCE_LEFT, DANCE_RIGHT, DANCE_UP, FRAME_HEIGHT, Frame, RESTING_FRAME, frame,
-        lines,
+        DANCE_DOWN, DANCE_LEFT, DANCE_RIGHT, DANCE_UP, Frame, RESTING_FRAME, frame, lines,
     };
     use crate::app::{ColorMode, PlaybackStatus};
     use ratatui::style::{Color, Style};
@@ -199,7 +198,6 @@ mod tests {
             &DANCE_RIGHT,
             &DANCE_DOWN,
         ] {
-            assert_eq!(frame.len(), FRAME_HEIGHT);
             for line in frame {
                 let width = line.before_bell.chars().count()
                     + line.bell.chars().count()

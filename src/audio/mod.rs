@@ -747,9 +747,13 @@ impl<B: Backend> WorkerCore<B> {
         }
 
         self.publish_position(positions, false);
-        self.write_pending(events, generation)
-            || self.poll_decoder(events, generation)
-            || self.finish_drained(events, positions, generation)
+        if self.write_pending(events, generation) {
+            return true;
+        }
+        if self.poll_decoder(events, generation) {
+            return true;
+        }
+        self.finish_drained(events, positions, generation)
     }
 
     fn write_pending(&mut self, events: &Sender<AudioEvent>, generation: u64) -> bool {

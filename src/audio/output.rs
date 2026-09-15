@@ -195,36 +195,25 @@ impl OutputStream for CpalOutput {
             )
             .ok_or_else(|| "audio output sample generation exhausted".to_owned())?;
         self.drain_deadline = None;
-        for frame in samples.chunks_exact(source_channels).take(frames) {
-            match (source_channels, self.output_channels) {
-                (1, output_channels) => {
-                    for _ in 0..output_channels {
-                        producer
-                            .push(finite_or_silence(frame[0]))
-                            .map_err(|_| "audio output ring changed while writing".to_owned())?;
-                    }
+        // Commit the batch once so the callback can never observe half a frame.
+        let mut chunk = producer
+            .write_chunk(output_samples)
+            .map_err(|_| "audio output ring changed while writing".to_owned())?;
+        let (first, second) = chunk.as_mut_slices();
+        for (offset, sample) in first.iter_mut().chain(second).enumerate() {
+            let frame_start = (offset / self.output_channels) * source_channels;
+            let channel = offset % self.output_channels;
+            *sample = match (source_channels, self.output_channels, channel) {
+                (1, _, _) => finite_or_silence(samples[frame_start]),
+                (2, 1, _) => {
+                    finite_or_silence(samples[frame_start].midpoint(samples[frame_start + 1]))
                 }
-                (2, 1) => {
-                    producer
-                        .push(finite_or_silence(frame[0].midpoint(frame[1])))
-                        .map_err(|_| "audio output ring changed while writing".to_owned())?;
-                }
-                (2, output_channels) => {
-                    producer
-                        .push(finite_or_silence(frame[0]))
-                        .map_err(|_| "audio output ring changed while writing".to_owned())?;
-                    producer
-                        .push(finite_or_silence(frame[1]))
-                        .map_err(|_| "audio output ring changed while writing".to_owned())?;
-                    for _ in 2..output_channels {
-                        producer
-                            .push(0.0)
-                            .map_err(|_| "audio output ring changed while writing".to_owned())?;
-                    }
-                }
+                (2, _, 0 | 1) => finite_or_silence(samples[frame_start + channel]),
+                (2, _, _) => 0.0,
                 _ => return Err("unsupported channel conversion".into()),
-            }
+            };
         }
+        chunk.commit_all();
         Ok(frames * source_channels)
     }
 
@@ -420,21 +409,36 @@ where
     let mut read = 0_u64;
     let mut underruns = 0_u64;
     let mut published = None;
-    for sample in output {
-        let value = if let Ok(value) = pcm_reader.pop() {
-            read += 1;
-            finite_or_silence(value * gain)
-        } else {
-            if !end_of_stream.load(Ordering::Acquire) {
-                underruns += 1;
+    let channels = usize::from(timing.format.channels);
+    let mut output_frames = output.chunks_exact_mut(channels);
+    for frame in &mut output_frames {
+        // Silence is a whole hardware frame too. Never resume between channels,
+        // even if the producer becomes ready halfway through an underrun.
+        if let Ok(chunk) = pcm_reader.read_chunk(channels) {
+            let (first, second) = chunk.as_slices();
+            for (sample, value) in frame.iter_mut().zip(first.iter().chain(second)) {
+                let value = finite_or_silence(*value * gain);
+                *sample = T::from_sample(value);
+                if let Some(levels) = analyzer.push_interleaved(value) {
+                    published = Some(levels);
+                }
             }
-            0.0
-        };
-        *sample = T::from_sample(value);
-        if let Some(levels) = analyzer.push_interleaved(value) {
-            published = Some(levels);
+            chunk.commit_all();
+            read += u64::from(timing.format.channels);
+        } else {
+            frame.fill(T::EQUILIBRIUM);
+            if !end_of_stream.load(Ordering::Acquire) {
+                underruns += u64::from(timing.format.channels);
+            }
+            for _ in 0..channels {
+                if let Some(levels) = analyzer.push_interleaved(0.0) {
+                    published = Some(levels);
+                }
+            }
         }
     }
+    // A backend's partial trailing frame cannot consume source PCM.
+    output_frames.into_remainder().fill(T::EQUILIBRIUM);
     if let Some(levels) = published {
         spectrum.publish(levels);
     }
@@ -678,6 +682,119 @@ mod tests {
             metrics.underrun_samples.load(Ordering::Relaxed),
             output.len() as u64
         );
+    }
+
+    #[test]
+    fn converted_frames_stay_aligned_across_the_ring_boundary() {
+        let cases = [
+            (1, 1, vec![0.25, -0.5], vec![0.25, -0.5]),
+            (1, 2, vec![0.25, -0.5], vec![0.25, 0.25, -0.5, -0.5]),
+            (2, 1, vec![0.25, 0.75, -0.5, 0.0], vec![0.5, -0.25]),
+            (
+                2,
+                2,
+                vec![0.25, -0.25, 0.5, -0.5],
+                vec![0.25, -0.25, 0.5, -0.5],
+            ),
+            (
+                2,
+                6,
+                vec![0.25, -0.25, 0.5, -0.5],
+                vec![
+                    0.25, -0.25, 0.0, 0.0, 0.0, 0.0, 0.5, -0.5, 0.0, 0.0, 0.0, 0.0,
+                ],
+            ),
+        ];
+        for (source_channels, output_channels, source, expected) in cases {
+            let mut device = CpalOutput::with_metrics(
+                Arc::new(SpectrumLane::default()),
+                Arc::new(AudioMetrics::default()),
+            );
+            let (mut producer, mut consumer) = rtrb::RingBuffer::new(expected.len());
+            // Leave one contiguous slot at the end. The next frame straddles
+            // the ring's two slices, which need not end on channel boundaries.
+            for _ in 0..expected.len() - 1 {
+                producer.push(0.0).expect("advance producer");
+                consumer.pop().expect("advance consumer");
+            }
+            device.source = Some(AudioFormat {
+                sample_rate: 48_000,
+                channels: source_channels,
+            });
+            device.output_channels = output_channels;
+            device.producer = Some(producer);
+
+            assert_eq!(
+                device.write(&source).expect("write converted frames"),
+                source.len()
+            );
+            assert_eq!(device.write(&source).expect("full ring waits"), 0);
+            let actual: Vec<_> = std::iter::from_fn(|| consumer.pop().ok()).collect();
+
+            assert_eq!(
+                actual, expected,
+                "{source_channels} to {output_channels} channels"
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_frames_wait_without_shifting_channels() {
+        for channels in [2, 6, 8] {
+            let (mut producer, mut consumer) = rtrb::RingBuffer::new(32);
+            // Pause publication after the first channel, then resume next callback.
+            producer.push(0.25).expect("first channel");
+            let progress = playing_progress();
+            let metrics = AudioMetrics::default();
+            let end_of_stream = AtomicBool::new(false);
+            let spectrum = SpectrumLane::default();
+            let mut analyzer = super::SpectrumAnalyzer::new(48_000, channels);
+            let mut render = |output: &mut [f32]| {
+                render_output(
+                    output,
+                    super::RenderContext {
+                        pcm_reader: &mut consumer,
+                        gain: 1.0,
+                        analyzer: &mut analyzer,
+                        progress: &progress,
+                        timing: timing(channels),
+                        end_of_stream: &end_of_stream,
+                        metrics: &metrics,
+                        spectrum: &spectrum,
+                    },
+                );
+            };
+            let mut first = vec![1.0; usize::from(channels)];
+            render(&mut first);
+
+            for channel in 1..channels {
+                producer
+                    .push(f32::from(channel) / 10.0)
+                    .expect("remaining channel");
+            }
+            let mut second = vec![0.0; usize::from(channels)];
+            render(&mut second);
+
+            assert!(
+                first.iter().all(|sample| *sample == 0.0),
+                "{channels} channels"
+            );
+            assert_eq!(second[0].to_bits(), 0.25_f32.to_bits());
+            for channel in 1..channels {
+                assert_eq!(
+                    second[usize::from(channel)].to_bits(),
+                    (f32::from(channel) / 10.0).to_bits()
+                );
+            }
+            assert_eq!(
+                progress.consumed.load(Ordering::Acquire),
+                u64::from(channels)
+            );
+            assert_eq!(
+                metrics.underrun_samples.load(Ordering::Relaxed),
+                u64::from(channels)
+            );
+        }
     }
 
     #[test]

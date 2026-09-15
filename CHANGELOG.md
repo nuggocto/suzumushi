@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.5] - 2026-09-15
+
+### Fixed
+
+- Kept stereo and multichannel output aligned during audio underruns by
+  publishing and consuming complete frames.
+- Preserved paused playback when seeking exactly to a track's end and advancing
+  to the next track or repeating the current one.
+
+### Changed
+
+- Separated browser/search, queue, and playback state into focused modules.
+  Queue operations own duplicate checks, limits, identity counters, and shuffle
+  updates; playback transitions reset track timing together.
+- Replaced side-effecting boolean chains and nested decoder-header writes with
+  explicit steps, and simplified desktop volume rounding.
+- Strengthened logging shutdown and queue-drop tests, checked decoded sample
+  content after seeks in every supported container, and removed assertions
+  that could not establish the behavior they claimed to test.
+
 ## [1.1.4] - 2026-09-12
 
 ### Fixed

@@ -641,7 +641,7 @@ mod tests {
             matches!(command, crate::audio::AudioCommand::LoadFailed { generation: 2, message }
             if message.contains("queued track became stale"))
         );
-        assert_eq!(app.playback_status, PlaybackStatus::Stopped);
+        assert_eq!(app.playback_status(), PlaybackStatus::Stopped);
     }
 
     #[test]
@@ -823,7 +823,7 @@ mod tests {
     fn event_loop_errors_still_publish_stopped_state() {
         let (root, _root_file, mut writer) = state_writer();
         let mut app = AppState::new(&Config::default(), empty_index()).expect("app state");
-        app.playback_status = PlaybackStatus::Playing;
+        app.set_playback_status(PlaybackStatus::Playing);
         let mut sync = StateSynchronizer::default();
         sync.sync(&app, &mut writer, Duration::ZERO)
             .expect("active state");

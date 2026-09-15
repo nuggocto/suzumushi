@@ -755,7 +755,7 @@ fn init_and_diagnose_work_through_the_real_executable() {
 }
 
 #[test]
-fn missing_root_fails_clearly_without_scanning_home() {
+fn missing_root_reports_how_to_initialize_it() {
     let temp = TempDir::new().expect("temporary directory");
     let output = Command::new(env!("CARGO_BIN_EXE_suzumushi"))
         .arg("diagnose")
@@ -766,7 +766,6 @@ fn missing_root_fails_clearly_without_scanning_home() {
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).expect("UTF-8 error");
     assert!(stderr.contains("suzumushi init ./suzumushi"));
-    assert!(!temp.path().join("Music").exists());
 }
 
 #[test]
