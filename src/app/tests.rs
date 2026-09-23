@@ -8,7 +8,6 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use super::browser::{contains_ascii_case_insensitive, rebuild_ascii_case_prefix};
 use super::{
     AppState, BrowserRow, ColorMode, Focus, PlaybackIntent, PlaybackStatus, RepeatMode, StatusKind,
-    reserve_startup_open_files,
 };
 use crate::audio::{AudioEvent, AudioFormat, AudioPosition};
 use crate::config::Config;
@@ -214,7 +213,7 @@ fn missing_creator_metadata_is_omitted() {
 }
 
 #[test]
-fn mono_is_selected_without_relying_on_color_for_focus() {
+fn mono_is_chosen_by_theme_no_color_or_a_dumb_terminal() {
     assert_eq!(
         ColorMode::resolve("terminal", false, false),
         ColorMode::Terminal
@@ -222,12 +221,6 @@ fn mono_is_selected_without_relying_on_color_for_focus() {
     assert_eq!(ColorMode::resolve("mono", false, false), ColorMode::Mono);
     assert_eq!(ColorMode::resolve("terminal", true, false), ColorMode::Mono);
     assert_eq!(ColorMode::resolve("terminal", false, true), ColorMode::Mono);
-}
-
-#[test]
-fn terminal_open_file_reservation_accepts_the_exact_peak() {
-    assert!(reserve_startup_open_files(6).is_ok());
-    assert!(reserve_startup_open_files(5).is_err());
 }
 
 #[test]

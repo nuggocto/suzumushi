@@ -687,6 +687,25 @@ fn invalid_arguments_have_one_clean_error_prefix() {
     assert!(!stderr.contains("invalid config"), "{stderr:?}");
     assert!(!stderr.contains(r"\x0A"), "{stderr:?}");
     assert!(stderr.ends_with('\n'));
+
+    let temp = TempDir::new().expect("temporary directory");
+    let output = Command::new(env!("CARGO_BIN_EXE_suzumushi"))
+        .arg("--root")
+        .arg(temp.path())
+        .arg("init")
+        .arg(temp.path().join("root"))
+        .output()
+        .expect("the binary should reject init combined with --root");
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).expect("argument error should be valid UTF-8");
+    assert!(
+        stderr.starts_with("error: `init` takes its destination as a positional path"),
+        "{stderr:?}"
+    );
+    assert!(
+        !temp.path().join("root").exists(),
+        "rejected init writes nothing"
+    );
 }
 
 #[test]
@@ -752,6 +771,44 @@ fn init_and_diagnose_work_through_the_real_executable() {
         lock_identity,
         "diagnose must not claim the writer lease"
     );
+}
+
+#[test]
+fn helpers_still_start_after_the_installed_executable_is_replaced() {
+    use std::os::fd::AsRawFd;
+
+    let temp = TempDir::new().expect("temporary directory");
+    let root = temp.path().join("root");
+    initialize_root(&root);
+    fs::write(root.join("audio/library/tagged.mp3"), id3_fixture()).expect("write tagged fixture");
+
+    // A package upgrade unlinks the running file, so /proc/self/exe then names
+    // "<path> (deleted)". Run the executable through a held descriptor to the
+    // unlinked copy: metadata tags appear only if the helper still starts.
+    let installed = temp.path().join("suzumushi");
+    fs::copy(env!("CARGO_BIN_EXE_suzumushi"), &installed).expect("install executable copy");
+    let running_image = File::open(&installed).expect("hold the installed image");
+    fs::remove_file(&installed).expect("replace the installed executable");
+    let executable = format!(
+        "/proc/{}/fd/{}",
+        std::process::id(),
+        running_image.as_raw_fd()
+    );
+
+    let diagnose = output_with_timeout(Command::new(executable).args([
+        OsStr::new("diagnose"),
+        OsStr::new("--root"),
+        root.as_os_str(),
+    ]));
+
+    assert!(
+        diagnose.status.success(),
+        "{}",
+        String::from_utf8_lossy(&diagnose.stderr)
+    );
+    let stdout = String::from_utf8(diagnose.stdout).expect("diagnose output is UTF-8");
+    assert!(stdout.contains("Calm Artist - Night Song"), "{stdout}");
+    assert!(!stdout.contains("MetadataRead"), "{stdout}");
 }
 
 #[test]

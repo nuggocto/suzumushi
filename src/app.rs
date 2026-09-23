@@ -923,18 +923,7 @@ impl AppState {
     fn set_status_kind(&mut self, kind: StatusKind, message: &str, lifetime: Option<Duration>) {
         self.status_kind = kind;
         self.status_expires_at = lifetime.map(|duration| self.event_time.saturating_add(duration));
-        self.status_message.clear();
-        for character in message.chars() {
-            if self
-                .status_message
-                .len()
-                .saturating_add(character.len_utf8())
-                > self.status_text_max_bytes
-            {
-                break;
-            }
-            self.status_message.push(character);
-        }
+        self.status_message = bounded_text(message, self.status_text_max_bytes);
     }
 
     pub(crate) fn advance_time(&mut self, now: Duration) {

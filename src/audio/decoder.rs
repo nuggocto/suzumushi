@@ -45,9 +45,7 @@ pub(super) struct HelperDecoder {
 
 impl HelperDecoder {
     pub(super) fn start(file: &File, position: Duration) -> Result<Self, String> {
-        let executable = std::env::current_exe()
-            .map_err(|error| format!("cannot locate the decoder helper: {error}"))?;
-        let mut command = Command::new(executable);
+        let mut command = Command::new(crate::HELPER_EXECUTABLE);
         command
             .arg("__audio-decode-helper")
             .arg(position.as_micros().min(u128::from(u64::MAX)).to_string());

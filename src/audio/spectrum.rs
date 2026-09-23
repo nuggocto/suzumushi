@@ -17,9 +17,9 @@ const CEILING_DB: f64 = -6.0;
 const ATTACK: f64 = 0.8;
 const RELEASE: f64 = 0.35;
 const FILTER_Q: f64 = 1.2;
-const WINDOW_FRAMES_F64: f64 = 1_024.0;
-const BAND_EXPONENTS: [i32; SPECTRUM_BANDS] =
-    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+// 1,024 is exactly representable, so the conversion cannot lose precision.
+#[allow(clippy::cast_precision_loss)]
+const WINDOW_FRAMES_F64: f64 = WINDOW_FRAMES as f64;
 
 /// One bounded visual spectrum. Each band is an integer from zero through seven.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -106,7 +106,8 @@ impl SpectrumAnalyzer {
         let maximum = (sample_rate * NYQUIST_MARGIN).min(MAX_FREQUENCY_HZ);
         let ratio = (maximum / MIN_FREQUENCY_HZ).max(1.0).powf(1.0 / 15.0);
         let bands = std::array::from_fn(|index| {
-            let frequency = MIN_FREQUENCY_HZ * ratio.powi(BAND_EXPONENTS[index]);
+            let frequency =
+                MIN_FREQUENCY_HZ * ratio.powi(i32::try_from(index).expect("sixteen bands fit i32"));
             let angle = TAU * frequency / sample_rate;
             let alpha = angle.sin() / (2.0 * FILTER_Q);
             let normalization = 1.0 / (1.0 + alpha);

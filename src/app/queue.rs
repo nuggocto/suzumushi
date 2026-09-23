@@ -11,6 +11,9 @@ use crate::config::Config;
 use crate::errors::{AppError, AppResult};
 use crate::model::{ScanIndex, TrackEntryId};
 
+// Config validation charges this many bytes per item before any queue exists.
+const _: () = assert!(size_of::<QueueItem>() == crate::config::QUEUE_ITEM_ACCOUNTING_BYTES);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct QueueItem {
     pub instance_id: u64,

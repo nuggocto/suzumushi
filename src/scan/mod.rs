@@ -115,15 +115,6 @@ pub fn fuzz_classify(bytes: &[u8]) {
     let _ = classify_relative_path(&path);
 }
 
-/// Scans one selected canonical root with production secure-open behavior.
-///
-/// # Errors
-///
-/// Returns an error when the root or descriptor traversal cannot be established.
-pub fn scan(root: &Path, config: &Config, generation: u64) -> AppResult<ScanIndex> {
-    scan_with_options(root, config, generation, ScanOptions::default())
-}
-
 /// Scans relative to an already pinned session root descriptor.
 ///
 /// # Errors
@@ -168,29 +159,6 @@ fn scan_cached_from<Fd: AsFd>(
         reader.save(root_file.as_fd(), root);
     }
     result
-}
-
-/// Scans one root with explicit instrumentation seams.
-///
-/// # Errors
-///
-/// Returns an error when reservation, root validation, or traversal fails.
-pub fn scan_with_options(
-    root: &Path,
-    config: &Config,
-    generation: u64,
-    options: ScanOptions,
-) -> AppResult<ScanIndex> {
-    let mut reader = metadata::HelperMetadataReader;
-    let mut observer = NoopObserver;
-    scan_with_components(
-        root,
-        config,
-        generation,
-        options,
-        &mut reader,
-        &mut observer,
-    )
 }
 
 /// Scans with explicit parser and observation seams for deterministic verification.
@@ -654,7 +622,6 @@ impl<'a> Scanner<'a> {
                 }
                 return Ok(());
             }
-            self.counters.mount_decisions += 1;
             self.accept_media(File::from(fd), child, true)
         })();
         self.release_open_slots(1);
@@ -1168,7 +1135,7 @@ mod tests {
     use std::os::unix::ffi::OsStringExt;
     use std::path::PathBuf;
 
-    use super::{natural_bytes_cmp, natural_path_cmp};
+    use super::natural_path_cmp;
 
     #[test]
     fn natural_order_v1_fixed_vectors_compare_components_independently() {
@@ -1183,6 +1150,11 @@ mod tests {
             (b"bad-\xfe", b"bad-\xff"),
             (b"library/a/x.mp3", b"library/a-/x.mp3"),
             (b"library/2/x.mp3", b"library/10/x.mp3"),
+            (b"track2", b"track10"),
+            (b"track2", b"track02"),
+            (b"a", b"aa"),
+            (b"ABC", b"abd"),
+            (b"Abc", b"abc"),
         ];
 
         for &(left, right) in ORDERED_PAIRS {
@@ -1190,23 +1162,6 @@ mod tests {
             let right = PathBuf::from(OsString::from_vec(right.to_vec()));
             assert_eq!(natural_path_cmp(&left, &right), Ordering::Less);
             assert_eq!(natural_path_cmp(&right, &left), Ordering::Greater);
-        }
-    }
-
-    #[test]
-    fn natural_order_keeps_numeric_case_and_byte_tie_breakers() {
-        const ORDERED_PAIRS: &[(&[u8], &[u8])] = &[
-            (b"track2", b"track10"),
-            (b"track2", b"track02"),
-            (b"a", b"aa"),
-            (b"ABC", b"abd"),
-            (b"Abc", b"abc"),
-            (b"bad-\xfe", b"bad-\xff"),
-        ];
-
-        for &(left, right) in ORDERED_PAIRS {
-            assert_eq!(natural_bytes_cmp(left, right), Ordering::Less);
-            assert_eq!(natural_bytes_cmp(right, left), Ordering::Greater);
         }
     }
 }

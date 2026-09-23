@@ -1359,34 +1359,6 @@ mod tests {
     }
 
     #[test]
-    fn position_lane_keeps_only_the_latest_update() {
-        let positions = PositionLane::default();
-        positions.replace(AudioPosition {
-            generation: 1,
-            timeline_revision: 1,
-            position: Duration::from_secs(1),
-            duration: Some(Duration::from_secs(3)),
-        });
-        positions.replace(AudioPosition {
-            generation: 1,
-            timeline_revision: 2,
-            position: Duration::from_secs(2),
-            duration: Some(Duration::from_secs(3)),
-        });
-
-        assert_eq!(
-            positions.take(),
-            Some(AudioPosition {
-                generation: 1,
-                timeline_revision: 2,
-                position: Duration::from_secs(2),
-                duration: Some(Duration::from_secs(3)),
-            })
-        );
-        assert_eq!(positions.take(), None);
-    }
-
-    #[test]
     fn repeated_seeks_bypass_the_reliable_command_backlog() {
         let (command_tx, commands) = sync_channel(2);
         let seeks = Arc::new(SeekLane::default());

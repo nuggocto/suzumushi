@@ -65,9 +65,7 @@ struct HelperReply {
 /// Returns a helper error for spawn, timeout, crash, oversized/malformed reply,
 /// parser refusal, or cleanup failure.
 pub fn parse_in_helper(file: &File) -> AppResult<TrackTags> {
-    let executable = std::env::current_exe()
-        .map_err(|error| AppError::MetadataHelper(format!("cannot locate executable: {error}")))?;
-    let mut command = Command::new(executable);
+    let mut command = Command::new(crate::HELPER_EXECUTABLE);
     command.arg("__metadata-helper");
     run_helper(command, file, HELPER_TIMEOUT)
 }
@@ -88,7 +86,10 @@ fn run_helper(mut command: Command, file: &File, timeout: Duration) -> AppResult
         .ok_or_else(|| AppError::MetadataHelper("helper stdout is unavailable".into()))?;
     let reader = thread::spawn(move || {
         let mut bytes = Vec::new();
-        stdout.take(65_537).read_to_end(&mut bytes).map(|_| bytes)
+        stdout
+            .take((MAX_HELPER_OUTPUT + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes)
     });
 
     let status = match wait_for_exit(&mut child, timeout) {

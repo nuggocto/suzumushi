@@ -113,10 +113,12 @@ pub fn initialize_from<Fd: AsFd>(
         current_path,
     };
     if let Err(error) = tracing::subscriber::set_global_default(subscriber) {
-        let _ = guard.finish();
-        return Err(AppError::InvalidConfig(format!(
-            "cannot install file logging: {error}"
-        )));
+        let report = guard.finish();
+        return Err(AppError::io(
+            "install file logging",
+            report.current_path,
+            io::Error::other(error),
+        ));
     }
     Ok(guard)
 }
@@ -318,9 +320,10 @@ impl RotatingWriter {
             || directory_stat.st_uid != getuid().as_raw()
             || directory_stat.st_mode & 0o777 != 0o700
         {
-            return Err(AppError::Lock(
-                "logs must be a current-user-owned directory with mode 0700".into(),
-            ));
+            return Err(AppError::InvalidRoot {
+                path: directory_path,
+                reason: "logs must be a current-user-owned directory with mode 0700".into(),
+            });
         }
         let directory = File::from(directory_fd);
         prune_archives(&directory, &directory_path, max_files)

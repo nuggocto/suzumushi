@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.6] - 2026-09-23
+
+### Fixed
+
+- Kept playback, seeking, and metadata reads working after the installed
+  executable is replaced while a session is open. Helpers now start from the
+  running image instead of its installed path, which a package upgrade deletes.
+- Reported misused `init` arguments as argument errors instead of configuration
+  errors, and unsafe log storage as a root problem instead of a lock failure.
+
+### Changed
+
+- Removed the unused path-based `scan` and `scan_with_options` entry points.
+- Checked the queue item size against the configured byte accounting at compile
+  time, and replaced duplicated bounded-text and lint-workaround code with the
+  shared helpers.
+- Stopped counting file symlinks as mount decisions, since they make none.
+- Removed tests that repeated other coverage or asserted copy text, merged the
+  overlapping natural-order tests, and renamed tests whose names overstated
+  their checks. Added a regression for helpers started after an upgrade.
+
 ## [1.1.5] - 2026-09-15
 
 ### Fixed

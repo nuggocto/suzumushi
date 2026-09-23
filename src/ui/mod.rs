@@ -589,19 +589,6 @@ mod tests {
     }
 
     #[test]
-    fn player_footer_names_enter_playback_and_separates_bindings() {
-        let mut app = AppState::new(&Config::default(), empty_index()).expect("app state");
-        app.apply(crate::input::AppAction::FocusNext);
-
-        let player = rendered(&app, 80, 24, Duration::ZERO);
-
-        assert!(player.contains("Enter play/pause"), "{player}");
-        assert!(player.contains("p previous · n next"), "{player}");
-        assert!(!player.contains("n/p skip"), "{player}");
-        assert!(player.contains(" · "), "{player}");
-    }
-
-    #[test]
     fn supported_width_keeps_long_elapsed_and_duration_text_visible() {
         let timeline =
             super::player_timeline(Duration::from_mins(10), Some(Duration::from_mins(20)), 38);

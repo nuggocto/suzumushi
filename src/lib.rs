@@ -23,6 +23,13 @@ pub mod state;
 pub mod terminal;
 pub mod ui;
 
+/// Starts helpers from the running image rather than its installed path.
+///
+/// A package upgrade replaces the installed file while a session is open, and
+/// `std::env::current_exe` then names a deleted path. The kernel keeps this link
+/// valid and guarantees the helper speaks the parent's protocol version.
+pub(crate) const HELPER_EXECUTABLE: &str = "/proc/self/exe";
+
 /// Parses the process command line and returns a conventional exit status.
 #[must_use]
 pub fn run() -> std::process::ExitCode {

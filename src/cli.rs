@@ -107,11 +107,14 @@ where
     match matches.subcommand() {
         Some(("init", init_matches)) => {
             if explicit.is_some() {
-                return Err(AppError::InvalidConfig("`init` takes its destination as a positional path; do not combine it with --root".into()));
+                return Err(AppError::InvalidArguments(
+                    "`init` takes its destination as a positional path; do not combine it with --root"
+                        .into(),
+                ));
             }
             let path = init_matches
                 .get_one::<PathBuf>("path")
-                .ok_or_else(|| AppError::InvalidConfig("init destination is required".into()))?;
+                .ok_or_else(|| AppError::InvalidArguments("init destination is required".into()))?;
             let initialized = init::initialize(path)?;
             println!("initialized {}", safe_path(&initialized.root, 4_096));
             println!("add audio below {}", safe_path(&initialized.library, 4_096));
@@ -120,7 +123,7 @@ where
         }
         Some(("diagnose", _)) => diagnose(explicit.as_deref(), current_dir),
         None => terminal_session(explicit.as_deref(), current_dir),
-        Some((name, _)) => Err(AppError::InvalidConfig(format!(
+        Some((name, _)) => Err(AppError::InvalidArguments(format!(
             "unsupported command {name}"
         ))),
     }

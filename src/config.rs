@@ -23,7 +23,7 @@ pub(crate) const AUDIO_WORKER_BYTES: usize = 6 * 1_048_576;
 // Cache tags, at most 10,000 tree nodes, bounded record parsing and a 4 MiB write buffer.
 pub(crate) const METADATA_CACHE_BYTES: usize = 16 * 1_048_576;
 pub(crate) const MAX_LOG_FILES: usize = 5;
-const QUEUE_ITEM_ACCOUNTING_BYTES: usize = 32;
+pub(crate) const QUEUE_ITEM_ACCOUNTING_BYTES: usize = 32;
 
 pub(crate) fn scan_reservation_bytes(index_bytes: usize) -> AppResult<usize> {
     index_bytes

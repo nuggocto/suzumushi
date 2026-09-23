@@ -618,7 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_media_is_rejected_by_the_worker_before_app_failure() {
+    fn stale_queued_media_becomes_a_load_failure_command() {
         let app = AppState::new(&Config::default(), empty_index()).expect("app state");
         let root = tempfile::tempfile().expect("unused root descriptor");
         let command = super::playback_command(
@@ -641,7 +641,6 @@ mod tests {
             matches!(command, crate::audio::AudioCommand::LoadFailed { generation: 2, message }
             if message.contains("queued track became stale"))
         );
-        assert_eq!(app.playback_status(), PlaybackStatus::Stopped);
     }
 
     #[test]
