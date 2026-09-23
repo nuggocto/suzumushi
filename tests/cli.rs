@@ -777,16 +777,20 @@ fn init_and_diagnose_work_through_the_real_executable() {
 fn helpers_still_start_after_the_installed_executable_is_replaced() {
     use std::os::fd::AsRawFd;
 
-    let temp = TempDir::new().expect("temporary directory");
+    let binary = std::path::Path::new(env!("CARGO_BIN_EXE_suzumushi"));
+    let temp = TempDir::new_in(binary.parent().expect("binary directory"))
+        .expect("temporary directory on the executable's filesystem");
     let root = temp.path().join("root");
     initialize_root(&root);
     fs::write(root.join("audio/library/tagged.mp3"), id3_fixture()).expect("write tagged fixture");
 
     // A package upgrade unlinks the running file, so /proc/self/exe then names
     // "<path> (deleted)". Run the executable through a held descriptor to the
-    // unlinked copy: metadata tags appear only if the helper still starts.
+    // unlinked name: metadata tags appear only if the helper still starts.
+    // A hard link avoids opening the image for writing, which parallel test
+    // subprocesses could inherit across fork and cause ETXTBSY during exec.
     let installed = temp.path().join("suzumushi");
-    fs::copy(env!("CARGO_BIN_EXE_suzumushi"), &installed).expect("install executable copy");
+    fs::hard_link(binary, &installed).expect("install executable link");
     let running_image = File::open(&installed).expect("hold the installed image");
     fs::remove_file(&installed).expect("replace the installed executable");
     let executable = format!(
