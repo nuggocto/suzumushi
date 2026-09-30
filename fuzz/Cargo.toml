@@ -13,7 +13,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "=0.4.13"
-suzumushi = { path = "..", version = "=1.1.8" }
+suzumushi = { path = "..", version = "=1.2.0" }
 
 [[bin]]
 name = "scanner_path_classification"

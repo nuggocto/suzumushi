@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-09-30
+
+### Added
+
+- Turned the Player into a night meadow around Suzu. Each of 32 frequency
+  bands is a hairline grass stalk tipped with a glowing light that the music
+  throws up and gravity brings back, in pastels from peach for bass through
+  rose and lilac to mint for treble. On pause the lights lift off as blinking fireflies and
+  drift around Suzu. On resume they keep drifting while home gently draws them
+  in, gliding back in a wave from bass to treble as their stalks grow up to
+  catch them. When playback stops, the meadow settles into dewy grass.
+- Filled the room above the title in a tall Player with a night sky: faint
+  twinkling stars and a crescent moon that crosses the sky as the track plays.
+  Paused fireflies drift up among the stars.
+- Drew the progress line as a firefly's path through the dew: a beaded trail
+  in the meadow's pastels behind a small light that breathes while playing and
+  blinks firefly yellow while paused, with faint dew ahead. The light glides
+  continuously instead of jumping cell by cell, and the elapsed time takes its
+  color.
+
+### Changed
+
+- Analyzed the spectrum in 32 bands with full level resolution, normalized
+  against a slowly relaxing loudness reference so quiet and loud recordings
+  move across the same range.
+- Redrew about 30 times per second while the meadow moves, 20 while fireflies
+  drift, and at the previous rate once everything is still.
+- Combined the Player's state and volume on one line to give the meadow room.
+
 ## [1.1.8] - 2026-09-30
 
 ### Fixed

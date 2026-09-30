@@ -4,25 +4,34 @@
 
 pub mod layout;
 mod mascot;
+mod palette;
+mod rail;
+mod stage;
 pub mod status;
+
+pub use palette::ColorDepth;
+pub(crate) use stage::STAGE_FIELD_BYTES;
+pub use stage::Stage;
 
 use std::os::unix::ffi::OsStrExt;
 use std::time::Duration;
 
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::app::{AppState, BrowserRow, ColorMode, Focus, PlaybackStatus, normal_component};
+use crate::config::STAGE_MAX_ROWS;
 use crate::display::{bounded_text, terminal_safe};
 
 const MIN_WIDTH: u16 = 80;
 const MIN_HEIGHT: u16 = 24;
 const MAX_ROW_TEXT_BYTES: usize = 4_096;
 
-pub fn render(frame: &mut Frame<'_>, app: &AppState, animation_time: Duration) {
+/// Draws the whole interface; the Player also advances the stage animation.
+pub fn render(frame: &mut Frame<'_>, app: &AppState, stage: &mut Stage, animation_time: Duration) {
     let area = frame.area();
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         frame.render_widget(
@@ -42,7 +51,7 @@ pub fn render(frame: &mut Frame<'_>, app: &AppState, animation_time: Duration) {
 
     let panels = layout::panels(area);
     render_library(frame, panels.library, app);
-    render_player(frame, panels.player, app, animation_time);
+    render_player(frame, panels.player, app, stage, animation_time);
     render_queue(frame, panels.queue, app);
     status::render(frame, panels.status, app);
 }
@@ -85,10 +94,73 @@ fn render_library(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn render_player(frame: &mut Frame<'_>, area: Rect, app: &AppState, animation_time: Duration) {
+fn render_player(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &AppState,
+    stage: &mut Stage,
+    animation_time: Duration,
+) {
+    let block = panel_block("Player", Focus::Player, app);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
     let max_bytes = row_text_max_bytes(area);
-    let title = app.player_title(max_bytes);
+    let mut title = vec![Line::from(app.player_title(max_bytes))];
     let creator = app.player_creator(max_bytes);
+    if !creator.is_empty() {
+        title.push(Line::from(creator));
+    }
+    let footer = player_footer(app, stage.depth(), usize::from(inner.width), animation_time);
+
+    // The stage fills the Player above the details: the meadow and title at
+    // its foot, and any room above them as night sky. Only a Player taller
+    // than the largest stage gets padding.
+    let stage_rows = usize::from(inner.height)
+        .saturating_sub(1 + footer.len())
+        .clamp(title.len() + mascot::HEIGHT, STAGE_MAX_ROWS);
+    let content = stage_rows + 1 + footer.len();
+    let padding = usize::from(inner.height).saturating_sub(content) / 2;
+    let [_, stage_area, _, footer_area] = Layout::vertical([
+        Constraint::Length(to_rows(padding)),
+        Constraint::Length(to_rows(stage_rows)),
+        Constraint::Length(1),
+        Constraint::Length(to_rows(footer.len())),
+    ])
+    .areas(inner);
+
+    let suzu = mascot::lines(app.playback_status(), animation_time, app.color_mode);
+    stage.render(
+        frame.buffer_mut(),
+        stage_area,
+        &stage::StageFrame {
+            status: app.playback_status(),
+            levels: app.audio_spectrum_levels(),
+            progress: track_progress(app.playback_position(), app.playback_duration()),
+            color_mode: app.color_mode,
+            title: &title,
+            suzu: &suzu,
+        },
+        animation_time,
+    );
+    frame.render_widget(
+        Paragraph::new(footer).alignment(Alignment::Center),
+        footer_area,
+    );
+}
+
+fn track_progress(position: Duration, duration: Option<Duration>) -> Option<f32> {
+    duration
+        .filter(|duration| !duration.is_zero())
+        .map(|duration| (position.as_secs_f32() / duration.as_secs_f32()).clamp(0.0, 1.0))
+}
+
+fn player_footer(
+    app: &AppState,
+    depth: ColorDepth,
+    width: usize,
+    animation_time: Duration,
+) -> Vec<Line<'static>> {
     let state = match app.playback_status() {
         PlaybackStatus::Stopped => "Stopped",
         PlaybackStatus::Loading => "Loading",
@@ -96,123 +168,90 @@ fn render_player(frame: &mut Frame<'_>, area: Rect, app: &AppState, animation_ti
         PlaybackStatus::Paused => "Paused",
         PlaybackStatus::Error => "Error",
     };
-    let position = app.playback_position();
-    let duration = app.playback_duration();
-    let timeline = player_timeline(
-        position,
-        duration,
-        usize::from(area.width.saturating_sub(2)),
-    );
     let volume = if app.muted {
         format!("Muted ({}%)", app.volume_percent)
     } else {
         format!("Volume {}%", app.volume_percent)
     };
-    let modes = format!(
-        "Shuffle {}  Repeat {}",
-        if app.shuffle_enabled() { "on" } else { "off" },
-        app.repeat.label(),
-    );
-    let mut content = Vec::with_capacity(18);
-    content.push(Line::from(title));
-    if !creator.is_empty() {
-        content.push(Line::from(creator));
-    }
-    content.push(Line::default());
-    content.extend(mascot::lines(
-        app.playback_status(),
-        animation_time,
-        app.color_mode,
-    ));
-    content.push(spectrum_line(app));
-    content.push(Line::from(timeline));
-    content.push(Line::default());
-    content.push(Line::styled(
-        format!("State: {state}"),
-        playback_state_style(app, app.playback_status()),
-    ));
-    content.push(Line::from(volume));
-    content.push(Line::from(modes));
+    let mut footer = vec![
+        player_timeline(
+            app.playback_position(),
+            app.playback_duration(),
+            width,
+            (app.color_mode == ColorMode::Terminal).then_some(depth),
+            app.playback_status(),
+            animation_time,
+        ),
+        Line::from(vec![
+            Span::styled(
+                format!("State: {state}"),
+                playback_state_style(app, app.playback_status()),
+            ),
+            Span::raw(format!("   {volume}")),
+        ]),
+        Line::from(format!(
+            "Shuffle {}  Repeat {}",
+            if app.shuffle_enabled() { "on" } else { "off" },
+            app.repeat.label(),
+        )),
+    ];
     if let Some(format) = app.playback_format() {
-        content.push(Line::from(format!(
+        footer.push(Line::from(format!(
             "{} Hz  {} ch",
             format.sample_rate, format.channels
         )));
     }
-    let available_lines = usize::from(area.height.saturating_sub(2));
-    let top_padding = available_lines.saturating_sub(content.len()) / 2;
-    if top_padding > 0 {
-        let mut centered = Vec::with_capacity(content.len() + top_padding);
-        centered.resize_with(top_padding, Line::default);
-        centered.append(&mut content);
-        content = centered;
-    }
-    frame.render_widget(
-        Paragraph::new(content)
-            .alignment(Alignment::Center)
-            .block(panel_block("Player", Focus::Player, app)),
-        area,
-    );
+    footer
 }
 
-fn spectrum_line(app: &AppState) -> Line<'static> {
-    const GLYPHS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    if app.playback_status() != PlaybackStatus::Playing {
-        return Line::default();
-    }
-    let levels = app.audio_spectrum_levels();
-    let mut bars = String::with_capacity(levels.len().saturating_mul(4));
-    for (index, level) in levels.into_iter().enumerate() {
-        if index != 0 {
-            bars.push(' ');
-        }
-        bars.push(GLYPHS[usize::from(level)]);
-    }
-    let style = if app.color_mode == ColorMode::Terminal {
-        Style::default().fg(Color::Green)
-    } else {
-        Style::default()
-    };
-    Line::styled(bars, style)
+fn to_rows(count: usize) -> u16 {
+    u16::try_from(count).unwrap_or(u16::MAX)
 }
 
+/// The track's progress as a firefly's path through the dew, then the time:
+/// elapsed in the light's color, the total plain.
 fn player_timeline(
-    position: std::time::Duration,
-    duration: Option<std::time::Duration>,
+    position: Duration,
+    duration: Option<Duration>,
     width: usize,
-) -> String {
-    let position_text = format_time(position);
-    let duration_text = duration.map_or_else(|| "--:--".into(), format_time);
-    let times = format!("{position_text} / {duration_text}");
-    let bar_width = width
-        .saturating_sub(times.len().saturating_add(4))
-        .clamp(4, 28);
-    format!("{}  {times}", progress_bar(position, duration, bar_width))
+    colors: Option<ColorDepth>,
+    status: PlaybackStatus,
+    animation_time: Duration,
+) -> Line<'static> {
+    let elapsed = format_time(position);
+    let total = duration.map_or_else(|| "--:--".into(), format_time);
+    let times_width = elapsed.len() + 3 + total.len();
+    let rail_cells = width
+        .saturating_sub(times_width.saturating_add(4))
+        .clamp(4, rail::MAX_RAIL_CELLS);
+    let progress = track_progress(position, duration);
+    let mut spans = rail::spans(
+        rail_cells,
+        progress,
+        status,
+        animation_time.as_secs_f32(),
+        colors,
+    );
+    spans.push(Span::raw("  "));
+    match (colors, progress) {
+        (Some(depth), Some(progress)) => {
+            spans.push(Span::styled(
+                elapsed,
+                Style::default().fg(depth.color(palette::pastel(progress))),
+            ));
+            spans.push(Span::styled(" / ", Style::default().fg(Color::DarkGray)));
+        }
+        _ => spans.push(Span::raw(format!("{elapsed} / "))),
+    }
+    spans.push(Span::raw(total));
+    Line::from(spans)
 }
 
-fn format_time(duration: std::time::Duration) -> String {
+fn format_time(duration: Duration) -> String {
     let seconds = duration.as_secs();
     let minutes = seconds / 60;
     let seconds = seconds % 60;
     format!("{minutes}:{seconds:02}")
-}
-
-fn progress_bar(
-    position: std::time::Duration,
-    duration: Option<std::time::Duration>,
-    width: usize,
-) -> String {
-    let filled = duration.map_or(0, |duration| {
-        if duration.is_zero() {
-            0
-        } else {
-            let numerator = position.as_nanos().min(duration.as_nanos());
-            usize::try_from(numerator.saturating_mul(width as u128) / duration.as_nanos())
-                .unwrap_or(width)
-                .min(width)
-        }
-    });
-    format!("[{}{}]", "=".repeat(filled), "-".repeat(width - filled))
 }
 
 fn render_queue(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
@@ -429,7 +468,10 @@ mod tests {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
-            .draw(|frame| super::render(frame, app, animation_time))
+            .draw(|frame| {
+                let mut stage = super::Stage::new(super::ColorDepth::TrueColor);
+                super::render(frame, app, &mut stage, animation_time);
+            })
             .expect("draw UI");
         let buffer = terminal.backend().buffer();
         let mut output = String::new();
@@ -454,28 +496,6 @@ mod tests {
     }
 
     #[test]
-    fn progress_handles_sub_millisecond_audio_and_clamps_at_completion() {
-        let duration = Some(Duration::from_micros(20));
-        assert_eq!(super::progress_bar(Duration::ZERO, duration, 4), "[----]");
-        assert_eq!(
-            super::progress_bar(Duration::from_micros(10), duration, 4),
-            "[==--]"
-        );
-        assert_eq!(
-            super::progress_bar(Duration::from_micros(20), duration, 4),
-            "[====]"
-        );
-        assert_eq!(
-            super::progress_bar(Duration::from_secs(1), duration, 4),
-            "[====]"
-        );
-        assert_eq!(
-            super::progress_bar(Duration::ZERO, Some(Duration::ZERO), 4),
-            "[----]"
-        );
-    }
-
-    #[test]
     fn supported_terminal_layouts_are_stable() {
         insta::assert_snapshot!("terminal_80x24", snapshot(80, 24));
         insta::assert_snapshot!("terminal_120x32", snapshot(120, 32));
@@ -493,7 +513,10 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
-            .draw(|frame| super::render(frame, &app, Duration::ZERO))
+            .draw(|frame| {
+                let mut stage = super::Stage::new(super::ColorDepth::TrueColor);
+                super::render(frame, &app, &mut stage, Duration::ZERO);
+            })
             .expect("draw UI");
         let buffer = terminal.backend().buffer();
         assert!(
@@ -546,25 +569,32 @@ mod tests {
     }
 
     #[test]
-    fn player_spectrum_moves_only_while_audio_is_playing() {
+    fn the_meadow_grows_with_the_music_only_while_playing() {
+        // Rows above Suzu's head hold only tall stalks and their lights.
+        let sky = |app: &AppState| -> usize {
+            let backend = TestBackend::new(80, 24);
+            let mut terminal = Terminal::new(backend).expect("test terminal");
+            let mut stage = super::Stage::new(super::ColorDepth::TrueColor);
+            for step in 0..30 {
+                terminal
+                    .draw(|frame| {
+                        super::render(frame, app, &mut stage, Duration::from_millis(step * 33));
+                    })
+                    .expect("draw UI");
+            }
+            let buffer = terminal.backend().buffer();
+            (3..8)
+                .flat_map(|y| (21..59).map(move |x| (x, y)))
+                .filter(|position| buffer[*position].symbol() != " ")
+                .count()
+        };
         let mut app = AppState::new(&Config::default(), empty_index()).expect("app state");
+        app.audio_spectrum(AudioSpectrum::new([230; crate::audio::SPECTRUM_BANDS]));
+
+        app.set_playback_status(crate::app::PlaybackStatus::Stopped);
+        assert_eq!(sky(&app), 0, "a stopped meadow rests on the ground");
         app.set_playback_status(crate::app::PlaybackStatus::Playing);
-        app.audio_spectrum(AudioSpectrum::new([
-            0, 1, 2, 3, 4, 5, 6, 7, 7, 6, 5, 4, 3, 2, 1, 0,
-        ]));
-
-        let playing = rendered(&app, 80, 24, Duration::ZERO);
-        assert!(
-            playing.contains("▁ ▂ ▃ ▄ ▅ ▆ ▇ █ █ ▇ ▆ ▅ ▄ ▃ ▂ ▁"),
-            "{playing}"
-        );
-
-        app.set_playback_status(crate::app::PlaybackStatus::Paused);
-        let paused = rendered(&app, 80, 24, Duration::ZERO);
-        assert!(
-            !paused.contains("▁ ▂ ▃ ▄ ▅ ▆ ▇ █ █ ▇ ▆ ▅ ▄ ▃ ▂ ▁"),
-            "{paused}"
-        );
+        assert!(sky(&app) > 20, "loud music grows tall stalks");
     }
 
     #[test]
@@ -590,10 +620,21 @@ mod tests {
 
     #[test]
     fn supported_width_keeps_long_elapsed_and_duration_text_visible() {
-        let timeline =
-            super::player_timeline(Duration::from_mins(10), Some(Duration::from_mins(20)), 38);
+        let timeline = super::player_timeline(
+            Duration::from_mins(10),
+            Some(Duration::from_mins(20)),
+            38,
+            None,
+            crate::app::PlaybackStatus::Playing,
+            Duration::ZERO,
+        );
+        let text: String = timeline
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
 
-        assert!(timeline.len() <= 38, "{timeline:?}");
-        assert!(timeline.ends_with("10:00 / 20:00"), "{timeline:?}");
+        assert!(timeline.width() <= 38, "{text:?}");
+        assert!(text.ends_with("10:00 / 20:00"), "{text:?}");
     }
 }

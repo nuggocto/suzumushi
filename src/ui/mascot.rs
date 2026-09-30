@@ -10,6 +10,8 @@ use ratatui::text::{Line, Span};
 use crate::app::{ColorMode, PlaybackStatus};
 
 const FRAME_HEIGHT: usize = 8;
+/// Rows every Suzu frame occupies.
+pub(super) const HEIGHT: usize = FRAME_HEIGHT;
 const FRAME_INTERVAL_MILLIS: u128 = 200;
 
 #[derive(Clone, Copy)]

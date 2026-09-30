@@ -216,10 +216,11 @@ impl AppState {
             .saturating_add(search_bytes)
             .saturating_add(shuffle_bytes)
             .saturating_add(queued_asset_bytes)
+            .saturating_add(crate::ui::STAGE_FIELD_BYTES)
             > UI_STATE_SCRATCH_BYTES
         {
             return Err(AppError::InvalidConfig(
-                "library browser, search, queue identity, and shuffle reservations exceed the UI/state scratch budget"
+                "library browser, search, queue identity, shuffle, and Player stage reservations exceed the UI/state scratch budget"
                     .into(),
             ));
         }

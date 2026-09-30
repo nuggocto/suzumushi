@@ -24,6 +24,12 @@ pub(crate) const AUDIO_WORKER_BYTES: usize = 6 * 1_048_576;
 pub(crate) const METADATA_CACHE_BYTES: usize = 16 * 1_048_576;
 pub(crate) const MAX_LOG_FILES: usize = 5;
 pub(crate) const QUEUE_ITEM_ACCOUNTING_BYTES: usize = 32;
+/// The Player's night meadow never draws more cells than this; wider or taller
+/// panels center it.
+pub(crate) const STAGE_MAX_COLUMNS: usize = 128;
+pub(crate) const STAGE_MAX_ROWS: usize = 40;
+/// Stalks grow in at most this many rows; taller stages add sky above.
+pub(crate) const MEADOW_MAX_ROWS: usize = 16;
 
 pub(crate) fn scan_reservation_bytes(index_bytes: usize) -> AppResult<usize> {
     index_bytes

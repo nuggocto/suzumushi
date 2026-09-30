@@ -5,9 +5,13 @@ audio from folders, searches it, builds a queue, and plays it. There is no
 account, database, streaming service, or network access.
 
 The interface has three panels: Library, Player, and Queue. It follows the
-terminal's own colors and stays out of the way. Suzu, the small bell-cricket
-mascot, dances in the Player while a compact live spectrum follows the sound.
-Suzu rests and the spectrum falls quiet when playback pauses or stops.
+terminal's own colors and stays out of the way. In the Player, Suzu, the small
+bell-cricket mascot, dances in a night meadow: each frequency band is a grass
+stalk tipped with light that rides the music. When playback pauses, the lights
+lift off as fireflies and drift around Suzu until you resume. When it stops,
+the meadow settles into quiet, dewy grass. In a tall Player, a night sky opens
+above the title: faint stars twinkle, and a crescent moon crosses the sky as the
+track plays.
 
 ## Install on Arch Linux
 
@@ -27,7 +31,7 @@ On x86-64 NixOS with Nix installed, add the repository flake to your user profil
 
 ```sh
 nix --extra-experimental-features 'nix-command flakes' \
-  profile add github:nuggocto/suzumushi/v1.1.8
+  profile add github:nuggocto/suzumushi/v1.2.0
 ```
 
 This installs both `suzumushi` and `suzu`. Nix builds from source with pinned
@@ -49,20 +53,20 @@ and local build checks.
 
 The verified binary archive is built for 64-bit GNU/Linux. Download the archive
 and `SHA256SUMS` from the
-[`v1.1.8` release](https://github.com/nuggocto/suzumushi/releases/tag/v1.1.8),
+[`v1.2.0` release](https://github.com/nuggocto/suzumushi/releases/tag/v1.2.0),
 either in your browser or with:
 
 ```sh
 curl -fLO \
-  'https://github.com/nuggocto/suzumushi/releases/download/v1.1.8/{SHA256SUMS,suzumushi-v1.1.8-x86_64-unknown-linux-gnu.tar.xz}'
+  'https://github.com/nuggocto/suzumushi/releases/download/v1.2.0/{SHA256SUMS,suzumushi-v1.2.0-x86_64-unknown-linux-gnu.tar.xz}'
 ```
 
 Then verify and install the downloaded archive:
 
 ```sh
 sha256sum --check --ignore-missing SHA256SUMS
-tar -xf suzumushi-v1.1.8-x86_64-unknown-linux-gnu.tar.xz
-cd suzumushi-v1.1.8-x86_64-unknown-linux-gnu
+tar -xf suzumushi-v1.2.0-x86_64-unknown-linux-gnu.tar.xz
+cd suzumushi-v1.2.0-x86_64-unknown-linux-gnu
 sudo install -Dm755 suzumushi /usr/local/bin/suzumushi
 sudo ln -s suzumushi /usr/local/bin/suzu
 ```
@@ -190,8 +194,13 @@ accept files and URLs through MPRIS.
 ## Terminal colors
 
 Suzumushi inherits the terminal's foreground, background, and named ANSI
-palette. Changing the terminal theme changes the player with it. Set
-`NO_COLOR`, or use `theme = "mono"`, for a monochrome interface. The focused
+palette. Changing the terminal theme changes the player with it. The Player's
+meadow is the one exception: it draws its own pastel gradient, from peach for
+bass through rose and lilac to mint for treble, shared by the progress line, in
+24-bit color when the terminal advertises
+`COLORTERM=truecolor` and in the nearest 256 colors otherwise. It never paints
+a background. Set `NO_COLOR`, or use `theme = "mono"`, for a monochrome
+interface. The focused
 panel is marked with `>` and a bold single-line border, so focus never depends
 on color alone.
 
@@ -210,7 +219,7 @@ automatic resampling are not current support claims.
 
 ## Status
 
-Version `1.1.8` is the current stable release. Its tag-driven Linux archive is
+Version `1.2.0` is the current stable release. Its tag-driven Linux archive is
 fully verified before GitHub publishes it. Arch users can install the matching
 `suzumushi-bin` package from AUR.
 

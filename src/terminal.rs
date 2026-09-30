@@ -113,6 +113,7 @@ fn run_terminal_session(
     let mut terminal = create_terminal(initial_area)?;
 
     let events = EventSource::new();
+    let mut stage = crate::ui::Stage::new(crate::ui::ColorDepth::from_environment());
     let mut event_time = Duration::ZERO;
     let mut audio_diagnostics = AudioDiagnosticsReporter::default();
 
@@ -125,10 +126,10 @@ fn run_terminal_session(
         terminal
             .draw(|frame| {
                 app.terminal_size = (frame.area().width, frame.area().height);
-                crate::ui::render(frame, app, event_time);
+                crate::ui::render(frame, app, &mut stage, event_time);
             })
             .map_err(|error| AppError::io("draw terminal", "terminal", error))?;
-        let event = events.next()?;
+        let event = events.next(stage.frame_interval())?;
         event_time = event_time_for(event);
         if let AppEvent::Resize(width, height, _) = event {
             let area = validate_terminal_area(width, height, TERMINAL_BUFFER_BYTES)?;

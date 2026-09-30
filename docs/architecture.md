@@ -25,6 +25,28 @@ The scan index is immutable during a session. Queue membership uses one byte
 per canonical asset, while queue order and shuffle order use bounded vectors.
 The app validates their startup reservations against the configured budgets.
 
+## Player stage
+
+`src/ui/stage.rs` owns the Player's night meadow, the only UI state kept between
+frames. Each spectrum band is a stalk whose light is thrown up by the music and
+falls back under gravity; on pause the lights fly as fireflies along
+deterministic paths. On resume each light keeps its flight while an eased pull
+brings it home, in a wave, and its stalk grows to meet it, so nothing stops or
+jumps. Shapes render into a fixed
+dot field, reserved once and counted in the UI budget, then into braille cells:
+solid shapes stay solid, glow becomes an ordered stipple, and bare stalk columns
+become hairlines. When the Player has room, the stage extends above the title
+into a sky of fixed-share stars and a moon placed by track progress. The title
+and Suzu are drawn last with silhouette masks. `src/ui/palette.rs` holds the
+pastel gradient and glow shading that the meadow and the progress rail share;
+`src/ui/rail.rs` draws the rail's trail, dew, and light in the same braille dots. The stage asks the
+event loop for about 30 frames per second while it moves, 20 while fireflies
+drift, and the ordinary tick once still.
+
+The audio callback analyzes 32 bands from 50 Hz to 16 kHz and normalizes them
+against a slowly relaxing loudness reference, so loud masters and quiet
+recordings use the same visual range.
+
 ## Audio and files
 
 `src/terminal.rs` dispatches playback intents after verifying the selected file

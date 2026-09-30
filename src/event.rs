@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{self, Event, KeyEvent, KeyEventKind};
 
 use crate::errors::{AppError, AppResult};
+/// The slowest redraw; animations ask for sooner ticks.
 const MAX_POLL: Duration = Duration::from_millis(100);
 
 /// Events consumed by the app-owned terminal loop.
@@ -30,13 +31,13 @@ impl EventSource {
         }
     }
 
-    /// Waits only until the next periodic redraw tick.
+    /// Waits only until the next redraw tick, at most `frame` from now.
     ///
     /// # Errors
     ///
     /// Returns an error when the terminal event stream cannot be polled or read.
-    pub fn next(&self) -> AppResult<AppEvent> {
-        if !event::poll(MAX_POLL)
+    pub fn next(&self, frame: Duration) -> AppResult<AppEvent> {
+        if !event::poll(frame.min(MAX_POLL))
             .map_err(|error| AppError::io("poll terminal input", "terminal", error))?
         {
             return Ok(AppEvent::Tick(self.elapsed()));
