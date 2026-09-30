@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.8] - 2026-09-30
+
+### Fixed
+
+- Removed the crackling, static-like noise when Space or play-pause is held or
+  pressed rapidly. Since 1.1.7 each toggle reached the audio device at once, and
+  toggles faster than one device cycle emitted millisecond fragments of audio.
+  The backend stream now stays running through rapid toggles.
+- Removed the click at every pause, resume, track start, seek, and stop: output
+  now fades in and out over 8 ms instead of cutting abruptly.
+- Held seeking stays quiet and restarts the decoder once at the final position,
+  instead of tearing down and rebuilding the audio stream on every key repeat.
+
 ## [1.1.7] - 2026-09-30
 
 ### Fixed

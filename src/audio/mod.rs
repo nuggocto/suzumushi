@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError, channel, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::errors::{AppError, AppResult};
 
@@ -34,6 +34,10 @@ pub fn fuzz_decode(input: &[u8]) {
 const COMMAND_CAPACITY: usize = 32;
 const WORKER_POLL: Duration = Duration::from_millis(5);
 const POSITION_INTERVAL: Duration = Duration::from_millis(250);
+/// A seek arriving this soon after a restart waits for the seeks to stop. A held
+/// key then restarts the decoder and output once, at its final position, instead
+/// of on every key repeat.
+const SEEK_SETTLE: Duration = Duration::from_millis(150);
 
 /// Match the decoder protocol's whole-microsecond position representation.
 pub(crate) fn decoder_position(position: Duration) -> Duration {
@@ -451,6 +455,10 @@ trait OutputStream: Send {
     fn play(&mut self) -> Result<(), String>;
     fn pause(&mut self) -> Result<(), String>;
     fn resume(&mut self) -> Result<(), String>;
+    /// Fades output to silence without changing the pause state.
+    fn silence(&mut self);
+    /// Performs deferred device work; called on every worker iteration.
+    fn service(&mut self) -> Result<(), String>;
     fn stop(&mut self) -> Result<(), String>;
     fn consumed_frames(&self) -> u64;
     fn drained(&mut self) -> bool;
@@ -503,9 +511,18 @@ struct ActivePlayback {
     start_notice: StartNotice,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingSeek {
+    generation: u64,
+    position: Duration,
+    due: Instant,
+}
+
 struct WorkerCore<B: Backend> {
     backend: B,
     active: Option<ActivePlayback>,
+    pending_seek: Option<PendingSeek>,
+    last_restart: Option<Instant>,
 }
 
 impl<B: Backend> WorkerCore<B> {
@@ -513,6 +530,8 @@ impl<B: Backend> WorkerCore<B> {
         Self {
             backend,
             active: None,
+            pending_seek: None,
+            last_restart: None,
         }
     }
 
@@ -567,7 +586,7 @@ impl<B: Backend> WorkerCore<B> {
             AudioCommand::Seek {
                 generation,
                 position,
-            } => self.seek(generation, position, events, positions),
+            } => self.seek(generation, position, events, positions, Instant::now()),
             AudioCommand::Shutdown => {
                 self.stop_active()?;
                 return Ok(true);
@@ -690,6 +709,7 @@ impl<B: Backend> WorkerCore<B> {
         position: Duration,
         events: &Sender<AudioEvent>,
         positions: &PositionLane,
+        now: Instant,
     ) {
         let timing = self
             .active
@@ -701,7 +721,9 @@ impl<B: Backend> WorkerCore<B> {
                     active.timeline_revision,
                 )
             });
-        let (duration, timeline_revision) = timing.unwrap_or((None, 0));
+        let Some((duration, timeline_revision)) = timing else {
+            return;
+        };
         let position = duration.map_or(position, |duration| position.min(duration));
         if duration.is_some_and(|duration| position >= duration) {
             Self::publish_specific_position(
@@ -721,12 +743,43 @@ impl<B: Backend> WorkerCore<B> {
                     },
                 ),
             }
-        } else if self
-            .active
-            .as_ref()
-            .is_some_and(|active| active.generation == generation)
-            && let Err(message) = self.restart_active(generation, position)
+        } else if self.pending_seek.is_some()
+            || self
+                .last_restart
+                .is_some_and(|restart| now.saturating_duration_since(restart) < SEEK_SETTLE)
         {
+            if let Some(active) = self.active.as_mut() {
+                active.output.silence();
+            }
+            self.pending_seek = Some(PendingSeek {
+                generation,
+                position,
+                due: now + SEEK_SETTLE,
+            });
+        } else {
+            self.restart_for_seek(generation, position, events, now);
+        }
+    }
+
+    /// Applies a held seek once no newer seek has arrived for [`SEEK_SETTLE`].
+    fn settle_seek(&mut self, events: &Sender<AudioEvent>, now: Instant) -> bool {
+        let Some(pending) = self.pending_seek.filter(|pending| now >= pending.due) else {
+            return false;
+        };
+        self.pending_seek = None;
+        self.restart_for_seek(pending.generation, pending.position, events, now);
+        true
+    }
+
+    fn restart_for_seek(
+        &mut self,
+        generation: u64,
+        position: Duration,
+        events: &Sender<AudioEvent>,
+        now: Instant,
+    ) {
+        self.last_restart = Some(now);
+        if let Err(message) = self.restart_active(generation, position) {
             emit(
                 events,
                 AudioEvent::Failed {
@@ -745,6 +798,16 @@ impl<B: Backend> WorkerCore<B> {
         if self.output_failed(events, generation) {
             return true;
         }
+        let serviced = self
+            .active
+            .as_mut()
+            .expect("active playback is retained")
+            .output
+            .service();
+        if let Err(message) = serviced {
+            self.fail(events, generation, &message);
+            return true;
+        }
 
         self.publish_position(positions, false);
         if self.write_pending(events, generation) {
@@ -752,6 +815,10 @@ impl<B: Backend> WorkerCore<B> {
         }
         if self.poll_decoder(events, generation) {
             return true;
+        }
+        // The muted timeline of a settling seek must not finish the track.
+        if self.pending_seek.is_some() {
+            return false;
         }
         self.finish_drained(events, positions, generation)
     }
@@ -1009,6 +1076,7 @@ impl<B: Backend> WorkerCore<B> {
     }
 
     fn stop_active(&mut self) -> Result<(), String> {
+        self.pending_seek = None;
         let Some(mut active) = self.active.take() else {
             return Ok(());
         };
@@ -1093,7 +1161,16 @@ fn worker_main<B: Backend>(
             Err(TryRecvError::Empty) => {}
         }
         if let Some(request) = seeks.take() {
-            core.seek(request.generation, request.position, events, positions);
+            core.seek(
+                request.generation,
+                request.position,
+                events,
+                positions,
+                Instant::now(),
+            );
+            continue;
+        }
+        if core.settle_seek(events, Instant::now()) {
             continue;
         }
         if core.drive(events, positions) {
@@ -1135,7 +1212,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::mpsc::TryRecvError;
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::{
         AudioCommand, AudioEvent, AudioFormat, AudioMetrics, AudioPosition, AudioRuntime, Backend,
@@ -1205,6 +1282,14 @@ mod tests {
 
         fn resume(&mut self) -> Result<(), String> {
             self.calls.lock().expect("fake output log").push("resume");
+            Ok(())
+        }
+
+        fn silence(&mut self) {
+            self.calls.lock().expect("fake output log").push("silence");
+        }
+
+        fn service(&mut self) -> Result<(), String> {
             Ok(())
         }
 
@@ -1726,6 +1811,91 @@ mod tests {
             [
                 "prepare", "write", "play", "stop", "prepare", "write", "resume"
             ]
+        );
+    }
+
+    #[test]
+    fn held_seeks_restart_once_at_the_final_position() {
+        let format = AudioFormat {
+            sample_rate: 48_000,
+            channels: 1,
+        };
+        let (backend, fixture) = fixture_backend(VecDeque::from([
+            DecoderPoll::Ready(decoded(format)),
+            DecoderPoll::Samples(vec![0.1; 512]),
+        ]));
+        let mut core = WorkerCore::new(backend);
+        let (events, received) = channel();
+        let positions = PositionLane::default();
+        core.command(
+            AudioCommand::Play {
+                generation: 11,
+                file: harmless_file(),
+                position: Duration::ZERO,
+                settings: PlaybackSettings::default(),
+                paused: false,
+            },
+            &events,
+            &positions,
+        )
+        .expect("start fake playback");
+        drive_steps(&mut core, &events, &positions, 6);
+        assert!(matches!(
+            received.try_recv(),
+            Ok(AudioEvent::Started { generation: 11, .. })
+        ));
+
+        let start = Instant::now();
+        let at = |millis| start + Duration::from_millis(millis);
+        // A single press restarts at once; key repeats then settle together.
+        core.seek(11, Duration::from_millis(100), &events, &positions, at(0));
+        for (millis, target) in [(25, 200), (50, 300), (75, 400)] {
+            core.seek(
+                11,
+                Duration::from_millis(target),
+                &events,
+                &positions,
+                at(millis),
+            );
+        }
+        fixture.drained.store(true, Ordering::Release);
+        drive_steps(&mut core, &events, &positions, 4);
+        assert!(!core.settle_seek(&events, at(200)), "a repeat is still due");
+        assert!(core.settle_seek(&events, at(225)));
+
+        assert_eq!(
+            fixture
+                .opened_positions
+                .lock()
+                .expect("open log")
+                .as_slice(),
+            [
+                Duration::ZERO,
+                Duration::from_millis(100),
+                Duration::from_millis(400)
+            ]
+        );
+        assert!(
+            fixture
+                .calls
+                .lock()
+                .expect("fake output calls")
+                .contains(&"silence"),
+            "held seeks fade out the stale timeline"
+        );
+        assert!(
+            received
+                .try_iter()
+                .all(|event| !matches!(event, AudioEvent::Finished { .. })),
+            "a settling seek never finishes the muted track"
+        );
+
+        core.seek(11, Duration::from_millis(500), &events, &positions, at(250));
+        core.command(AudioCommand::Stop { generation: 11 }, &events, &positions)
+            .expect("stop during a settling seek");
+        assert!(
+            !core.settle_seek(&events, at(1_000)),
+            "stop drops the held seek"
         );
     }
 

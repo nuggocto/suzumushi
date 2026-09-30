@@ -38,6 +38,14 @@ silence. The callback does no allocation, locking, waiting, or logging. Ring
 consumption precedes hardware playback, so completion also waits for the
 backend's playback delay.
 
+Output never cuts hard. The callback ramps gain over 8 ms whenever output
+starts, pauses, resumes, mutes, or stops, and a toggle mid-ramp reverses it. A
+pause leaves the backend stream running and silent until it has been paused for
+half a second, so rapid toggles never restart the device stream mid-cycle.
+Teardown waits, briefly, for the fade-out to reach the backend. Seeks arriving
+within 150 ms of a restart are held silently and applied once, at the latest
+target, so a held arrow key restarts the decoder once.
+
 ## Verification
 
 Run `mise run ci` for formatting, Clippy, tests, MSRV compatibility, dependency

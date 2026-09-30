@@ -27,7 +27,7 @@ On x86-64 NixOS with Nix installed, add the repository flake to your user profil
 
 ```sh
 nix --extra-experimental-features 'nix-command flakes' \
-  profile add github:nuggocto/suzumushi/v1.1.7
+  profile add github:nuggocto/suzumushi/v1.1.8
 ```
 
 This installs both `suzumushi` and `suzu`. Nix builds from source with pinned
@@ -49,20 +49,20 @@ and local build checks.
 
 The verified binary archive is built for 64-bit GNU/Linux. Download the archive
 and `SHA256SUMS` from the
-[`v1.1.7` release](https://github.com/nuggocto/suzumushi/releases/tag/v1.1.7),
+[`v1.1.8` release](https://github.com/nuggocto/suzumushi/releases/tag/v1.1.8),
 either in your browser or with:
 
 ```sh
 curl -fLO \
-  'https://github.com/nuggocto/suzumushi/releases/download/v1.1.7/{SHA256SUMS,suzumushi-v1.1.7-x86_64-unknown-linux-gnu.tar.xz}'
+  'https://github.com/nuggocto/suzumushi/releases/download/v1.1.8/{SHA256SUMS,suzumushi-v1.1.8-x86_64-unknown-linux-gnu.tar.xz}'
 ```
 
 Then verify and install the downloaded archive:
 
 ```sh
 sha256sum --check --ignore-missing SHA256SUMS
-tar -xf suzumushi-v1.1.7-x86_64-unknown-linux-gnu.tar.xz
-cd suzumushi-v1.1.7-x86_64-unknown-linux-gnu
+tar -xf suzumushi-v1.1.8-x86_64-unknown-linux-gnu.tar.xz
+cd suzumushi-v1.1.8-x86_64-unknown-linux-gnu
 sudo install -Dm755 suzumushi /usr/local/bin/suzumushi
 sudo ln -s suzumushi /usr/local/bin/suzu
 ```
@@ -167,7 +167,9 @@ Playlist additions remain all-or-nothing. Shuffle keeps the editable Queue in
 its visible order while randomizing playback across its tracks.
 
 Held seek input keeps only the newest target, so releasing the arrow key resumes
-from the position shown instead of replaying obsolete intermediate seeks.
+from the position shown instead of replaying obsolete intermediate seeks. Audio
+stays quiet while the key is held, and pausing, resuming, and seeking fade in
+and out instead of cutting abruptly.
 
 ## Desktop controls
 
@@ -208,7 +210,7 @@ automatic resampling are not current support claims.
 
 ## Status
 
-Version `1.1.7` is the current stable release. Its tag-driven Linux archive is
+Version `1.1.8` is the current stable release. Its tag-driven Linux archive is
 fully verified before GitHub publishes it. Arch users can install the matching
 `suzumushi-bin` package from AUR.
 

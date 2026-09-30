@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{
@@ -21,6 +21,15 @@ const MIN_SAMPLE_RATE: u32 = 8_000;
 const MAX_SAMPLE_RATE: u32 = 192_000;
 const MAX_SOURCE_CHANNELS: u16 = 2;
 const MAX_OUTPUT_CHANNELS: u16 = 8;
+/// Gain ramp applied whenever output starts, pauses, resumes, mutes, or stops.
+/// Long enough to remove the click of a hard cut, short enough to feel immediate.
+const FADE_MICROS: u64 = 8_000;
+/// Keeps the backend stream running, silent, for this long after a pause. Rapid
+/// toggles then only reverse the fade instead of stopping and restarting the
+/// device stream mid-cycle, which emits fragments of audio.
+const BACKEND_PAUSE_DELAY: Duration = Duration::from_millis(500);
+/// Upper bound on waiting for a fade-out to reach the device before teardown.
+const STOP_FADE_TIMEOUT: Duration = Duration::from_millis(100);
 
 pub(super) struct CpalOutput {
     source: Option<AudioFormat>,
@@ -35,13 +44,69 @@ pub(super) struct CpalOutput {
     metrics: Arc<AudioMetrics>,
     written: u64,
     drain_deadline: Option<StreamInstant>,
+    backend_running: bool,
+    paused_at: Option<Instant>,
 }
 
 #[derive(Default)]
 struct OutputProgress {
     playing: AtomicBool,
+    /// Silences output without changing the pause state, while a seek settles.
+    muted: AtomicBool,
+    /// Set by a callback that renders only silence after any fade-out, so the
+    /// faded buffer before it has already been handed to the backend.
+    silent: AtomicBool,
     consumed: AtomicU64,
     playback_delay_nanos: AtomicU64,
+}
+
+impl OutputProgress {
+    fn new() -> Self {
+        Self {
+            silent: AtomicBool::new(true),
+            ..Self::default()
+        }
+    }
+}
+
+/// Callback-owned gain ramp toward the requested audibility.
+///
+/// A toggle in the middle of a ramp reverses it from the current gain, so no
+/// sequence of pauses and resumes can produce a step larger than one ramp frame.
+struct Fade {
+    step: u16,
+    length: u16,
+}
+
+impl Fade {
+    fn new(sample_rate: u32) -> Self {
+        let length = u64::from(sample_rate).saturating_mul(FADE_MICROS) / 1_000_000;
+        Self {
+            step: 0,
+            length: u16::try_from(length).unwrap_or(u16::MAX).max(1),
+        }
+    }
+
+    /// A one-frame ramp that is already fully audible, so exact PCM passes through.
+    #[cfg(test)]
+    const fn instant() -> Self {
+        Self { step: 1, length: 1 }
+    }
+
+    const fn is_silent(&self) -> bool {
+        self.step == 0
+    }
+
+    /// Moves one frame toward the target and returns that frame's gain.
+    fn advance(&mut self, audible: bool) -> f32 {
+        self.step = if audible {
+            self.step.saturating_add(1).min(self.length)
+        } else {
+            self.step.saturating_sub(1)
+        };
+        let progress = f32::from(self.step) / f32::from(self.length);
+        progress * progress * 2.0_f32.mul_add(-progress, 3.0)
+    }
 }
 
 impl CpalOutput {
@@ -59,6 +124,8 @@ impl CpalOutput {
             metrics,
             written: 0,
             drain_deadline: None,
+            backend_running: false,
+            paused_at: None,
         }
     }
 
@@ -82,6 +149,31 @@ impl CpalOutput {
             self.failure.store(1, Ordering::Release);
         }
         false
+    }
+}
+
+impl CpalOutput {
+    fn pause_backend(&mut self) -> Result<(), String> {
+        if !self.backend_running {
+            return Ok(());
+        }
+        self.backend_running = false;
+        self.stream
+            .as_ref()
+            .ok_or_else(|| "audio output stream is unavailable".to_owned())?
+            .pause()
+            .map_err(|error| format!("cannot pause the audio output stream: {error}"))
+    }
+
+    /// Lets a running stream finish its fade-out, so teardown is not a hard cut.
+    fn await_silence(&self) {
+        if !self.backend_running {
+            return;
+        }
+        let deadline = Instant::now() + STOP_FADE_TIMEOUT;
+        while !self.progress.silent.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 }
 
@@ -117,11 +209,13 @@ impl OutputStream for CpalOutput {
         let sample_format = choice.sample_format;
         let config = choice.config;
         let (producer, pcm_reader) = RingBuffer::new(PCM_RING_SAMPLES);
-        self.progress = Arc::new(OutputProgress::default());
+        self.progress = Arc::new(OutputProgress::new());
         self.end_of_stream.store(false, Ordering::Release);
         self.failure.store(0, Ordering::Release);
         self.written = 0;
         self.drain_deadline = None;
+        self.backend_running = false;
+        self.paused_at = None;
         self.spectrum.clear();
         let progress = Arc::clone(&self.progress);
         let end_of_stream = Arc::clone(&self.end_of_stream);
@@ -222,27 +316,30 @@ impl OutputStream for CpalOutput {
     }
 
     fn play(&mut self) -> Result<(), String> {
-        self.stream
+        let stream = self
+            .stream
             .as_ref()
-            .ok_or_else(|| "audio output stream is unavailable".to_owned())?
-            .play()
-            .map_err(|error| format!("cannot start the audio output stream: {error}"))?;
+            .ok_or_else(|| "audio output stream is unavailable".to_owned())?;
+        if !self.backend_running {
+            stream
+                .play()
+                .map_err(|error| format!("cannot start the audio output stream: {error}"))?;
+            self.backend_running = true;
+        }
+        self.paused_at = None;
         self.drain_deadline = None;
+        self.progress.silent.store(false, Ordering::Release);
         self.progress.playing.store(true, Ordering::Release);
         Ok(())
     }
 
+    /// Fades out; the backend stream pauses later, once it is silent and idle.
     fn pause(&mut self) -> Result<(), String> {
         self.drain_deadline = None;
         self.spectrum.clear();
-        if !self.progress.playing.swap(false, Ordering::AcqRel) {
-            return Ok(());
+        if self.progress.playing.swap(false, Ordering::AcqRel) {
+            self.paused_at = Some(Instant::now());
         }
-        self.stream
-            .as_ref()
-            .ok_or_else(|| "audio output stream is unavailable".to_owned())?
-            .pause()
-            .map_err(|error| format!("cannot pause the audio output stream: {error}"))?;
         Ok(())
     }
 
@@ -250,11 +347,28 @@ impl OutputStream for CpalOutput {
         self.play()
     }
 
+    fn silence(&mut self) {
+        self.spectrum.clear();
+        self.progress.muted.store(true, Ordering::Release);
+    }
+
+    fn service(&mut self) -> Result<(), String> {
+        let silent = self.progress.silent.load(Ordering::Acquire);
+        if !backend_pause_due(self.paused_at, Instant::now(), silent) {
+            return Ok(());
+        }
+        self.paused_at = None;
+        self.pause_backend()
+    }
+
     fn stop(&mut self) -> Result<(), String> {
-        let pause_error = self.pause().err();
+        self.progress.playing.store(false, Ordering::Release);
+        self.await_silence();
+        let pause_error = self.pause_backend().err();
         self.stream.take();
         self.producer.take();
         self.source = None;
+        self.paused_at = None;
         self.spectrum.clear();
         pause_error.map_or(Ok(()), Err)
     }
@@ -279,6 +393,14 @@ impl OutputStream for CpalOutput {
         (self.failure.load(Ordering::Acquire) != 0)
             .then(|| "the audio output callback reported a device failure".into())
     }
+}
+
+/// Pauses the backend only after a pause has been silent for a while, so rapid
+/// toggles never stop and restart the device stream.
+fn backend_pause_due(paused_at: Option<Instant>, now: Instant, silent: bool) -> bool {
+    silent
+        && paused_at
+            .is_some_and(|paused| now.saturating_duration_since(paused) >= BACKEND_PAUSE_DELAY)
 }
 
 fn build_stream(
@@ -332,6 +454,7 @@ where
         metrics,
     } = callback;
     let mut analyzer = SpectrumAnalyzer::new(config.sample_rate, config.channels);
+    let mut fade = Fade::new(config.sample_rate);
     let format = AudioFormat {
         sample_rate: config.sample_rate,
         channels: config.channels,
@@ -349,6 +472,7 @@ where
                     RenderContext {
                         pcm_reader: &mut pcm_reader,
                         gain,
+                        fade: &mut fade,
                         analyzer: &mut analyzer,
                         progress: &progress,
                         timing: OutputTiming {
@@ -370,6 +494,7 @@ where
 struct RenderContext<'a> {
     pcm_reader: &'a mut Consumer<f32>,
     gain: f32,
+    fade: &'a mut Fade,
     analyzer: &'a mut SpectrumAnalyzer,
     progress: &'a OutputProgress,
     timing: OutputTiming,
@@ -390,6 +515,7 @@ where
     let RenderContext {
         pcm_reader,
         gain,
+        fade,
         analyzer,
         progress,
         timing,
@@ -397,10 +523,14 @@ where
         metrics,
         spectrum,
     } = context;
-    if !progress.playing.load(Ordering::Acquire) {
+    let audible =
+        progress.playing.load(Ordering::Acquire) && !progress.muted.load(Ordering::Acquire);
+    if !audible && fade.is_silent() {
         output.fill(T::EQUILIBRIUM);
+        progress.silent.store(true, Ordering::Release);
         return;
     }
+    progress.silent.store(false, Ordering::Release);
     let frames = output.len().div_ceil(usize::from(timing.format.channels));
     let buffer_nanos = u64::try_from(frames)
         .unwrap_or(u64::MAX)
@@ -412,12 +542,18 @@ where
     let channels = usize::from(timing.format.channels);
     let mut output_frames = output.chunks_exact_mut(channels);
     for frame in &mut output_frames {
+        if !audible && fade.is_silent() {
+            // The fade-out finished inside this buffer; keep the remaining PCM.
+            frame.fill(T::EQUILIBRIUM);
+            continue;
+        }
+        let ramp = fade.advance(audible);
         // Silence is a whole hardware frame too. Never resume between channels,
         // even if the producer becomes ready halfway through an underrun.
         if let Ok(chunk) = pcm_reader.read_chunk(channels) {
             let (first, second) = chunk.as_slices();
             for (sample, value) in frame.iter_mut().zip(first.iter().chain(second)) {
-                let value = finite_or_silence(*value * gain);
+                let value = finite_or_silence(*value * gain * ramp);
                 *sample = T::from_sample(value);
                 if let Some(levels) = analyzer.push_interleaved(value) {
                     published = Some(levels);
@@ -427,7 +563,7 @@ where
             read += u64::from(timing.format.channels);
         } else {
             frame.fill(T::EQUILIBRIUM);
-            if !end_of_stream.load(Ordering::Acquire) {
+            if audible && !end_of_stream.load(Ordering::Acquire) {
                 underruns += u64::from(timing.format.channels);
             }
             for _ in 0..channels {
@@ -439,7 +575,8 @@ where
     }
     // A backend's partial trailing frame cannot consume source PCM.
     output_frames.into_remainder().fill(T::EQUILIBRIUM);
-    if let Some(levels) = published {
+    // A paused or muted fade-out tail must not repaint the cleared spectrum.
+    if let Some(levels) = published.filter(|_| audible) {
         spectrum.publish(levels);
     }
     if underruns != 0 {
@@ -660,6 +797,7 @@ mod tests {
         let end_of_stream = AtomicBool::new(false);
         let spectrum = SpectrumLane::default();
         let mut analyzer = super::SpectrumAnalyzer::new(48_000, 2);
+        let mut fade = super::Fade::instant();
         let mut output = [1.0_f32; 4];
 
         render_output(
@@ -667,6 +805,7 @@ mod tests {
             super::RenderContext {
                 pcm_reader: &mut consumer,
                 gain: 1.0,
+                fade: &mut fade,
                 analyzer: &mut analyzer,
                 progress: &progress,
                 timing: timing(2),
@@ -749,12 +888,14 @@ mod tests {
             let end_of_stream = AtomicBool::new(false);
             let spectrum = SpectrumLane::default();
             let mut analyzer = super::SpectrumAnalyzer::new(48_000, channels);
+            let mut fade = super::Fade::instant();
             let mut render = |output: &mut [f32]| {
                 render_output(
                     output,
                     super::RenderContext {
                         pcm_reader: &mut consumer,
                         gain: 1.0,
+                        fade: &mut fade,
                         analyzer: &mut analyzer,
                         progress: &progress,
                         timing: timing(channels),
@@ -807,6 +948,7 @@ mod tests {
         let end_of_stream = AtomicBool::new(true);
         let spectrum = SpectrumLane::default();
         let mut analyzer = super::SpectrumAnalyzer::new(48_000, 1);
+        let mut fade = super::Fade::instant();
         let mut output = [1.0_f32; 4];
 
         render_output(
@@ -814,6 +956,7 @@ mod tests {
             super::RenderContext {
                 pcm_reader: &mut consumer,
                 gain: 1.0,
+                fade: &mut fade,
                 analyzer: &mut analyzer,
                 progress: &progress,
                 timing: timing(1),
@@ -838,12 +981,14 @@ mod tests {
         let end_of_stream = AtomicBool::new(false);
         let spectrum = SpectrumLane::default();
         let mut analyzer = super::SpectrumAnalyzer::new(48_000, 1);
+        let mut fade = super::Fade::instant();
         let mut output = [1.0_f32; 4];
         render_output(
             &mut output,
             super::RenderContext {
                 pcm_reader: &mut consumer,
                 gain: 1.0,
+                fade: &mut fade,
                 analyzer: &mut analyzer,
                 progress: &progress,
                 timing: timing(1),
@@ -869,6 +1014,7 @@ mod tests {
         let end_of_stream = AtomicBool::new(true);
         let spectrum = SpectrumLane::default();
         let mut analyzer = super::SpectrumAnalyzer::new(48_000, 2);
+        let mut fade = super::Fade { step: 0, length: 1 };
         let mut output = [1.0_f32; 4];
 
         render_output(
@@ -876,6 +1022,7 @@ mod tests {
             super::RenderContext {
                 pcm_reader: &mut consumer,
                 gain: 1.0,
+                fade: &mut fade,
                 analyzer: &mut analyzer,
                 progress: &progress,
                 timing: timing(2),
@@ -895,6 +1042,7 @@ mod tests {
             super::RenderContext {
                 pcm_reader: &mut consumer,
                 gain: 1.0,
+                fade: &mut fade,
                 analyzer: &mut analyzer,
                 progress: &progress,
                 timing: timing(2),
@@ -923,6 +1071,7 @@ mod tests {
         device.progress.playing.store(true, Ordering::Release);
         let end_of_stream = AtomicBool::new(true);
         let mut analyzer = super::SpectrumAnalyzer::new(8_000, 1);
+        let mut fade = super::Fade::instant();
         let mut buffer = [0.0_f32; 80];
         let now = StreamInstant::ZERO + Duration::from_secs(1);
         assert!(!device.drained_at(now), "queued PCM has not been consumed");
@@ -932,6 +1081,7 @@ mod tests {
             super::RenderContext {
                 pcm_reader: &mut consumer,
                 gain: 1.0,
+                fade: &mut fade,
                 analyzer: &mut analyzer,
                 progress: &device.progress,
                 timing: OutputTiming {
@@ -968,6 +1118,119 @@ mod tests {
         );
         assert!(!device.drained_at(resumed + Duration::from_micros(49_999)));
         assert!(device.drained_at(resumed + Duration::from_millis(50)));
+    }
+
+    /// Renders `frames` mono frames of a constant 0.5 signal and returns them.
+    fn render_constant(
+        consumer: &mut rtrb::Consumer<f32>,
+        fade: &mut super::Fade,
+        progress: &OutputProgress,
+        frames: usize,
+    ) -> Vec<f32> {
+        let metrics = AudioMetrics::default();
+        let end_of_stream = AtomicBool::new(false);
+        let spectrum = SpectrumLane::default();
+        let mut analyzer = super::SpectrumAnalyzer::new(48_000, 1);
+        let mut output = vec![1.0_f32; frames];
+        render_output(
+            &mut output,
+            super::RenderContext {
+                pcm_reader: consumer,
+                gain: 1.0,
+                fade,
+                analyzer: &mut analyzer,
+                progress,
+                timing: timing(1),
+                end_of_stream: &end_of_stream,
+                metrics: &metrics,
+                spectrum: &spectrum,
+            },
+        );
+        output
+    }
+
+    fn constant_ring(samples: usize) -> rtrb::Consumer<f32> {
+        let (mut producer, consumer) = rtrb::RingBuffer::new(samples);
+        for _ in 0..samples {
+            producer.push(0.5).expect("constant PCM");
+        }
+        consumer
+    }
+
+    #[test]
+    fn rapid_pauses_and_resumes_never_step_by_more_than_one_ramp_frame() {
+        let mut consumer = constant_ring(48_000);
+        let progress = OutputProgress::new();
+        let mut fade = super::Fade::new(48_000);
+        let length = f32::from(fade.length);
+        let mut rendered = vec![0.0];
+        // Toggle every buffer, faster than a fade completes, as a held key does.
+        for buffer in 0..40 {
+            progress.playing.store(buffer % 3 != 2, Ordering::Release);
+            rendered.extend(render_constant(&mut consumer, &mut fade, &progress, 128));
+        }
+
+        // Smoothstep's steepest slope is 1.5 per ramp length.
+        let limit = 0.5 * 1.5 / length + 1e-6;
+        let largest = rendered
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0]).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(largest <= limit, "step {largest} exceeds {limit}");
+        assert!(rendered[1] < 0.001, "a new stream fades in from silence");
+    }
+
+    #[test]
+    fn a_fade_out_stops_consuming_pcm_and_reports_silence_one_buffer_later() {
+        let mut consumer = constant_ring(4_096);
+        let progress = playing_progress();
+        let mut fade = super::Fade::new(48_000);
+        let length = usize::from(fade.length);
+        render_constant(&mut consumer, &mut fade, &progress, length);
+        let before = progress.consumed.load(Ordering::Acquire);
+
+        progress.playing.store(false, Ordering::Release);
+        let tail = render_constant(&mut consumer, &mut fade, &progress, length * 2);
+
+        assert_eq!(
+            progress.consumed.load(Ordering::Acquire) - before,
+            u64::try_from(length).expect("small fade"),
+            "the fade-out consumes exactly one ramp of PCM"
+        );
+        // The ramp's final frame lands exactly on silence.
+        assert!(tail[..length - 1].iter().all(|sample| *sample > 0.0));
+        assert!(tail[length - 1..].iter().all(|sample| *sample == 0.0));
+        assert!(
+            !progress.silent.load(Ordering::Acquire),
+            "the buffer carrying the fade is not yet silent"
+        );
+        render_constant(&mut consumer, &mut fade, &progress, 16);
+        assert!(progress.silent.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn muting_fades_out_without_changing_the_pause_state() {
+        let mut consumer = constant_ring(4_096);
+        let progress = playing_progress();
+        let mut fade = super::Fade::instant();
+        progress.muted.store(true, Ordering::Release);
+
+        let output = render_constant(&mut consumer, &mut fade, &progress, 8);
+
+        assert_eq!(output[0].to_bits(), 0.0_f32.to_bits());
+        assert!(progress.playing.load(Ordering::Acquire));
+        assert_eq!(progress.consumed.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn the_backend_pauses_only_after_a_silent_pause_outlasts_rapid_toggles() {
+        let paused = std::time::Instant::now();
+        let later = paused + super::BACKEND_PAUSE_DELAY;
+
+        assert!(!super::backend_pause_due(None, later, true));
+        assert!(!super::backend_pause_due(Some(paused), paused, true));
+        assert!(!super::backend_pause_due(Some(paused), later, false));
+        assert!(super::backend_pause_due(Some(paused), later, true));
     }
 
     #[test]
