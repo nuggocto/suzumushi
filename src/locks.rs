@@ -64,8 +64,6 @@ impl Drop for RootWriterLease {
 #[derive(Debug)]
 pub struct ActiveTuiLease {
     file: File,
-    /// Verified private runtime directory containing the lock.
-    pub runtime_directory: PathBuf,
 }
 
 impl ActiveTuiLease {
@@ -105,10 +103,7 @@ impl ActiveTuiLease {
         let app_path = runtime.join("suzumushi");
         let file = open_private_lock(&app_fd, ACTIVE_LOCK, &app_path.join(ACTIVE_LOCK))?;
         let file = acquire_and_record(file, "active TUI")?;
-        Ok(Self {
-            file,
-            runtime_directory: app_path,
-        })
+        Ok(Self { file })
     }
 }
 

@@ -22,6 +22,9 @@ pub enum AppError {
     /// Keeps parser diagnostics separate so the executable owns the error prefix.
     #[error("{0}")]
     InvalidArguments(String),
+    /// Root discovery needs a working directory that no longer exists.
+    #[error("cannot determine current directory: {0}")]
+    CurrentDirectory(#[source] std::io::Error),
     /// A filesystem operation failed.
     #[error("{operation} {path:?}: {source}")]
     Io {

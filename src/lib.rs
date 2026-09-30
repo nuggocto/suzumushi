@@ -33,14 +33,7 @@ pub(crate) const HELPER_EXECUTABLE: &str = "/proc/self/exe";
 /// Parses the process command line and returns a conventional exit status.
 #[must_use]
 pub fn run() -> std::process::ExitCode {
-    let current_dir = match std::env::current_dir() {
-        Ok(path) => path,
-        Err(error) => {
-            eprintln!("error: cannot determine current directory: {error}");
-            return std::process::ExitCode::from(2);
-        }
-    };
-    match cli::run_from(std::env::args_os(), &current_dir) {
+    match cli::run_from(std::env::args_os(), std::env::current_dir) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
             let message = display::terminal_safe(error.to_string().as_bytes(), 16_384);

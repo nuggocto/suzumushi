@@ -257,9 +257,10 @@ pub fn helper_main() -> i32 {
 }
 
 /// Exercises the same bounded adapter directly for fuzzing, without filesystem path lookup.
+///
+/// Parser panics escape so the fuzzer records them; only the helper contains them.
 pub fn fuzz_parse(input: &[u8]) {
-    let cursor = std::io::Cursor::new(input);
-    let _ = std::panic::catch_unwind(|| parse_reader(cursor));
+    let _ = parse_reader(std::io::Cursor::new(input));
 }
 
 /// Exercises bounded helper reply framing for fuzzing.

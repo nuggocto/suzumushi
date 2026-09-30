@@ -75,7 +75,8 @@ impl MprisProjection {
             playback_status: app.playback_status(),
             repeat: app.repeat,
             shuffle: app.shuffle_enabled(),
-            volume_percent: app.volume_percent,
+            // MPRIS defines Volume 0.0 as mute; the app keeps the unmuted level.
+            volume_percent: if app.muted { 0 } else { app.volume_percent },
             title,
             creator,
             track_token,
@@ -445,7 +446,10 @@ impl PlayerInterface {
 
     #[zbus(property)]
     fn set_rate(&self, value: f64) -> zbus::fdo::Result<()> {
-        if value.to_bits() == 1.0_f64.to_bits() {
+        // MPRIS requires a Rate of 0.0 to act as Pause, even for fixed-rate players.
+        if value == 0.0 {
+            self.pause()
+        } else if value.to_bits() == 1.0_f64.to_bits() {
             Ok(())
         } else {
             Err(zbus::fdo::Error::InvalidArgs(
@@ -940,5 +944,49 @@ mod tests {
         };
         player.play().expect("first request fits");
         assert!(player.play().is_err());
+    }
+
+    #[test]
+    fn zero_rate_pauses_and_other_unsupported_rates_are_refused() {
+        let (sender, receiver) = mpsc::sync_channel(REQUEST_CAPACITY);
+        let player = PlayerInterface {
+            actions: sender,
+            state: Arc::new(RwLock::new(projection())),
+        };
+
+        player.set_rate(1.0).expect("the fixed rate is accepted");
+        assert!(receiver.try_recv().is_err());
+        player.set_rate(0.0).expect("zero rate acts as Pause");
+        assert_eq!(receiver.try_recv().expect("pause action"), AppAction::Pause);
+        assert!(player.set_rate(2.0).is_err());
+        assert!(player.set_rate(f64::NAN).is_err());
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn muting_publishes_zero_volume_and_keeps_the_stored_level() {
+        use crate::app::AppState;
+        use crate::config::Config;
+        use crate::model::{ScanCounters, ScanIndex};
+
+        let index = ScanIndex {
+            generation: 1,
+            complete: true,
+            assets: Vec::new(),
+            entries: Vec::new(),
+            playlists: Vec::new(),
+            warnings: Vec::new(),
+            counters: ScanCounters::default(),
+        };
+        let mut app = AppState::new(&Config::default(), index).expect("app state");
+        app.apply(AppAction::SetVolume(40));
+        let audible = MprisProjection::from_app(&app);
+        app.apply(AppAction::ToggleMute);
+        let muted = MprisProjection::from_app(&app);
+
+        assert_eq!(audible.volume_percent, 40);
+        assert_eq!(muted.volume_percent, 0);
+        assert_eq!(app.volume_percent, 40, "unmuting restores the stored level");
+        assert_ne!(audible, muted, "muting must emit a Volume change");
     }
 }

@@ -72,7 +72,7 @@ impl ScanObserver for NoopObserver {}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PathClass {
     LibraryAudio,
-    PlaylistAudio { playlist: Vec<u8> },
+    PlaylistAudio,
     Other,
 }
 
@@ -102,9 +102,7 @@ pub fn classify_relative_path(path: &Path) -> PathClass {
     }
     match components.as_slice() {
         [first, ..] if first.as_bytes() == b"library" => PathClass::LibraryAudio,
-        [first, playlist, _, ..] if first.as_bytes() == b"playlists" => PathClass::PlaylistAudio {
-            playlist: playlist.as_bytes().to_vec(),
-        },
+        [first, _, _, ..] if first.as_bytes() == b"playlists" => PathClass::PlaylistAudio,
         _ => PathClass::Other,
     }
 }
@@ -408,15 +406,16 @@ impl<'a> Scanner<'a> {
         depth: usize,
     ) -> AppResult<()> {
         self.counters.directories += 1;
-        if depth > self.limits.max_depth {
-            self.limit(&child, "scan.max_depth");
-            return Ok(());
-        }
+        // Ignored directories are never traversed, so they cannot reach a traversal limit.
         if self.limits.ignore_hidden_audio && is_hidden(name) {
             return Ok(());
         }
         if child.components().count() == 1 && !matches!(name.as_bytes(), b"library" | b"playlists")
         {
+            return Ok(());
+        }
+        if depth > self.limits.max_depth {
+            self.limit(&child, "scan.max_depth");
             return Ok(());
         }
         if playlist_key(&child).is_some_and(|key| {
@@ -477,7 +476,7 @@ impl<'a> Scanner<'a> {
         symlink: bool,
     ) -> AppResult<()> {
         match classify_relative_path(&child) {
-            PathClass::LibraryAudio | PathClass::PlaylistAudio { .. } => {
+            PathClass::LibraryAudio | PathClass::PlaylistAudio => {
                 if self.limits.ignore_hidden_audio && is_hidden(name) {
                     return Ok(());
                 }
@@ -531,7 +530,7 @@ impl<'a> Scanner<'a> {
             && is_hidden(name)
             && matches!(
                 classify_relative_path(&child),
-                PathClass::LibraryAudio | PathClass::PlaylistAudio { .. }
+                PathClass::LibraryAudio | PathClass::PlaylistAudio
             )
         {
             return Ok(());
@@ -611,7 +610,7 @@ impl<'a> Scanner<'a> {
             }
             if !matches!(
                 classify_relative_path(&child),
-                PathClass::LibraryAudio | PathClass::PlaylistAudio { .. }
+                PathClass::LibraryAudio | PathClass::PlaylistAudio
             ) {
                 if is_media_hierarchy(&child) {
                     self.warn(

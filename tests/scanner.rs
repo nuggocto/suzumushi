@@ -35,6 +35,55 @@ impl ScanObserver for Noop {}
 type Configure = Box<dyn Fn(&mut Config)>;
 type CounterCase = (&'static str, Configure, Configure);
 
+/// Checks every retained collection and charged counter against its own limit,
+/// so a scan that is marked partial cannot still retain too much.
+fn assert_within_limits(index: &suzumushi::model::ScanIndex, config: &Config) {
+    let scan = &config.scan;
+    let counters = &index.counters;
+    assert!(index.assets.len() <= scan.max_files, "assets");
+    assert!(index.entries.len() <= scan.max_entries, "entries");
+    assert!(index.playlists.len() <= scan.max_playlists, "playlists");
+    assert!(
+        index
+            .playlists
+            .iter()
+            .all(|playlist| playlist.entry_count <= scan.max_entries_per_playlist),
+        "playlist entries"
+    );
+    assert!(
+        index
+            .entries
+            .iter()
+            .all(|entry| entry.display_path.as_os_str().len() <= scan.max_path_bytes),
+        "path bytes"
+    );
+    assert!(
+        counters.parser_attempts <= scan.max_parser_attempts,
+        "parser attempts"
+    );
+    assert!(
+        counters.symlink_resolutions <= scan.max_symlink_resolutions,
+        "symlink resolutions"
+    );
+    assert!(
+        counters.path_bytes <= scan.max_total_path_bytes,
+        "total path bytes"
+    );
+    assert!(
+        counters.metadata_bytes <= scan.max_total_metadata_bytes,
+        "metadata bytes"
+    );
+    assert!(
+        counters.warning_bytes <= scan.max_warning_bytes,
+        "warning bytes"
+    );
+    assert!(counters.index_bytes <= scan.max_index_bytes, "index bytes");
+    assert!(
+        counters.open_files_high_water <= config.runtime.max_open_files,
+        "open files"
+    );
+}
+
 fn retained_max_path_bytes(index: &suzumushi::model::ScanIndex) -> usize {
     index
         .entries
@@ -362,6 +411,30 @@ fn hidden_directory_at_audio_root_does_not_consume_descendant_budgets() {
     assert_eq!(
         index.counters.directory_enumerations,
         baseline.counters.directory_enumerations
+    );
+}
+
+#[test]
+fn ignored_hidden_directory_beyond_the_depth_limit_does_not_stop_the_scan() {
+    let (_temp, root) = root();
+    let album = root.join("audio/library/Album");
+    fs::create_dir(&album).expect("album directory");
+    // Sorts before the visible track, so an early stop would drop it.
+    fs::create_dir(album.join(".ignored")).expect("hidden directory beyond the depth limit");
+    fs::write(album.join("z.wav"), b"visible").expect("visible media");
+
+    let mut config = Config::default();
+    config.scan.max_depth = 2;
+    config.validate().expect("valid depth limit");
+    let mut reader = FakeMetadata::default();
+    let index = scan(&root, &config, &mut reader);
+
+    assert!(index.complete, "{:?}", index.warnings);
+    assert!(
+        index
+            .entries
+            .iter()
+            .any(|entry| entry.display_path == Path::new("library/Album/z.wav"))
     );
 }
 
@@ -826,7 +899,7 @@ fn scan_counters_stop_at_limit_and_report_limit_plus_one() {
             !index.complete,
             "limit-plus-one scan must be visibly partial"
         );
-        assert!(index.counters.open_files_high_water <= config.runtime.max_open_files);
+        assert_within_limits(&index, &config);
     }
 }
 
@@ -871,10 +944,9 @@ fn retained_counters_accept_the_exact_limit_and_refuse_one_more() {
             tags: tags.clone(),
             attempts: 0,
         };
-        assert!(
-            !scan(&root, &config, &mut reader).complete,
-            "{name} limit plus one must be partial"
-        );
+        let partial = scan(&root, &config, &mut reader);
+        assert!(!partial.complete, "{name} limit plus one must be partial");
+        assert_within_limits(&partial, &config);
     }
 }
 

@@ -906,13 +906,7 @@ fn duration_micros(duration: Duration) -> u64 {
 }
 
 fn bounded_error(message: &str) -> String {
-    let mut bounded = String::new();
-    for character in message.chars() {
-        if bounded.len().saturating_add(character.len_utf8()) > MAX_ERROR_BYTES {
-            break;
-        }
-        bounded.push(character);
-    }
+    let bounded = crate::display::bounded_text(message, MAX_ERROR_BYTES);
     if bounded.is_empty() {
         "decoder failed".into()
     } else {

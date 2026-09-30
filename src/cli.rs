@@ -55,11 +55,18 @@ pub fn command() -> Command {
 
 /// Runs the process arguments and returns an application result.
 ///
+/// `current_dir` is resolved only by commands that discover a root from it, so
+/// helpers keep working after a session's working directory is deleted.
+///
 /// # Errors
 ///
-/// Returns a typed error when arguments, root selection, initialization,
-/// configuration, scanning, or helper execution fails.
-pub fn run_from<I, T>(arguments: I, current_dir: &Path) -> AppResult<()>
+/// Returns a typed error when arguments, the working directory, root
+/// selection, initialization, configuration, scanning, or helper execution
+/// fails.
+pub fn run_from<I, T>(
+    arguments: I,
+    current_dir: impl FnOnce() -> std::io::Result<PathBuf>,
+) -> AppResult<()>
 where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
@@ -121,8 +128,14 @@ where
             println!("then run `suzumushi --root <ROOT>` using the initialized path");
             Ok(())
         }
-        Some(("diagnose", _)) => diagnose(explicit.as_deref(), current_dir),
-        None => terminal_session(explicit.as_deref(), current_dir),
+        Some(("diagnose", _)) => diagnose(
+            explicit.as_deref(),
+            &current_dir().map_err(AppError::CurrentDirectory)?,
+        ),
+        None => terminal_session(
+            explicit.as_deref(),
+            &current_dir().map_err(AppError::CurrentDirectory)?,
+        ),
         Some((name, _)) => Err(AppError::InvalidArguments(format!(
             "unsupported command {name}"
         ))),

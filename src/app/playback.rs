@@ -8,6 +8,19 @@ use super::{AppState, PlaybackIntent, PlaybackStatus, QueueItem, RepeatMode};
 use crate::audio::{AudioEvent, AudioFormat, AudioPosition, AudioSpectrum, PlaybackSettings};
 use crate::display::terminal_safe;
 
+/// The playback mode most recently requested of the worker.
+///
+/// Worker acknowledgements update `PlaybackState::status` in command order, so
+/// the acknowledged status lags behind requests still in flight. Controls
+/// consult the request instead, so a newer command is never discarded merely
+/// because an older one has not been acknowledged yet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PlaybackRequest {
+    Play,
+    Pause,
+    Stop,
+}
+
 #[derive(Debug)]
 pub(super) struct PlaybackState {
     pub(super) generation: u64,
@@ -20,7 +33,7 @@ pub(super) struct PlaybackState {
     pub(super) format: Option<AudioFormat>,
     pub(super) position: Duration,
     pub(super) duration: Option<Duration>,
-    pub(super) start_paused: bool,
+    pub(super) request: PlaybackRequest,
     pub(super) finished: bool,
     pub(super) spectrum: AudioSpectrum,
 }
@@ -38,7 +51,7 @@ impl PlaybackState {
             format: None,
             position: Duration::ZERO,
             duration: None,
-            start_paused: false,
+            request: PlaybackRequest::Play,
             finished: false,
             spectrum: AudioSpectrum::silent(),
         }
@@ -68,7 +81,11 @@ impl PlaybackState {
             .ok_or("Playback generation exhausted")?;
         self.select(item, index, position, generation);
         self.status = PlaybackStatus::Loading;
-        self.start_paused = paused;
+        self.request = if paused {
+            PlaybackRequest::Pause
+        } else {
+            PlaybackRequest::Play
+        };
         Ok(generation)
     }
 
@@ -142,7 +159,7 @@ impl AppState {
                 position,
                 ..
             } => {
-                let status = if self.playback.start_paused {
+                let status = if self.playback.request == PlaybackRequest::Pause {
                     PlaybackStatus::Paused
                 } else {
                     PlaybackStatus::Playing
@@ -158,6 +175,13 @@ impl AppState {
                 } else {
                     "Playing"
                 });
+                None
+            }
+            // Before Started, the worker only records the mode it will start in;
+            // Started then reports the requested mode.
+            AudioEvent::Paused { .. } | AudioEvent::Resumed { .. }
+                if self.playback.status == PlaybackStatus::Loading =>
+            {
                 None
             }
             AudioEvent::Paused { .. } => {
@@ -213,27 +237,56 @@ impl AppState {
         }
     }
 
+    /// Returns the status playback will reach once every command already sent
+    /// to the worker is acknowledged.
+    pub(super) fn requested_status(&self) -> PlaybackStatus {
+        if !self.worker_has_track() {
+            return self.playback.status;
+        }
+        match self.playback.request {
+            PlaybackRequest::Play => PlaybackStatus::Playing,
+            PlaybackRequest::Pause => PlaybackStatus::Paused,
+            PlaybackRequest::Stop => PlaybackStatus::Stopped,
+        }
+    }
+
+    fn request_pause(&mut self) -> PlaybackIntent {
+        self.playback.request = PlaybackRequest::Pause;
+        PlaybackIntent::Pause {
+            generation: self.playback.generation,
+        }
+    }
+
+    fn request_resume(&mut self) -> PlaybackIntent {
+        self.playback.request = PlaybackRequest::Play;
+        PlaybackIntent::Resume {
+            generation: self.playback.generation,
+        }
+    }
+
+    fn request_stop(&mut self) -> PlaybackIntent {
+        self.playback.request = PlaybackRequest::Stop;
+        PlaybackIntent::Stop {
+            generation: self.playback.generation,
+        }
+    }
+
     pub(super) fn play_pause(&mut self) -> Option<PlaybackIntent> {
-        match self.playback.status {
-            PlaybackStatus::Playing => Some(PlaybackIntent::Pause {
-                generation: self.playback.generation,
-            }),
-            PlaybackStatus::Paused => Some(PlaybackIntent::Resume {
-                generation: self.playback.generation,
-            }),
-            PlaybackStatus::Loading => {
-                self.set_status("Track is still loading");
-                None
-            }
-            PlaybackStatus::Stopped | PlaybackStatus::Error => {
+        match self.requested_status() {
+            PlaybackStatus::Playing => Some(self.request_pause()),
+            PlaybackStatus::Paused => Some(self.request_resume()),
+            PlaybackStatus::Loading | PlaybackStatus::Stopped | PlaybackStatus::Error => {
                 if self.queue.items().is_empty() {
                     self.set_status("Queue a track before starting playback");
                     None
                 } else {
                     let index = self.queue.selection.min(self.queue.items().len() - 1);
+                    // A requested stop rewinds, even before the worker acknowledges it.
                     let position = self
                         .current_queue_index()
-                        .filter(|current| *current == index)
+                        .filter(|current| {
+                            *current == index && self.playback.request != PlaybackRequest::Stop
+                        })
                         .map_or(Duration::ZERO, |_| self.playback.resume_position());
                     self.start_new_shuffle_round_at(index, position)
                 }
@@ -242,24 +295,24 @@ impl AppState {
     }
 
     pub(super) fn play(&mut self) -> Option<PlaybackIntent> {
-        match self.playback.status {
-            PlaybackStatus::Paused => Some(PlaybackIntent::Resume {
-                generation: self.playback.generation,
-            }),
+        match self.requested_status() {
+            PlaybackStatus::Paused => Some(self.request_resume()),
             PlaybackStatus::Stopped | PlaybackStatus::Error => self.play_pause(),
             PlaybackStatus::Loading | PlaybackStatus::Playing => None,
         }
     }
 
-    pub(super) fn pause(&self) -> Option<PlaybackIntent> {
-        (self.playback.status == PlaybackStatus::Playing).then_some(PlaybackIntent::Pause {
-            generation: self.playback.generation,
-        })
+    pub(super) fn pause(&mut self) -> Option<PlaybackIntent> {
+        if self.requested_status() == PlaybackStatus::Playing {
+            Some(self.request_pause())
+        } else {
+            None
+        }
     }
 
     pub(super) fn stop_playback(&mut self) -> Option<PlaybackIntent> {
         if self.playback.current.is_none()
-            || matches!(self.playback.status, PlaybackStatus::Stopped)
+            || matches!(self.requested_status(), PlaybackStatus::Stopped)
         {
             self.set_status("Nothing is playing");
             return None;
@@ -271,9 +324,7 @@ impl AppState {
             self.set_status("Stopped");
             return None;
         }
-        Some(PlaybackIntent::Stop {
-            generation: self.playback.generation,
-        })
+        Some(self.request_stop())
     }
 
     pub(super) fn next_track(&mut self) -> Option<PlaybackIntent> {
@@ -282,25 +333,18 @@ impl AppState {
         }
         if let Some(next) = self.next_queue_index(self.repeat == RepeatMode::All) {
             self.queue.selection = next;
-            match self.playback.status {
-                PlaybackStatus::Paused => self.start_queue_index_paused(next),
-                PlaybackStatus::Stopped | PlaybackStatus::Error => {
-                    self.select_stopped_queue_index(next);
-                    None
-                }
-                PlaybackStatus::Loading | PlaybackStatus::Playing => self.start_queue_index(next),
-            }
+            self.navigate_to(next)
         } else if matches!(
-            self.playback.status,
-            PlaybackStatus::Loading | PlaybackStatus::Playing | PlaybackStatus::Paused
+            self.requested_status(),
+            PlaybackStatus::Playing | PlaybackStatus::Paused
         ) {
             self.set_status("End of queue");
-            Some(PlaybackIntent::Stop {
-                generation: self.playback.generation,
-            })
+            Some(self.request_stop())
         } else {
-            self.playback.status = PlaybackStatus::Stopped;
-            self.playback.format = None;
+            if !self.worker_has_track() {
+                self.playback.status = PlaybackStatus::Stopped;
+                self.playback.format = None;
+            }
             self.set_status("End of queue");
             None
         }
@@ -310,24 +354,46 @@ impl AppState {
         if self.queue.items().is_empty() {
             return self.stop_playback();
         }
-        let current = self.current_queue_index().unwrap_or(self.queue.selection);
+        let current = self.current_queue_index().unwrap_or_else(|| {
+            if self.playback.current.is_some() {
+                self.playback.position_hint
+            } else {
+                self.queue.selection
+            }
+        });
         let previous = self
             .previous_queue_index(self.repeat == RepeatMode::All)
             .unwrap_or(current)
             .min(self.queue.items().len() - 1);
         self.queue.selection = previous;
-        match self.playback.status {
-            PlaybackStatus::Paused => self.start_queue_index_paused(previous),
+        self.navigate_to(previous)
+    }
+
+    /// Moves to a queue index while keeping the requested playback mode.
+    fn navigate_to(&mut self, index: usize) -> Option<PlaybackIntent> {
+        match self.requested_status() {
+            PlaybackStatus::Paused => self.start_queue_index_paused(index),
             PlaybackStatus::Stopped | PlaybackStatus::Error => {
-                self.select_stopped_queue_index(previous);
+                self.select_stopped_queue_index(index);
                 None
             }
-            PlaybackStatus::Loading | PlaybackStatus::Playing => self.start_queue_index(previous),
+            PlaybackStatus::Loading | PlaybackStatus::Playing => self.start_queue_index(index),
         }
     }
 
     pub(super) fn advance_after_finish(&mut self) -> Option<PlaybackIntent> {
-        let paused = self.playback.status == PlaybackStatus::Paused;
+        let paused = match self.requested_status() {
+            PlaybackStatus::Paused => true,
+            PlaybackStatus::Stopped => {
+                // The track ended before a requested stop reached the worker.
+                self.playback.status = PlaybackStatus::Stopped;
+                self.playback.format = None;
+                self.playback.position = Duration::ZERO;
+                self.set_status("Stopped");
+                return None;
+            }
+            PlaybackStatus::Loading | PlaybackStatus::Playing | PlaybackStatus::Error => false,
+        };
         if self.repeat == RepeatMode::One
             && let Some(current) = self.current_queue_index()
         {

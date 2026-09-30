@@ -8,6 +8,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::os::unix::net::UnixListener;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child as ProcessChild, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -17,7 +18,7 @@ use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::inotify;
 use rustix::fs::{CWD, Mode, OFlags, mkfifoat};
 use rustix::process::{PidfdFlags, pidfd_open};
-use rustix::process::{Signal, kill_process};
+use rustix::process::{Signal, kill_process, kill_process_group};
 use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
 use rustix::termios::{Pid, Winsize, tcsetwinsize};
 use tempfile::TempDir;
@@ -42,15 +43,6 @@ impl std::ops::Deref for Child {
 impl std::ops::DerefMut for Child {
     fn deref_mut(&mut self) -> &mut ProcessChild {
         self.process.as_mut().expect("owned test child")
-    }
-}
-
-impl Child {
-    fn wait_with_output(mut self) -> std::io::Result<Output> {
-        self.process
-            .take()
-            .expect("owned test child")
-            .wait_with_output()
     }
 }
 
@@ -101,10 +93,7 @@ fn wait_readable(fd: impl AsFd, deadline: Instant) {
 
 #[test]
 fn help_succeeds_and_names_the_canonical_command() {
-    let output = Command::new(env!("CARGO_BIN_EXE_suzumushi"))
-        .arg("--help")
-        .output()
-        .expect("the suzumushi binary should start");
+    let output = output_with_timeout(Command::new(env!("CARGO_BIN_EXE_suzumushi")).arg("--help"));
 
     assert!(
         output.status.success(),
@@ -131,10 +120,8 @@ fn help_succeeds_and_names_the_canonical_command() {
 
 #[test]
 fn version_succeeds_without_selecting_a_root() {
-    let output = Command::new(env!("CARGO_BIN_EXE_suzumushi"))
-        .arg("--version")
-        .output()
-        .expect("the installed command should report its version");
+    let output =
+        output_with_timeout(Command::new(env!("CARGO_BIN_EXE_suzumushi")).arg("--version"));
 
     assert!(output.status.success());
     assert_eq!(
@@ -147,11 +134,10 @@ fn version_succeeds_without_selecting_a_root() {
 #[test]
 fn internal_audio_helper_decodes_only_its_inherited_descriptor() {
     let fixture = File::open("tests/fixtures/audio/tone.flac").expect("open audio fixture");
-    let output = Command::new(env!("CARGO_BIN_EXE_suzumushi"))
-        .arg("__audio-decode-helper")
-        .stdin(Stdio::from(fixture))
-        .output()
-        .expect("run internal audio helper");
+    let output = output_with_input(
+        Command::new(env!("CARGO_BIN_EXE_suzumushi")).arg("__audio-decode-helper"),
+        Stdio::from(fixture),
+    );
 
     assert!(output.status.success(), "helper status: {}", output.status);
     assert!(output.stderr.is_empty());
@@ -169,13 +155,53 @@ fn internal_audio_helper_decodes_only_its_inherited_descriptor() {
 }
 
 #[test]
+fn helpers_do_not_need_the_working_directory() {
+    let temp = TempDir::new().expect("temporary directory");
+    let working = temp.path().join("deleted");
+    fs::create_dir(&working).expect("working directory");
+    let fixture = File::open("tests/fixtures/audio/tone.flac").expect("open audio fixture");
+
+    // A session whose working directory was deleted still restarts decoders.
+    let output = output_with_input(
+        Command::new("sh").args([
+            OsStr::new("-c"),
+            OsStr::new(r#"cd "$0" && rmdir "$0" && exec "$1" __audio-decode-helper"#),
+            working.as_os_str(),
+            OsStr::new(env!("CARGO_BIN_EXE_suzumushi")),
+        ]),
+        Stdio::from(fixture),
+    );
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!working.exists());
+    assert!(output.stdout.starts_with(b"SUZPCM02"));
+    assert_eq!(&output.stdout[output.stdout.len() - 4..], &[0, 0, 0, 0]);
+}
+
+#[test]
+fn command_deadline_covers_descendants_holding_its_output() {
+    let started = Instant::now();
+    // The shell exits at once, but its background child keeps both pipes open.
+    let result = std::panic::catch_unwind(|| {
+        output_with_timeout(Command::new("sh").args(["-c", "sleep 30 & exit 0"]))
+    });
+
+    assert!(result.is_err(), "a held output pipe must fail the deadline");
+    assert!(started.elapsed() < Duration::from_secs(10));
+}
+
+#[test]
 fn bare_command_requires_a_selected_root() {
     let temp = TempDir::new().expect("temporary directory");
-    let output = Command::new(env!("CARGO_BIN_EXE_suzumushi"))
-        .current_dir(temp.path())
-        .env_remove("SUZUMUSHI_ROOT")
-        .output()
-        .expect("the binary should start");
+    let output = output_with_timeout(
+        Command::new(env!("CARGO_BIN_EXE_suzumushi"))
+            .current_dir(temp.path())
+            .env_remove("SUZUMUSHI_ROOT"),
+    );
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8(output.stderr).expect("UTF-8 error");
@@ -253,9 +279,7 @@ fn terminal_session_restores_the_pty_and_holds_both_leases() {
     transcript.extend(read_pty_until(&mut master, &mut child, FOCUSED_PLAYER));
     assert!(byte_contains(&transcript, "·".as_bytes()));
 
-    let second = terminal_command(&root, &runtime)
-        .output()
-        .expect("run competing terminal session");
+    let second = output_with_timeout(&mut terminal_command(&root, &runtime));
     assert!(!second.status.success());
     let conflict = String::from_utf8(second.stderr).expect("UTF-8 lock error");
     assert!(
@@ -431,12 +455,12 @@ fn terminal_reopens_the_last_queue_without_autoplay() {
             .windows(b"Night Song".len())
             .any(|bytes| bytes == b"Night Song")
     );
-    let diagnosis = Command::new(env!("CARGO_BIN_EXE_suzumushi"))
-        .arg("--root")
-        .arg(&root)
-        .arg("diagnose")
-        .output()
-        .expect("diagnose cached root");
+    let diagnosis = output_with_timeout(
+        Command::new(env!("CARGO_BIN_EXE_suzumushi"))
+            .arg("--root")
+            .arg(&root)
+            .arg("diagnose"),
+    );
     assert!(diagnosis.status.success());
     assert_eq!(
         fs::read(&cache_path).expect("cache remains"),
@@ -652,9 +676,7 @@ fn terminal_startup_reserves_its_open_file_peak_before_opening() {
     fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))
         .expect("make runtime directory private");
 
-    let output = terminal_command(&root, &runtime)
-        .output()
-        .expect("run terminal startup preflight");
+    let output = output_with_timeout(&mut terminal_command(&root, &runtime));
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).expect("UTF-8 resource error");
     assert!(stderr.contains("runtime.max_open_files"), "{stderr}");
@@ -671,10 +693,7 @@ fn terminal_startup_reserves_its_open_file_peak_before_opening() {
 
 #[test]
 fn invalid_arguments_have_one_clean_error_prefix() {
-    let output = Command::new(env!("CARGO_BIN_EXE_suzumushi"))
-        .arg("init")
-        .output()
-        .expect("the binary should reject incomplete arguments");
+    let output = output_with_timeout(Command::new(env!("CARGO_BIN_EXE_suzumushi")).arg("init"));
 
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
@@ -689,13 +708,13 @@ fn invalid_arguments_have_one_clean_error_prefix() {
     assert!(stderr.ends_with('\n'));
 
     let temp = TempDir::new().expect("temporary directory");
-    let output = Command::new(env!("CARGO_BIN_EXE_suzumushi"))
-        .arg("--root")
-        .arg(temp.path())
-        .arg("init")
-        .arg(temp.path().join("root"))
-        .output()
-        .expect("the binary should reject init combined with --root");
+    let output = output_with_timeout(
+        Command::new(env!("CARGO_BIN_EXE_suzumushi"))
+            .arg("--root")
+            .arg(temp.path())
+            .arg("init")
+            .arg(temp.path().join("root")),
+    );
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8(output.stderr).expect("argument error should be valid UTF-8");
     assert!(
@@ -712,10 +731,10 @@ fn invalid_arguments_have_one_clean_error_prefix() {
 fn init_and_diagnose_work_through_the_real_executable() {
     let temp = TempDir::new().expect("temporary directory");
     let root = temp.path().join("root");
-    let init = Command::new(env!("CARGO_BIN_EXE_suzumushi"))
-        .args(["init", root.to_str().expect("UTF-8 fixture path")])
-        .output()
-        .expect("run init");
+    let init = output_with_timeout(
+        Command::new(env!("CARGO_BIN_EXE_suzumushi"))
+            .args(["init", root.to_str().expect("UTF-8 fixture path")]),
+    );
     assert!(
         init.status.success(),
         "{}",
@@ -744,14 +763,11 @@ fn init_and_diagnose_work_through_the_real_executable() {
     )
     .expect("create broken symlink");
 
-    let diagnose = Command::new(env!("CARGO_BIN_EXE_suzumushi"))
-        .args([
-            "diagnose",
-            "--root",
-            root.to_str().expect("UTF-8 fixture path"),
-        ])
-        .output()
-        .expect("run diagnose");
+    let diagnose = output_with_timeout(Command::new(env!("CARGO_BIN_EXE_suzumushi")).args([
+        "diagnose",
+        "--root",
+        root.to_str().expect("UTF-8 fixture path"),
+    ]));
     assert!(
         diagnose.status.success(),
         "{}",
@@ -818,12 +834,12 @@ fn helpers_still_start_after_the_installed_executable_is_replaced() {
 #[test]
 fn missing_root_reports_how_to_initialize_it() {
     let temp = TempDir::new().expect("temporary directory");
-    let output = Command::new(env!("CARGO_BIN_EXE_suzumushi"))
-        .arg("diagnose")
-        .current_dir(temp.path())
-        .env_remove("SUZUMUSHI_ROOT")
-        .output()
-        .expect("run diagnose");
+    let output = output_with_timeout(
+        Command::new(env!("CARGO_BIN_EXE_suzumushi"))
+            .arg("diagnose")
+            .current_dir(temp.path())
+            .env_remove("SUZUMUSHI_ROOT"),
+    );
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).expect("UTF-8 error");
     assert!(stderr.contains("suzumushi init ./suzumushi"));
@@ -833,21 +849,21 @@ fn missing_root_reports_how_to_initialize_it() {
 fn diagnostics_never_emit_raw_terminal_escape_bytes() {
     let temp = TempDir::new().expect("temporary directory");
     let root = temp.path().join("root");
-    let init = Command::new(env!("CARGO_BIN_EXE_suzumushi"))
-        .arg("init")
-        .arg(&root)
-        .output()
-        .expect("run init");
+    let init = output_with_timeout(
+        Command::new(env!("CARGO_BIN_EXE_suzumushi"))
+            .arg("init")
+            .arg(&root),
+    );
     assert!(init.status.success());
     fs::write(root.join("audio/library/bad\u{1b}[31m.mp3"), b"not media")
         .expect("write hostile filename fixture");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_suzumushi"))
-        .arg("diagnose")
-        .arg("--root")
-        .arg(&root)
-        .output()
-        .expect("run diagnose");
+    let output = output_with_timeout(
+        Command::new(env!("CARGO_BIN_EXE_suzumushi"))
+            .arg("diagnose")
+            .arg("--root")
+            .arg(&root),
+    );
     assert!(output.status.success());
     assert!(!output.stdout.contains(&0x1b));
     assert!(!output.stderr.contains(&0x1b));
@@ -857,23 +873,23 @@ fn diagnostics_never_emit_raw_terminal_escape_bytes() {
 fn native_linux_paths_do_not_require_utf8() {
     let temp = TempDir::new().expect("temporary directory");
     let root = temp.path().join(OsString::from_vec(b"root-\xff".to_vec()));
-    let init = Command::new(env!("CARGO_BIN_EXE_suzumushi"))
-        .arg("init")
-        .arg(&root)
-        .output()
-        .expect("run init");
+    let init = output_with_timeout(
+        Command::new(env!("CARGO_BIN_EXE_suzumushi"))
+            .arg("init")
+            .arg(&root),
+    );
     assert!(
         init.status.success(),
         "{}",
         String::from_utf8_lossy(&init.stderr)
     );
 
-    let diagnose = Command::new(env!("CARGO_BIN_EXE_suzumushi"))
-        .arg("diagnose")
-        .arg("--root")
-        .arg(&root)
-        .output()
-        .expect("run diagnose");
+    let diagnose = output_with_timeout(
+        Command::new(env!("CARGO_BIN_EXE_suzumushi"))
+            .arg("diagnose")
+            .arg("--root")
+            .arg(&root),
+    );
     assert!(
         diagnose.status.success(),
         "{}",
@@ -886,11 +902,11 @@ fn native_linux_paths_do_not_require_utf8() {
 fn fifo_media_targets_never_wait_for_a_writer() {
     let temp = TempDir::new().expect("temporary directory");
     let root = temp.path().join("root");
-    let init = Command::new(env!("CARGO_BIN_EXE_suzumushi"))
-        .arg("init")
-        .arg(&root)
-        .output()
-        .expect("run init");
+    let init = output_with_timeout(
+        Command::new(env!("CARGO_BIN_EXE_suzumushi"))
+            .arg("init")
+            .arg(&root),
+    );
     assert!(init.status.success());
 
     let fifo = temp.path().join("media.fifo");
@@ -916,11 +932,11 @@ fn fifo_media_targets_never_wait_for_a_writer() {
 fn fifo_config_never_waits_for_a_writer() {
     let temp = TempDir::new().expect("temporary directory");
     let root = temp.path().join("root");
-    let init = Command::new(env!("CARGO_BIN_EXE_suzumushi"))
-        .arg("init")
-        .arg(&root)
-        .output()
-        .expect("run init");
+    let init = output_with_timeout(
+        Command::new(env!("CARGO_BIN_EXE_suzumushi"))
+            .arg("init")
+            .arg(&root),
+    );
     assert!(init.status.success());
 
     fs::remove_file(root.join("config.toml")).expect("remove regular config");
@@ -942,11 +958,11 @@ fn fifo_config_never_waits_for_a_writer() {
 fn fifo_readme_never_blocks_repeated_initialization() {
     let temp = TempDir::new().expect("temporary directory");
     let root = temp.path().join("root");
-    let init = Command::new(env!("CARGO_BIN_EXE_suzumushi"))
-        .arg("init")
-        .arg(&root)
-        .output()
-        .expect("run init");
+    let init = output_with_timeout(
+        Command::new(env!("CARGO_BIN_EXE_suzumushi"))
+            .arg("init")
+            .arg(&root),
+    );
     assert!(init.status.success());
 
     let readme = root.join("audio/playlists/demo/README.txt");
@@ -968,11 +984,11 @@ fn fifo_readme_never_blocks_repeated_initialization() {
 }
 
 fn initialize_root(root: &std::path::Path) {
-    let output = Command::new(env!("CARGO_BIN_EXE_suzumushi"))
-        .arg("init")
-        .arg(root)
-        .output()
-        .expect("initialize terminal fixture");
+    let output = output_with_timeout(
+        Command::new(env!("CARGO_BIN_EXE_suzumushi"))
+            .arg("init")
+            .arg(root),
+    );
     assert!(
         output.status.success(),
         "{}",
@@ -1179,29 +1195,111 @@ fn byte_position(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 fn output_with_timeout(command: &mut Command) -> Output {
+    output_with_input(command, Stdio::null())
+}
+
+/// Runs a command like `Command::output`, but bounds its exit and the
+/// collection of its output by one deadline.
+///
+/// The command runs in its own process group. A descendant that still holds
+/// an output pipe at the deadline is killed with the group and fails the test.
+fn output_with_input(command: &mut Command, stdin: Stdio) -> Output {
     let mut child = command
+        .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .spawn_owned()
         .expect("spawn command");
+    let group = Pid::from_child(&child);
+    let mut stdout = OutputPipe::new(child.stdout.take().expect("piped stdout"));
+    let mut stderr = OutputPipe::new(child.stderr.take().expect("piped stderr"));
     let deadline = Instant::now() + Duration::from_secs(2);
+    let mut status = None;
     loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return child.wait_with_output().expect("collect command output"),
-            Ok(None) if Instant::now() < deadline => wait_readable(&child.exited, deadline),
-            Ok(None) => {
-                child.kill().expect("kill timed-out command");
-                let output = child.wait_with_output().expect("reap timed-out command");
-                panic!(
-                    "command exceeded two seconds\nstdout: {}\nstderr: {}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
+        if status.is_none() {
+            status = child.try_wait().expect("inspect command status");
+        }
+        if status.is_some() && stdout.is_closed() && stderr.is_closed() {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            let _ = kill_process_group(group, Signal::KILL);
+            if status.is_none() {
+                child.wait().expect("reap timed-out command");
             }
-            Err(error) => {
-                child.kill().expect("kill command after wait failure");
-                child.wait().expect("reap command after wait failure");
-                panic!("cannot inspect command status: {error}");
+            panic!(
+                "command or a descendant holding its output exceeded two seconds\n\
+                 exited: {}\nstdout: {}\nstderr: {}",
+                status.is_some(),
+                String::from_utf8_lossy(&stdout.bytes),
+                String::from_utf8_lossy(&stderr.bytes)
+            );
+        }
+        let timeout = Timespec {
+            tv_sec: i64::try_from(remaining.as_secs()).expect("bounded test timeout"),
+            tv_nsec: i64::from(remaining.subsec_nanos()),
+        };
+        let mut ready = Vec::with_capacity(3);
+        if status.is_none() {
+            ready.push(PollFd::new(&child.exited, PollFlags::IN));
+        }
+        for pipe in [&stdout, &stderr] {
+            if let Some(fd) = &pipe.fd {
+                ready.push(PollFd::new(fd, PollFlags::IN));
+            }
+        }
+        match poll(&mut ready, Some(&timeout)) {
+            Ok(_) | Err(rustix::io::Errno::INTR) => {}
+            Err(error) => panic!("wait for command output: {error}"),
+        }
+        drop(ready);
+        stdout.drain();
+        stderr.drain();
+    }
+    Output {
+        status: status.expect("command exited"),
+        stdout: stdout.bytes,
+        stderr: stderr.bytes,
+    }
+}
+
+/// Nonblocking reader for one child output pipe.
+struct OutputPipe {
+    fd: Option<OwnedFd>,
+    bytes: Vec<u8>,
+}
+
+impl OutputPipe {
+    fn new(pipe: impl Into<OwnedFd>) -> Self {
+        let fd = pipe.into();
+        let flags = rustix::fs::fcntl_getfl(&fd).expect("read output pipe flags");
+        rustix::fs::fcntl_setfl(&fd, flags | OFlags::NONBLOCK)
+            .expect("make output pipe nonblocking");
+        Self {
+            fd: Some(fd),
+            bytes: Vec::new(),
+        }
+    }
+
+    const fn is_closed(&self) -> bool {
+        self.fd.is_none()
+    }
+
+    /// Reads everything currently available and closes the pipe at end of file.
+    fn drain(&mut self) {
+        let mut buffer = [0; 8_192];
+        loop {
+            let Some(fd) = &self.fd else {
+                return;
+            };
+            match rustix::io::read(fd, &mut buffer) {
+                Ok(0) => self.fd = None,
+                Ok(read) => self.bytes.extend_from_slice(&buffer[..read]),
+                Err(rustix::io::Errno::AGAIN) => return,
+                Err(rustix::io::Errno::INTR) => {}
+                Err(error) => panic!("read command output: {error}"),
             }
         }
     }

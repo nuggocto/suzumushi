@@ -464,12 +464,14 @@ impl QueueState {
                 .iter()
                 .position(|item| item.instance_id == instance_id);
         }
-        let current = self
-            .current_index(current, position_hint)
-            .unwrap_or(self.selection);
-        current
-            .checked_sub(1)
-            .or_else(|| wrap.then(|| self.items.len() - 1))
+        // A playing item removed from the queue leaves its successor at the
+        // retained hint, so the item before that gap precedes it.
+        let previous = match (current, self.current_index(current, position_hint)) {
+            (_, Some(index)) => index.checked_sub(1),
+            (Some(_), None) => position_hint.min(self.items.len()).checked_sub(1),
+            (None, None) => self.selection.checked_sub(1),
+        };
+        previous.or_else(|| wrap.then(|| self.items.len() - 1))
     }
 
     pub(super) fn current_index(

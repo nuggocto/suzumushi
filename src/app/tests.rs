@@ -145,6 +145,43 @@ fn app_with_two_queued_tracks() -> AppState {
     app
 }
 
+fn app_playing_three_distinct_tracks() -> AppState {
+    let mut app = AppState::new(
+        &Config::default(),
+        fixture_index_with_distinct_context_assets(),
+    )
+    .expect("app state");
+    for entry_index in 0..3 {
+        select_entry(&mut app, entry_index);
+        app.apply(AppAction::Activate);
+    }
+    assert_eq!(app.queue.items().len(), 3);
+    start(&mut app, 1);
+    app
+}
+
+fn start(app: &mut AppState, generation: u64) {
+    app.audio_event(AudioEvent::Started {
+        generation,
+        timeline_revision: 1,
+        format: STEREO_48_KHZ,
+        duration: Some(Duration::from_secs(90)),
+        position: Duration::ZERO,
+    });
+}
+
+fn loaded(intent: Option<PlaybackIntent>) -> (u64, TrackEntryId, bool) {
+    match intent {
+        Some(PlaybackIntent::Load {
+            generation,
+            item,
+            paused,
+            ..
+        }) => (generation, item.entry_id, paused),
+        other => panic!("expected a load, got {other:?}"),
+    }
+}
+
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
@@ -936,6 +973,8 @@ fn next_and_previous_preserve_paused_playback() {
         duration: Some(Duration::from_secs(90)),
         position: Duration::from_secs(20),
     });
+    app.apply(AppAction::Pause)
+        .expect("pause the playing track");
     app.audio_event(AudioEvent::Paused { generation: 1 });
 
     assert!(matches!(
@@ -976,6 +1015,150 @@ fn next_and_previous_preserve_paused_playback() {
 }
 
 #[test]
+fn navigation_while_a_paused_replacement_loads_stays_paused() {
+    let mut app = app_playing_three_distinct_tracks();
+    app.apply(AppAction::Pause).expect("pause the first track");
+    app.audio_event(AudioEvent::Paused { generation: 1 });
+
+    assert_eq!(
+        loaded(app.apply(AppAction::Next)),
+        (2, TrackEntryId(20), true)
+    );
+    assert_eq!(app.playback.status, PlaybackStatus::Loading);
+    assert_eq!(
+        loaded(app.apply(AppAction::Next)),
+        (3, TrackEntryId(40), true),
+        "a second Next before Started keeps the paused mode"
+    );
+    assert_eq!(
+        loaded(app.apply(AppAction::Previous)),
+        (4, TrackEntryId(20), true)
+    );
+    start(&mut app, 4);
+    assert_eq!(app.playback.status, PlaybackStatus::Paused);
+}
+
+#[test]
+fn controls_sent_before_acknowledgement_keep_their_order() {
+    let mut app = app_playing_three_distinct_tracks();
+
+    assert!(matches!(
+        app.apply(AppAction::Pause),
+        Some(PlaybackIntent::Pause { generation: 1 })
+    ));
+    assert!(
+        matches!(
+            app.apply(AppAction::Play),
+            Some(PlaybackIntent::Resume { generation: 1 })
+        ),
+        "Play must not be discarded while Pause is unacknowledged"
+    );
+    assert!(matches!(
+        app.apply(AppAction::PlayPause),
+        Some(PlaybackIntent::Pause { generation: 1 })
+    ));
+    assert!(matches!(
+        app.apply(AppAction::PlayPause),
+        Some(PlaybackIntent::Resume { generation: 1 })
+    ));
+    for event in [
+        AudioEvent::Paused { generation: 1 },
+        AudioEvent::Resumed { generation: 1 },
+        AudioEvent::Paused { generation: 1 },
+        AudioEvent::Resumed { generation: 1 },
+    ] {
+        app.audio_event(event);
+    }
+    assert_eq!(app.playback.status, PlaybackStatus::Playing);
+
+    app.apply(AppAction::Pause).expect("request pause");
+    assert_eq!(
+        loaded(app.apply(AppAction::Next)),
+        (2, TrackEntryId(20), true),
+        "navigation after an unacknowledged Pause stays paused"
+    );
+}
+
+#[test]
+fn play_and_pause_while_loading_choose_the_starting_mode() {
+    let mut app = app_playing_three_distinct_tracks();
+    loaded(app.apply(AppAction::Next));
+
+    assert!(matches!(
+        app.apply(AppAction::Pause),
+        Some(PlaybackIntent::Pause { generation: 2 })
+    ));
+    app.audio_event(AudioEvent::Paused { generation: 2 });
+    assert_eq!(
+        app.playback.status,
+        PlaybackStatus::Loading,
+        "only Started completes a load"
+    );
+    start(&mut app, 2);
+    assert_eq!(app.playback.status, PlaybackStatus::Paused);
+    assert!(matches!(
+        app.apply(AppAction::Play),
+        Some(PlaybackIntent::Resume { generation: 2 })
+    ));
+}
+
+#[test]
+fn stop_sent_before_acknowledgement_is_not_overridden() {
+    let mut app = app_playing_three_distinct_tracks();
+    assert!(matches!(
+        app.apply(AppAction::Stop),
+        Some(PlaybackIntent::Stop { generation: 1 })
+    ));
+    assert!(
+        app.audio_event(AudioEvent::Finished { generation: 1 })
+            .is_none(),
+        "a track ending before the Stop arrives must not advance"
+    );
+    assert_eq!(app.playback.status, PlaybackStatus::Stopped);
+
+    let mut app = app_playing_three_distinct_tracks();
+    app.audio_position(AudioPosition {
+        generation: 1,
+        timeline_revision: 2,
+        position: Duration::from_secs(30),
+        duration: Some(Duration::from_secs(90)),
+    });
+    app.apply(AppAction::Stop).expect("request stop");
+    assert!(matches!(
+        app.apply(AppAction::Play),
+        Some(PlaybackIntent::Load {
+            generation: 2,
+            position: Duration::ZERO,
+            paused: false,
+            ..
+        })
+    ));
+    app.audio_event(AudioEvent::Stopped { generation: 1 });
+    assert_eq!(app.playback.status, PlaybackStatus::Loading);
+}
+
+#[test]
+fn previous_after_removing_the_playing_tail_returns_to_its_predecessor() {
+    let mut app = app_playing_three_distinct_tracks();
+    loaded(app.apply(AppAction::Next));
+    start(&mut app, 2);
+    assert_eq!(
+        loaded(app.apply(AppAction::Next)),
+        (3, TrackEntryId(40), false)
+    );
+    start(&mut app, 3);
+    app.focus = Focus::Queue;
+    app.queue.selection = 2;
+    app.apply(AppAction::QueueRemove);
+    assert_eq!(app.queue.items().len(), 2);
+
+    assert_eq!(
+        loaded(app.apply(AppAction::Previous)),
+        (4, TrackEntryId(20), false)
+    );
+}
+
+#[test]
 fn seeking_to_the_end_preserves_pause_when_advancing_or_repeating() {
     for (repeat, expected_entry) in [
         (RepeatMode::Off, 20),
@@ -998,6 +1181,8 @@ fn seeking_to_the_end_preserves_pause_when_advancing_or_repeating() {
             duration: Some(Duration::from_secs(10)),
             position: Duration::ZERO,
         });
+        app.apply(AppAction::Pause)
+            .expect("pause the playing track");
         app.audio_event(AudioEvent::Paused { generation: 1 });
         let (playback_generation, queue_instance) =
             app.current_track_token().expect("current track");
@@ -1232,7 +1417,11 @@ fn timing_revisions_prevent_cross_lane_position_regressions() {
 
 #[test]
 fn shuffle_is_a_permutation_and_repeat_modes_choose_in_the_app_loop() {
-    let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+    let mut app = AppState::new(
+        &Config::default(),
+        fixture_index_with_distinct_context_assets(),
+    )
+    .expect("app state");
     app.queue.shuffle_seed = 1;
     select_entry(&mut app, 0);
     app.apply(AppAction::Activate);
@@ -1240,6 +1429,8 @@ fn shuffle_is_a_permutation_and_repeat_modes_choose_in_the_app_loop() {
     app.apply(AppAction::Activate);
     select_entry(&mut app, 2);
     app.apply(AppAction::Activate);
+
+    assert_eq!(app.queue.items().len(), 3);
 
     app.apply(AppAction::ToggleShuffle);
     let mut expected: Vec<_> = app

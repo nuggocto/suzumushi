@@ -281,6 +281,11 @@ impl AppState {
     #[cfg(test)]
     pub(crate) fn set_playback_status(&mut self, status: PlaybackStatus) {
         self.playback.status = status;
+        self.playback.request = if status == PlaybackStatus::Paused {
+            playback::PlaybackRequest::Pause
+        } else {
+            playback::PlaybackRequest::Play
+        };
     }
 
     pub(crate) fn queue(&self) -> &[QueueItem] {

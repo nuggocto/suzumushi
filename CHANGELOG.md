@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.7] - 2026-09-30
+
+### Fixed
+
+- Kept play, pause, stop, and navigation requests in order when several arrive
+  before the audio worker acknowledges the previous one. A pause followed
+  quickly by play now resumes, a double play-pause toggle returns to playing,
+  and Next or Previous pressed while a paused track is still loading keeps it
+  paused. Play and pause while a track loads now choose how it starts instead
+  of being refused.
+- Made Previous return to the track before a playing item that was removed
+  from the Queue, instead of following the Queue selection.
+- Stopped an ignored hidden directory beyond `scan.max_depth` from ending the
+  scan early and hiding the visible tracks after it.
+- Kept playback, seeking, and metadata helpers working after the session's
+  working directory is deleted.
+- Reported a muted player's desktop-control volume as 0, and paused playback
+  when a desktop client sets the playback rate to 0, as MPRIS requires.
+
+### Changed
+
+- Removed unused internal state: the active lease's runtime path and the
+  playlist name retained by path classification.
+- Let the metadata fuzz target report parser panics directly, and checked each
+  scan limit against what the scan retains rather than only its completeness.
+- Bounded every CLI test command, including output held open by its
+  descendants, by one deadline, and ran each in its own process group so a
+  timeout cleans up the whole command.
+
 ## [1.1.6] - 2026-09-23
 
 ### Fixed
@@ -333,6 +362,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Resolved invalid, modified, and double-Space leader sequences to one action without accepting modified chord keys.
 - Bounded both terminal cell buffers before initial allocation and resize, with clean restoration when a reported terminal size exceeds the UI reservation.
 - Required initialization to verify and acquire the root writer lease before repairing an existing root.
-- Reserved the terminal session's five-descriptor startup peak before opening locks or log storage.
+- Reserved the terminal session's six-descriptor startup peak before opening locks or log storage.
 - Disabled embedded cover-art parsing during text-only metadata scans.
 - Kept the selected root descriptor and filesystem identity pinned across configuration, locking, scanning, and logging for the whole command or terminal session.
