@@ -15,7 +15,7 @@ use std::time::Duration;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 
 use super::palette::{self, ColorDepth, FIREFLY, MOON, STAR};
 use crate::app::{ColorMode, PlaybackStatus};
@@ -733,48 +733,47 @@ fn moon_center(progress: Option<f32>, width: f32, sky: f32) -> (f32, f32) {
 
 /// Draws lines over the stage from the top of `area`. Each line is centered as
 /// a paragraph line would be, and its silhouette, widened by `margin` cells on
-/// each side, hides the stage behind it.
+/// each side, hides the stage behind it. Positions are display cells, so wide
+/// and combining characters land exactly where a paragraph would put them.
 fn draw_overlay(buffer: &mut Buffer, area: Rect, lines: &[Line<'static>], margin: u16) {
+    let right = area.x + area.width;
     for (row, line) in (area.y..area.y + area.height).zip(lines) {
-        let width = u16::try_from(line.width()).unwrap_or(u16::MAX);
+        let width = to_u16(line.width());
         // Match paragraph centering exactly, so the art keeps its alignment.
         let start = area.x + (area.width / 2).saturating_sub(width / 2);
-        let glyphs = line
-            .spans
-            .iter()
-            .flat_map(|span| span.content.chars().map(move |glyph| (glyph, span.style)));
-        let first = glyphs.clone().position(|(glyph, _)| glyph != ' ');
-        let last = glyphs
-            .clone()
-            .enumerate()
-            .filter(|(_, (glyph, _))| *glyph != ' ')
-            .map(|(offset, _)| offset)
-            .last();
-        let (Some(first), Some(last)) = (first, last) else {
+        let mut offset = 0_u16;
+        let mut inked: Option<(u16, u16)> = None;
+        for grapheme in line.styled_graphemes(Style::default()) {
+            let cells = to_u16(Span::raw(grapheme.symbol).width());
+            if grapheme.symbol != " " {
+                let first = inked.map_or(offset, |(first, _)| first);
+                inked = Some((first, offset + cells));
+            }
+            offset = offset.saturating_add(cells);
+        }
+        let Some((first, end)) = inked else {
             continue;
         };
         let masked = start
-            .saturating_add(to_u16(first))
+            .saturating_add(first)
             .saturating_sub(margin)
             .max(area.x)
-            ..start
-                .saturating_add(to_u16(last) + 1 + margin)
-                .min(area.x + area.width);
+            ..start.saturating_add(end).saturating_add(margin).min(right);
         for x in masked {
             if let Some(cell) = buffer.cell_mut((x, row)) {
                 cell.reset();
             }
         }
-        for (offset, (glyph, style)) in glyphs.enumerate().take(last + 1).skip(first) {
-            let x = start.saturating_add(to_u16(offset));
-            if x >= area.x + area.width {
+        let mut x = start;
+        for grapheme in line.styled_graphemes(Style::default()) {
+            let cells = to_u16(Span::raw(grapheme.symbol).width());
+            if x.saturating_add(cells) > right {
                 break;
             }
-            if glyph != ' '
-                && let Some(cell) = buffer.cell_mut((x, row))
-            {
-                cell.set_char(glyph).set_style(style);
+            if grapheme.symbol != " " {
+                buffer.set_stringn(x, row, grapheme.symbol, usize::from(cells), grapheme.style);
             }
+            x = x.saturating_add(cells);
         }
     }
 }
@@ -859,7 +858,7 @@ mod tests {
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
     use ratatui::style::Color;
-    use ratatui::text::Line;
+    use ratatui::text::{Line, Span};
 
     use super::{
         BandMotion, ColorDepth, DRIFT_FRAME, FAST_FRAME, Field, Flight, IDLE_FRAME, MAX_BALL,
@@ -1221,5 +1220,30 @@ mod tests {
             .filter(|band| stage.light_at(*band, field, 4.0).0.y > meadow_top)
             .count();
         assert!(above > 4, "fireflies drift above the meadow: {above}");
+    }
+
+    #[test]
+    fn wide_and_combining_titles_keep_every_character() {
+        for title in ["東京夜", "Cafe\u{301} au lait", "🦗 night"] {
+            let line = [Line::raw(title)];
+            let area = Rect::new(0, 0, 44, 30);
+            let mut stage = Stage::new(ColorDepth::TrueColor);
+            let mut buffer = Buffer::empty(area);
+            let mut stage_frame = frame(PlaybackStatus::Playing, 180, ColorMode::Terminal, &[]);
+            stage_frame.title = &line;
+            stage.render(&mut buffer, area, &stage_frame, Duration::ZERO);
+
+            let title_row = area.height - 16 - 1;
+            // Read the row as a terminal shows it: a wide symbol covers the
+            // cell after it.
+            let mut shown = String::new();
+            let mut x = 0;
+            while x < area.width {
+                let symbol = buffer[(x, title_row)].symbol();
+                shown.push_str(symbol);
+                x += u16::try_from(Span::raw(symbol).width().max(1)).expect("narrow cell");
+            }
+            assert!(shown.contains(title), "{title:?} rendered as {shown:?}");
+        }
     }
 }

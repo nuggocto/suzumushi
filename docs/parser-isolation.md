@@ -41,8 +41,8 @@ code hang.
   output device must support the source sample rate. No hidden resampler or
   second fallback pipeline exists.
 - The output ring is fixed at 262,144 samples. The callback pops samples,
-  applies one atomic gain, writes silence on underrun, converts sample types,
-  updates the fixed 16-band spectrum analyzer, and publishes atomic state. It
+  glides toward the latest volume, writes silence on underrun, converts sample types,
+  updates the fixed 32-band spectrum analyzer, and publishes atomic state. It
   does not allocate, block, log, take a lock, or send a message.
 - A callback playback gate keeps new and paused streams from consuming PCM,
   even when a backend starts callbacks before `play` is called. After the ring

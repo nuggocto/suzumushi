@@ -76,6 +76,10 @@ impl OutputProgress {
 struct Fade {
     step: u16,
     length: u16,
+    /// The volume gain applied to the last frame. Volume and mute changes glide
+    /// toward their target over one ramp length instead of cutting at once; a
+    /// new stream starts at its target, since the fade-in already covers it.
+    volume: Option<f32>,
 }
 
 impl Fade {
@@ -84,13 +88,18 @@ impl Fade {
         Self {
             step: 0,
             length: u16::try_from(length).unwrap_or(u16::MAX).max(1),
+            volume: None,
         }
     }
 
     /// A one-frame ramp that is already fully audible, so exact PCM passes through.
     #[cfg(test)]
     const fn instant() -> Self {
-        Self { step: 1, length: 1 }
+        Self {
+            step: 1,
+            length: 1,
+            volume: None,
+        }
     }
 
     const fn is_silent(&self) -> bool {
@@ -106,6 +115,16 @@ impl Fade {
         };
         let progress = f32::from(self.step) / f32::from(self.length);
         progress * progress * 2.0_f32.mul_add(-progress, 3.0)
+    }
+
+    /// Moves the volume one frame toward `target` and returns that frame's gain.
+    fn volume_toward(&mut self, target: f32) -> f32 {
+        let limit = 1.0 / f32::from(self.length);
+        let volume = self.volume.map_or(target, |current| {
+            current + (target - current).clamp(-limit, limit)
+        });
+        self.volume = Some(volume);
+        volume
     }
 }
 
@@ -153,6 +172,14 @@ impl CpalOutput {
 }
 
 impl CpalOutput {
+    /// Starts per-stream progress afresh, keeping a settling seek's silence
+    /// so a replacement prepared mid-seek cannot become audible.
+    fn renew_progress(&mut self) {
+        let silenced = self.progress.muted.load(Ordering::Acquire);
+        self.progress = Arc::new(OutputProgress::new());
+        self.progress.muted.store(silenced, Ordering::Release);
+    }
+
     fn pause_backend(&mut self) -> Result<(), String> {
         if !self.backend_running {
             return Ok(());
@@ -209,7 +236,7 @@ impl OutputStream for CpalOutput {
         let sample_format = choice.sample_format;
         let config = choice.config;
         let (producer, pcm_reader) = RingBuffer::new(PCM_RING_SAMPLES);
-        self.progress = Arc::new(OutputProgress::new());
+        self.renew_progress();
         self.end_of_stream.store(false, Ordering::Release);
         self.failure.store(0, Ordering::Release);
         self.written = 0;
@@ -547,13 +574,13 @@ where
             frame.fill(T::EQUILIBRIUM);
             continue;
         }
-        let ramp = fade.advance(audible);
+        let ramp = fade.advance(audible) * fade.volume_toward(gain);
         // Silence is a whole hardware frame too. Never resume between channels,
         // even if the producer becomes ready halfway through an underrun.
         if let Ok(chunk) = pcm_reader.read_chunk(channels) {
             let (first, second) = chunk.as_slices();
             for (sample, value) in frame.iter_mut().zip(first.iter().chain(second)) {
-                let value = finite_or_silence(*value * gain * ramp);
+                let value = finite_or_silence(*value * ramp);
                 *sample = T::from_sample(value);
                 if let Some(levels) = analyzer.push_interleaved(value) {
                     published = Some(levels);
@@ -1014,7 +1041,11 @@ mod tests {
         let end_of_stream = AtomicBool::new(true);
         let spectrum = SpectrumLane::default();
         let mut analyzer = super::SpectrumAnalyzer::new(48_000, 2);
-        let mut fade = super::Fade { step: 0, length: 1 };
+        let mut fade = super::Fade {
+            step: 0,
+            length: 1,
+            volume: None,
+        };
         let mut output = [1.0_f32; 4];
 
         render_output(
@@ -1220,6 +1251,86 @@ mod tests {
         assert_eq!(output[0].to_bits(), 0.0_f32.to_bits());
         assert!(progress.playing.load(Ordering::Acquire));
         assert_eq!(progress.consumed.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn muting_glides_to_silence_and_back_while_the_timeline_keeps_moving() {
+        let mut device = CpalOutput::with_metrics(
+            Arc::new(SpectrumLane::default()),
+            Arc::new(AudioMetrics::default()),
+        );
+        let mut consumer = constant_ring(8_192);
+        let progress = playing_progress();
+        let mut fade = super::Fade::new(48_000);
+        fade.step = fade.length;
+        let length = usize::from(fade.length);
+        let metrics = AudioMetrics::default();
+        let end_of_stream = AtomicBool::new(false);
+        let spectrum = SpectrumLane::default();
+        let mut analyzer = super::SpectrumAnalyzer::new(48_000, 1);
+        let mut samples = Vec::new();
+        // Each buffer reads the gain the way the device callback does.
+        let mut render = |device: &CpalOutput, frames: usize, samples: &mut Vec<f32>| {
+            let mut output = vec![0.0_f32; frames];
+            render_output(
+                &mut output,
+                super::RenderContext {
+                    pcm_reader: &mut consumer,
+                    gain: f32::from_bits(device.gain.load(Ordering::Relaxed)),
+                    fade: &mut fade,
+                    analyzer: &mut analyzer,
+                    progress: &progress,
+                    timing: timing(1),
+                    end_of_stream: &end_of_stream,
+                    metrics: &metrics,
+                    spectrum: &spectrum,
+                },
+            );
+            samples.extend(output);
+        };
+
+        device.set_gain(100, false);
+        render(&device, 32, &mut samples);
+        device.set_gain(100, true);
+        render(&device, length * 2, &mut samples);
+        let muted_at = progress.consumed.load(Ordering::Acquire);
+        device.set_gain(100, false);
+        render(&device, length * 2, &mut samples);
+
+        let step_limit = 0.5 / f32::from(fade.length) + 1e-6;
+        let largest = samples
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0]).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(largest <= step_limit, "step {largest} exceeds {step_limit}");
+        assert_eq!(samples[31].to_bits(), 0.5_f32.to_bits());
+        assert_eq!(samples[32 + length * 2 - 1].to_bits(), 0.0_f32.to_bits());
+        assert_eq!(
+            samples.last().map(|sample| sample.to_bits()),
+            Some(0.5_f32.to_bits())
+        );
+        assert!(
+            progress.consumed.load(Ordering::Acquire) > muted_at,
+            "muted audio keeps its place in the track"
+        );
+    }
+
+    #[test]
+    fn preparing_a_stream_keeps_a_settling_seek_silent() {
+        let mut device = CpalOutput::with_metrics(
+            Arc::new(SpectrumLane::default()),
+            Arc::new(AudioMetrics::default()),
+        );
+        device.silence();
+        device.renew_progress();
+        assert!(device.progress.muted.load(Ordering::Acquire));
+
+        let mut fresh = CpalOutput::with_metrics(
+            Arc::new(SpectrumLane::default()),
+            Arc::new(AudioMetrics::default()),
+        );
+        fresh.renew_progress();
+        assert!(!fresh.progress.muted.load(Ordering::Acquire));
     }
 
     #[test]

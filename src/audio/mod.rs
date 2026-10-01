@@ -501,6 +501,10 @@ struct ActivePlayback {
     decoder: Box<dyn DecoderStream>,
     output: Box<dyn OutputStream>,
     info: Option<DecodedInfo>,
+    /// The track's length once any decoder has reported it. Unlike `info`, it
+    /// survives seek restarts, so a seek that arrives before the replacement
+    /// decoder's header still recognizes the end of the track.
+    duration: Option<Duration>,
     settings: PlaybackSettings,
     pending: Option<(Vec<f32>, usize)>,
     started: bool,
@@ -625,6 +629,7 @@ impl<B: Backend> WorkerCore<B> {
                     decoder,
                     output,
                     info: None,
+                    duration: None,
                     settings,
                     pending: None,
                     started: false,
@@ -711,39 +716,17 @@ impl<B: Backend> WorkerCore<B> {
         positions: &PositionLane,
         now: Instant,
     ) {
-        let timing = self
+        if self
             .active
             .as_ref()
-            .filter(|active| active.generation == generation)
-            .map(|active| {
-                (
-                    active.info.and_then(|info| info.duration),
-                    active.timeline_revision,
-                )
-            });
-        let Some((duration, timeline_revision)) = timing else {
+            .is_none_or(|active| active.generation != generation)
+        {
             return;
-        };
-        let position = duration.map_or(position, |duration| position.min(duration));
-        if duration.is_some_and(|duration| position >= duration) {
-            Self::publish_specific_position(
-                positions,
-                generation,
-                timeline_revision,
-                position,
-                duration,
-            );
-            match self.stop_active() {
-                Ok(()) => emit(events, AudioEvent::Finished { generation }),
-                Err(message) => emit(
-                    events,
-                    AudioEvent::Failed {
-                        generation,
-                        message,
-                    },
-                ),
-            }
-        } else if self.pending_seek.is_some()
+        }
+        if self.finish_at_end(generation, position, events, positions) {
+            return;
+        }
+        if self.pending_seek.is_some()
             || self
                 .last_restart
                 .is_some_and(|restart| now.saturating_duration_since(restart) < SEEK_SETTLE)
@@ -761,13 +744,69 @@ impl<B: Backend> WorkerCore<B> {
         }
     }
 
+    /// Completes the track when a seek reaches its known end, as playing to
+    /// the end would; a decoder started there would have nothing to play.
+    fn finish_at_end(
+        &mut self,
+        generation: u64,
+        position: Duration,
+        events: &Sender<AudioEvent>,
+        positions: &PositionLane,
+    ) -> bool {
+        let Some((duration, timeline_revision)) = self
+            .active
+            .as_ref()
+            .filter(|active| active.generation == generation)
+            .and_then(|active| {
+                active
+                    .info
+                    .and_then(|info| info.duration)
+                    .or(active.duration)
+                    .map(|duration| (duration, active.timeline_revision))
+            })
+        else {
+            return false;
+        };
+        if position < duration {
+            return false;
+        }
+        self.pending_seek = None;
+        Self::publish_specific_position(
+            positions,
+            generation,
+            timeline_revision,
+            duration,
+            Some(duration),
+        );
+        match self.stop_active() {
+            Ok(()) => emit(events, AudioEvent::Finished { generation }),
+            Err(message) => emit(
+                events,
+                AudioEvent::Failed {
+                    generation,
+                    message,
+                },
+            ),
+        }
+        true
+    }
+
     /// Applies a held seek once no newer seek has arrived for [`SEEK_SETTLE`].
-    fn settle_seek(&mut self, events: &Sender<AudioEvent>, now: Instant) -> bool {
+    /// The track's length may have become known meanwhile, so the target is
+    /// checked against it again.
+    fn settle_seek(
+        &mut self,
+        events: &Sender<AudioEvent>,
+        positions: &PositionLane,
+        now: Instant,
+    ) -> bool {
         let Some(pending) = self.pending_seek.filter(|pending| now >= pending.due) else {
             return false;
         };
         self.pending_seek = None;
-        self.restart_for_seek(pending.generation, pending.position, events, now);
+        if !self.finish_at_end(pending.generation, pending.position, events, positions) {
+            self.restart_for_seek(pending.generation, pending.position, events, now);
+        }
         true
     }
 
@@ -810,15 +849,16 @@ impl<B: Backend> WorkerCore<B> {
         }
 
         self.publish_position(positions, false);
+        // A settling seek will replace this decoder: feeding it would only
+        // start or finish a timeline that is about to be discarded.
+        if self.pending_seek.is_some() {
+            return false;
+        }
         if self.write_pending(events, generation) {
             return true;
         }
         if self.poll_decoder(events, generation) {
             return true;
-        }
-        // The muted timeline of a settling seek must not finish the track.
-        if self.pending_seek.is_some() {
-            return false;
         }
         self.finish_drained(events, positions, generation)
     }
@@ -896,6 +936,7 @@ impl<B: Backend> WorkerCore<B> {
                 .set_gain(active.settings.volume_percent, active.settings.muted);
             active.base_position = info.position;
             active.last_reported_position = info.position;
+            active.duration = info.duration.or(active.duration);
             active.info = Some(info);
         }
     }
@@ -929,11 +970,36 @@ impl<B: Backend> WorkerCore<B> {
             return false;
         }
         if !active.started {
-            self.fail(
-                events,
-                generation,
-                "track contained no decodable audio samples",
-            );
+            // A restart that decodes nothing was a seek to the very end, which
+            // completes the track; a fresh track with no audio is broken.
+            if matches!(active.start_notice, StartNotice::Seeked) {
+                let duration = active.duration;
+                let position = duration.unwrap_or(active.base_position);
+                let timeline_revision = active.timeline_revision;
+                Self::publish_specific_position(
+                    positions,
+                    generation,
+                    timeline_revision,
+                    position,
+                    duration,
+                );
+                match self.stop_active() {
+                    Ok(()) => emit(events, AudioEvent::Finished { generation }),
+                    Err(message) => emit(
+                        events,
+                        AudioEvent::Failed {
+                            generation,
+                            message,
+                        },
+                    ),
+                }
+            } else {
+                self.fail(
+                    events,
+                    generation,
+                    "track contained no decodable audio samples",
+                );
+            }
             return true;
         }
         if !active.output.drained() {
@@ -992,6 +1058,7 @@ impl<B: Backend> WorkerCore<B> {
             decoder,
             output,
             info: None,
+            duration: old.duration,
             settings: old.settings,
             pending: None,
             started: false,
@@ -1170,7 +1237,7 @@ fn worker_main<B: Backend>(
             );
             continue;
         }
-        if core.settle_seek(events, Instant::now()) {
+        if core.settle_seek(events, positions, Instant::now()) {
             continue;
         }
         if core.drive(events, positions) {
@@ -1860,8 +1927,11 @@ mod tests {
         }
         fixture.drained.store(true, Ordering::Release);
         drive_steps(&mut core, &events, &positions, 4);
-        assert!(!core.settle_seek(&events, at(200)), "a repeat is still due");
-        assert!(core.settle_seek(&events, at(225)));
+        assert!(
+            !core.settle_seek(&events, &positions, at(200)),
+            "a repeat is still due"
+        );
+        assert!(core.settle_seek(&events, &positions, at(225)));
 
         assert_eq!(
             fixture
@@ -1894,8 +1964,156 @@ mod tests {
         core.command(AudioCommand::Stop { generation: 11 }, &events, &positions)
             .expect("stop during a settling seek");
         assert!(
-            !core.settle_seek(&events, at(1_000)),
+            !core.settle_seek(&events, &positions, at(1_000)),
             "stop drops the held seek"
+        );
+    }
+
+    /// Starts a one-second track of generation 11 and drives it to Started.
+    fn started_core(
+        scripts: Vec<VecDeque<DecoderPoll>>,
+    ) -> (
+        WorkerCore<FakeBackend>,
+        FakeFixture,
+        std::sync::mpsc::Sender<AudioEvent>,
+        std::sync::mpsc::Receiver<AudioEvent>,
+        PositionLane,
+    ) {
+        let format = AudioFormat {
+            sample_rate: 48_000,
+            channels: 1,
+        };
+        let (mut backend, fixture) = fixture_backend(VecDeque::from([
+            DecoderPoll::Ready(decoded(format)),
+            DecoderPoll::Samples(vec![0.1; 512]),
+        ]));
+        backend.scripts.extend(scripts);
+        let mut core = WorkerCore::new(backend);
+        let (events, received) = channel();
+        let positions = PositionLane::default();
+        core.command(
+            AudioCommand::Play {
+                generation: 11,
+                file: harmless_file(),
+                position: Duration::ZERO,
+                settings: PlaybackSettings::default(),
+                paused: false,
+            },
+            &events,
+            &positions,
+        )
+        .expect("start fake playback");
+        drive_steps(&mut core, &events, &positions, 6);
+        assert!(matches!(
+            received.try_recv(),
+            Ok(AudioEvent::Started { generation: 11, .. })
+        ));
+        (core, fixture, events, received, positions)
+    }
+
+    #[test]
+    fn a_seek_to_the_end_before_the_replacement_header_completes_the_track() {
+        let format = AudioFormat {
+            sample_rate: 48_000,
+            channels: 1,
+        };
+        let (mut core, _fixture, events, received, positions) =
+            started_core(vec![VecDeque::from([
+                DecoderPoll::Ready(decoded_at(format, Duration::from_millis(100))),
+                DecoderPoll::Samples(vec![0.1; 512]),
+            ])]);
+        let start = Instant::now();
+
+        core.seek(11, Duration::from_millis(100), &events, &positions, start);
+        // The replacement's header has not arrived when the second seek does.
+        core.seek(
+            11,
+            Duration::from_secs(1),
+            &events,
+            &positions,
+            start + Duration::from_millis(25),
+        );
+        drive_steps(&mut core, &events, &positions, 6);
+        assert!(!core.settle_seek(&events, &positions, start + Duration::from_secs(1)));
+
+        let delivered: Vec<_> = received.try_iter().collect();
+        assert!(
+            delivered.contains(&AudioEvent::Finished { generation: 11 }),
+            "{delivered:?}"
+        );
+        assert!(
+            !delivered
+                .iter()
+                .any(|event| matches!(event, AudioEvent::Failed { .. })),
+            "{delivered:?}"
+        );
+    }
+
+    #[test]
+    fn a_restart_that_decodes_nothing_finishes_instead_of_failing() {
+        let format = AudioFormat {
+            sample_rate: 48_000,
+            channels: 1,
+        };
+        // Seeking a hair before the end: the decoder has no whole frame left.
+        let (mut core, _fixture, events, received, positions) =
+            started_core(vec![VecDeque::from([
+                DecoderPoll::Ready(decoded_at(format, Duration::from_millis(999))),
+                DecoderPoll::End,
+            ])]);
+        core.seek(
+            11,
+            Duration::from_millis(999),
+            &events,
+            &positions,
+            Instant::now(),
+        );
+        drive_steps(&mut core, &events, &positions, 6);
+
+        assert_eq!(
+            received.try_iter().collect::<Vec<_>>(),
+            [AudioEvent::Finished { generation: 11 }]
+        );
+    }
+
+    #[test]
+    fn a_settling_seek_never_starts_the_replacement_it_will_discard() {
+        let format = AudioFormat {
+            sample_rate: 48_000,
+            channels: 1,
+        };
+        let (mut core, fixture, events, _received, positions) = started_core(vec![
+            VecDeque::from([
+                DecoderPoll::Ready(decoded_at(format, Duration::from_millis(100))),
+                DecoderPoll::Samples(vec![0.1; 512]),
+            ]),
+            VecDeque::from([
+                DecoderPoll::Ready(decoded_at(format, Duration::from_millis(200))),
+                DecoderPoll::Samples(vec![0.1; 512]),
+            ]),
+        ]);
+        let start = Instant::now();
+        core.seek(11, Duration::from_millis(100), &events, &positions, start);
+        let before = fixture.calls.lock().expect("fake output calls").len();
+        // A repeat arrives before the replacement's header and samples.
+        core.seek(
+            11,
+            Duration::from_millis(200),
+            &events,
+            &positions,
+            start + Duration::from_millis(25),
+        );
+        drive_steps(&mut core, &events, &positions, 8);
+
+        assert_eq!(
+            &fixture.calls.lock().expect("fake output calls")[before..],
+            ["silence"],
+            "the replacement is neither prepared, fed, nor played"
+        );
+        assert!(core.settle_seek(&events, &positions, start + Duration::from_millis(200)));
+        assert_eq!(
+            fixture.opened_positions.lock().expect("open log").last(),
+            Some(&Duration::from_millis(200))
         );
     }
 

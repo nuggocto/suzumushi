@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - 2026-10-01
+
+### Fixed
+
+- Showed every character of wide and combining titles and artist names in
+  the Player. Japanese, Chinese, emoji, and accented names lost characters
+  since 1.2.0 because the title was drawn one character per cell.
+- Muting, unmuting, and volume changes now glide over 8 ms instead of cutting
+  the sound at once, and muted audio keeps its place in the track.
+- A seek that reaches the end of a track, even while an earlier seek is still
+  restarting the decoder, now finishes the track and moves on instead of
+  reporting that the track contains no audio.
+- Held seeking stays silent until it settles: an intermediate position can no
+  longer briefly start playing while a later seek is pending.
+- Corrected the parser isolation notes, which still described a 16-band
+  analyzer.
+
 ## [1.2.0] - 2026-09-30
 
 ### Added
