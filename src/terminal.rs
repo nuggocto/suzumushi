@@ -124,10 +124,7 @@ fn run_terminal_session(
         publish_mpris(app, mpris)?;
         state_sync.sync(app, state_store, event_time)?;
         terminal
-            .draw(|frame| {
-                app.terminal_size = (frame.area().width, frame.area().height);
-                crate::ui::render(frame, app, &mut stage, event_time);
-            })
+            .draw(|frame| crate::ui::render(frame, app, &mut stage, event_time))
             .map_err(|error| AppError::io("draw terminal", "terminal", error))?;
         let event = events.next(stage.frame_interval())?;
         event_time = event_time_for(event);
@@ -316,12 +313,7 @@ fn validate_terminal_area(width: u16, height: u16, budget: usize) -> AppResult<R
 fn apply_event(app: &mut AppState, event: AppEvent) -> Option<PlaybackIntent> {
     match event {
         AppEvent::Key(key, now) => app.key(key, now),
-        AppEvent::Resize(width, height, now) => {
-            app.advance_time(now);
-            app.terminal_size = (width, height);
-            None
-        }
-        AppEvent::Tick(now) => {
+        AppEvent::Resize(_, _, now) | AppEvent::Tick(now) => {
             app.advance_time(now);
             None
         }
@@ -334,7 +326,7 @@ fn drain_audio_events(
     audio: &AudioRuntime,
 ) -> AppResult<()> {
     app.audio_spectrum(audio.spectrum());
-    while let Some(position) = audio.try_position()? {
+    while let Some(position) = audio.try_position() {
         app.audio_position(position);
     }
     while let Some(event) = audio.try_event()? {

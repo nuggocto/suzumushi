@@ -30,7 +30,6 @@ pub(super) struct QueueState {
     generation: u64,
     next_item_id: u64,
     max_items: usize,
-    max_bytes: usize,
     pub(super) shuffle: bool,
     pub(super) shuffle_order: Vec<u64>,
     pub(super) shuffle_cursor: Option<usize>,
@@ -53,6 +52,8 @@ pub(super) struct RestoredQueue {
 
 impl QueueState {
     pub(super) fn new(config: &Config, asset_count: usize) -> AppResult<Self> {
+        // Checking the whole reservation here lets `max_items` alone bound
+        // later appends to `max_bytes`.
         let mut queue = Vec::new();
         reserve_exact(&mut queue, config.queue.max_items, "queue")?;
         let queue_bytes = queue
@@ -76,7 +77,6 @@ impl QueueState {
             generation: 0,
             next_item_id: 1,
             max_items: config.queue.max_items,
-            max_bytes: config.queue.max_bytes,
             shuffle: false,
             shuffle_order,
             shuffle_cursor: None,
@@ -242,15 +242,11 @@ impl QueueState {
 
     fn check_append(&self, count: usize) -> Result<(), QueueError> {
         let next_items = self.items.len().checked_add(count);
-        let next_bytes = next_items.and_then(|items| items.checked_mul(size_of::<QueueItem>()));
         let identities_fit = u64::try_from(count)
             .ok()
             .and_then(|count| self.next_item_id.checked_add(count))
             .is_some();
-        if next_items.is_none_or(|items| items > self.max_items)
-            || next_bytes.is_none_or(|bytes| bytes > self.max_bytes)
-            || !identities_fit
-        {
+        if next_items.is_none_or(|items| items > self.max_items) || !identities_fit {
             return Err(QueueError::Limit);
         }
         self.check_generation()

@@ -220,13 +220,6 @@ fn scan_with_components_from<Fd: AsFd>(
     Ok(scanner.finish())
 }
 
-struct PendingEntry {
-    id: TrackEntryId,
-    asset_index: usize,
-    display_path: PathBuf,
-    source: TrackEntrySource,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ScanProgress {
     Clean,
@@ -272,7 +265,7 @@ struct Scanner<'a> {
     progress: ScanProgress,
     assets: Vec<MediaAsset>,
     asset_indices: BTreeMap<(u64, u64), usize>,
-    entries: Vec<PendingEntry>,
+    entries: Vec<TrackEntry>,
     playlists: BTreeMap<Vec<u8>, Playlist>,
     warnings: Vec<ScanWarning>,
     counters: ScanCounters,
@@ -710,11 +703,18 @@ impl<'a> Scanner<'a> {
         if self.progress.is_stopped() {
             return Ok(());
         }
-        self.entries.push(PendingEntry {
+        let search = SearchFields {
+            filename: child.file_stem().map_or_else(String::new, |value| {
+                terminal_safe(value.as_bytes(), self.limits.max_path_bytes)
+            }),
+            relative_path: terminal_safe(child_bytes, self.limits.max_path_bytes),
+        };
+        self.entries.push(TrackEntry {
             id,
             asset_index,
             display_path: child.clone(),
             source,
+            search,
         });
         if let Some(key) = playlist
             && let Some(playlist) = self.playlists.get_mut(&key)
@@ -912,37 +912,15 @@ impl<'a> Scanner<'a> {
     }
 
     fn finish(self) -> ScanIndex {
-        let mut contextual = Vec::with_capacity(self.entries.len());
-        for pending in self.entries {
-            let filename = pending
-                .display_path
-                .file_stem()
-                .map_or_else(String::new, |value| {
-                    terminal_safe(value.as_bytes(), self.limits.max_path_bytes)
-                });
-            let relative_path = terminal_safe(
-                pending.display_path.as_os_str().as_bytes(),
-                self.limits.max_path_bytes,
-            );
-            contextual.push(TrackEntry {
-                id: pending.id,
-                asset_index: pending.asset_index,
-                display_path: pending.display_path,
-                source: pending.source,
-                search: SearchFields {
-                    filename,
-                    relative_path,
-                },
-            });
-        }
-        contextual.sort_by(|left, right| natural_path_cmp(&left.display_path, &right.display_path));
+        let mut entries = self.entries;
+        entries.sort_by(|left, right| natural_path_cmp(&left.display_path, &right.display_path));
         let mut playlists: Vec<_> = self.playlists.into_values().collect();
         playlists.sort_by(|left, right| natural_path_cmp(&left.path, &right.path));
         ScanIndex {
             generation: self.generation,
             complete: self.progress.is_complete(),
             assets: self.assets,
-            entries: contextual,
+            entries,
             playlists,
             warnings: self.warnings,
             counters: self.counters,
@@ -1016,8 +994,8 @@ fn tag_bytes(tags: &TrackTags) -> usize {
 }
 
 // These charges intentionally exceed the retained model payload. They cover
-// both build-time and final containers, lookup-tree nodes, cloned path
-// buffers, vector slack, and allocator bookkeeping under one index budget.
+// containers, lookup-tree nodes, cloned path buffers and search text, vector
+// slack, and allocator bookkeeping under one index budget.
 fn retained_asset_bytes(metadata_bytes: usize) -> usize {
     std::mem::size_of::<MediaAsset>()
         .saturating_add(std::mem::size_of::<((u64, u64), usize)>())
@@ -1026,8 +1004,7 @@ fn retained_asset_bytes(metadata_bytes: usize) -> usize {
 }
 
 fn retained_entry_bytes(path_bytes: usize) -> usize {
-    std::mem::size_of::<PendingEntry>()
-        .saturating_add(std::mem::size_of::<TrackEntry>())
+    std::mem::size_of::<TrackEntry>()
         .saturating_add(256)
         .saturating_add(path_bytes.saturating_mul(12))
 }

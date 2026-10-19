@@ -184,10 +184,10 @@ pub enum AudioEvent {
 /// Owns the audio worker and awaits it on every shutdown path.
 pub struct AudioRuntime {
     commands: Option<SyncSender<AudioCommand>>,
-    seeks: Option<Arc<SeekLane>>,
-    events: Option<Receiver<AudioEvent>>,
-    positions: Option<Arc<PositionLane>>,
-    spectrum: Option<Arc<SpectrumLane>>,
+    seeks: Arc<SeekLane>,
+    events: Receiver<AudioEvent>,
+    positions: Arc<PositionLane>,
+    spectrum: Arc<SpectrumLane>,
     metrics: Arc<AudioMetrics>,
     worker: Option<JoinHandle<AppResult<()>>>,
 }
@@ -229,10 +229,10 @@ impl AudioRuntime {
             .map_err(|error| AppError::Audio(format!("cannot start worker: {error}")))?;
         Ok(Self {
             commands: Some(command_tx),
-            seeks: Some(seeks),
-            events: Some(event_rx),
-            positions: Some(positions),
-            spectrum: Some(spectrum),
+            seeks,
+            events: event_rx,
+            positions,
+            spectrum,
             metrics,
             worker: Some(worker),
         })
@@ -253,14 +253,10 @@ impl AudioRuntime {
                 generation,
                 position,
             } => {
-                let accepted = self
-                    .seeks
-                    .as_ref()
-                    .ok_or_else(|| AppError::Audio("worker seek lane is already closed".into()))?
-                    .replace(SeekRequest {
-                        generation,
-                        position,
-                    });
+                let accepted = self.seeks.replace(SeekRequest {
+                    generation,
+                    position,
+                });
                 if accepted {
                     Ok(())
                 } else {
@@ -279,12 +275,7 @@ impl AudioRuntime {
     ///
     /// Returns an audio error when the worker event lane has disconnected.
     pub fn try_event(&self) -> AppResult<Option<AudioEvent>> {
-        match self
-            .events
-            .as_ref()
-            .ok_or_else(|| AppError::Audio("worker event lane is already closed".into()))?
-            .try_recv()
-        {
+        match self.events.try_recv() {
             Ok(event) => Ok(Some(event)),
             Err(TryRecvError::Empty) => Ok(None),
             Err(TryRecvError::Disconnected) => {
@@ -294,23 +285,14 @@ impl AudioRuntime {
     }
 
     /// Returns the newest available coalesced playback position without blocking.
-    ///
-    /// # Errors
-    ///
-    /// Returns an audio error when the position lane has disconnected.
-    pub fn try_position(&self) -> AppResult<Option<AudioPosition>> {
-        Ok(self
-            .positions
-            .as_ref()
-            .ok_or_else(|| AppError::Audio("worker position lane is already closed".into()))?
-            .take())
+    #[must_use]
+    pub fn try_position(&self) -> Option<AudioPosition> {
+        self.positions.take()
     }
 
     /// Returns the newest lock-free spectrum snapshot without blocking.
     pub(crate) fn spectrum(&self) -> AudioSpectrum {
-        self.spectrum
-            .as_ref()
-            .map_or_else(AudioSpectrum::default, |spectrum| spectrum.latest())
+        self.spectrum.latest()
     }
 
     /// Returns callback and backend diagnostics without waiting for the worker.
@@ -328,16 +310,11 @@ impl AudioRuntime {
     }
 
     fn stop(&mut self) -> AppResult<()> {
-        if let Some(seeks) = self.seeks.take() {
-            seeks.clear();
-        }
+        self.seeks.clear();
         if let Some(commands) = self.commands.take() {
             let _ = commands.try_send(AudioCommand::Shutdown);
             drop(commands);
         }
-        self.events.take();
-        self.positions.take();
-        self.spectrum.take();
         let Some(worker) = self.worker.take() else {
             return Ok(());
         };
@@ -1516,10 +1493,10 @@ mod tests {
         let seeks = Arc::new(SeekLane::default());
         let runtime = AudioRuntime {
             commands: Some(command_tx),
-            seeks: Some(Arc::clone(&seeks)),
-            events: None,
-            positions: None,
-            spectrum: None,
+            seeks: Arc::clone(&seeks),
+            events: channel().1,
+            positions: Arc::default(),
+            spectrum: Arc::default(),
             metrics: Arc::new(AudioMetrics::default()),
             worker: None,
         };

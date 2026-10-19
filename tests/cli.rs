@@ -6,7 +6,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::os::unix::net::UnixListener;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -210,26 +210,18 @@ fn bare_command_requires_a_selected_root() {
 
 #[test]
 fn unresponsive_session_bus_does_not_prevent_terminal_use_or_shutdown() {
-    let temp = TempDir::new().expect("temporary directory");
-    let root = temp.path().join("root");
-    initialize_root(&root);
-    let runtime = temp.path().join("runtime");
-    fs::create_dir(&runtime).expect("runtime directory");
-    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).expect("private runtime");
-    let bus_path = temp.path().join("bus");
+    let fixture = Fixture::new();
+    let bus_path = fixture.temp.path().join("bus");
     let listener = UnixListener::bind(&bus_path).expect("isolated bus");
     listener.set_nonblocking(true).expect("bounded accept");
-    let (mut master, slave) = open_test_pty(80, 24);
-    let mut child = terminal_command(&root, &runtime)
-        .env(
+    let (mut master, mut child) = spawn_in_pty(
+        fixture.command().env(
             "DBUS_SESSION_BUS_ADDRESS",
             format!("unix:path={}", bus_path.display()),
-        )
-        .stdin(Stdio::from(duplicate_file(&slave)))
-        .stdout(Stdio::from(duplicate_file(&slave)))
-        .stderr(Stdio::from(slave))
-        .spawn_owned()
-        .expect("terminal with stalled bus");
+        ),
+        80,
+        24,
+    );
 
     // The listener accepts no authentication data. Its open socket stays alive
     // through startup and shutdown, so only the player's deadline can unblock it.
@@ -245,29 +237,18 @@ fn unresponsive_session_bus_does_not_prevent_terminal_use_or_shutdown() {
     assert!(authentication.starts_with(b"\0AUTH"));
     master.write_all(b"q").expect("quit");
     read_pty_to_exit(&mut master, &mut child);
-    let log = fs::read_to_string(root.join("logs/suzumushi.log")).expect("startup log");
+    let log = fs::read_to_string(fixture.root.join("logs/suzumushi.log")).expect("startup log");
     assert!(log.contains("session bus connection timed out"), "{log}");
 }
 
 #[test]
 fn terminal_session_restores_the_pty_and_holds_both_leases() {
-    let temp = TempDir::new().expect("temporary directory");
-    let root = temp.path().join("root");
-    initialize_root(&root);
-    tune_terminal_fixture(&root);
-    seed_old_log_archives(&root);
-    let runtime = temp.path().join("runtime");
-    fs::create_dir(&runtime).expect("create runtime directory");
-    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))
-        .expect("make runtime directory private");
+    let fixture = Fixture::new();
+    let Fixture { root, runtime, .. } = &fixture;
+    tune_terminal_fixture(root);
+    seed_old_log_archives(root);
 
-    let (mut master, slave) = open_test_pty(80, 24);
-    let mut child = terminal_command(&root, &runtime)
-        .stdin(Stdio::from(duplicate_file(&slave)))
-        .stdout(Stdio::from(duplicate_file(&slave)))
-        .stderr(Stdio::from(slave))
-        .spawn_owned()
-        .expect("start terminal session");
+    let (mut master, mut child) = fixture.spawn_terminal();
     let mut transcript = read_pty_until(&mut master, &mut child, b"Library");
 
     master.write_all(b"?").expect("open terminal help");
@@ -279,7 +260,7 @@ fn terminal_session_restores_the_pty_and_holds_both_leases() {
     transcript.extend(read_pty_until(&mut master, &mut child, FOCUSED_PLAYER));
     assert!(byte_contains(&transcript, "·".as_bytes()));
 
-    let second = output_with_timeout(&mut terminal_command(&root, &runtime));
+    let second = output_with_timeout(&mut fixture.command());
     assert!(!second.status.success());
     let conflict = String::from_utf8(second.stderr).expect("UTF-8 lock error");
     assert!(
@@ -333,33 +314,19 @@ fn terminal_session_restores_the_pty_and_holds_both_leases() {
         0o600
     );
 
-    suzumushi::locks::ActiveTuiLease::acquire_in(Some(&runtime))
+    suzumushi::locks::ActiveTuiLease::acquire_in(Some(runtime))
         .expect("active lease is released after quit");
-    suzumushi::locks::RootWriterLease::acquire(&root).expect("root lease is released after quit");
-    suzumushi::init::initialize(&root)
+    suzumushi::locks::RootWriterLease::acquire(root).expect("root lease is released after quit");
+    suzumushi::init::initialize(root)
         .expect("the persistent root lock remains an owned initialization entry");
 }
 
 #[test]
 fn terminal_user_can_search_and_build_a_queue_without_audio() {
-    let temp = TempDir::new().expect("temporary directory");
-    let root = temp.path().join("root");
-    initialize_root(&root);
-    let campaign = root.join("audio/library/JDR/Campaign One");
-    fs::create_dir_all(&campaign).expect("create nested library folders");
-    fs::write(campaign.join("night.mp3"), id3_fixture()).expect("write tagged fixture");
-    let runtime = temp.path().join("runtime");
-    fs::create_dir(&runtime).expect("create runtime directory");
-    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))
-        .expect("make runtime directory private");
+    let fixture = Fixture::new();
+    fixture.add_tagged_track("JDR/Campaign One/night.mp3");
 
-    let (mut master, slave) = open_test_pty(80, 24);
-    let mut child = terminal_command(&root, &runtime)
-        .stdin(Stdio::from(duplicate_file(&slave)))
-        .stdout(Stdio::from(duplicate_file(&slave)))
-        .stderr(Stdio::from(slave))
-        .spawn_owned()
-        .expect("start terminal session");
+    let (mut master, mut child) = fixture.spawn_terminal();
     let mut transcript = read_pty_until(&mut master, &mut child, b"Night Song");
 
     master
@@ -380,7 +347,7 @@ fn terminal_user_can_search_and_build_a_queue_without_audio() {
     assert!(byte_contains(&transcript, b"Campaign"));
     assert!(byte_contains(&transcript, b"\x1b[?1049l"));
     let state: serde_json::Value = serde_json::from_slice(
-        &fs::read(root.join("state/now-playing.json")).expect("read final playback state"),
+        &fs::read(fixture.root.join("state/now-playing.json")).expect("read final playback state"),
     )
     .expect("playback state is valid JSON");
     assert_eq!(state["version"], 1);
@@ -389,24 +356,10 @@ fn terminal_user_can_search_and_build_a_queue_without_audio() {
 
 #[test]
 fn terminal_user_can_collapse_and_expand_a_library_folder() {
-    let temp = TempDir::new().expect("temporary directory");
-    let root = temp.path().join("root");
-    initialize_root(&root);
-    let campaign = root.join("audio/library/JDR/Campaign One");
-    fs::create_dir_all(&campaign).expect("create nested library folders");
-    fs::write(campaign.join("night.mp3"), id3_fixture()).expect("write tagged fixture");
-    let runtime = temp.path().join("runtime");
-    fs::create_dir(&runtime).expect("create runtime directory");
-    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))
-        .expect("make runtime directory private");
+    let fixture = Fixture::new();
+    fixture.add_tagged_track("JDR/Campaign One/night.mp3");
 
-    let (mut master, slave) = open_test_pty(80, 24);
-    let mut child = terminal_command(&root, &runtime)
-        .stdin(Stdio::from(duplicate_file(&slave)))
-        .stdout(Stdio::from(duplicate_file(&slave)))
-        .stderr(Stdio::from(slave))
-        .spawn_owned()
-        .expect("start terminal session");
+    let (mut master, mut child) = fixture.spawn_terminal();
     read_pty_until(&mut master, &mut child, b"Night Song");
 
     master
@@ -424,22 +377,11 @@ fn terminal_user_can_collapse_and_expand_a_library_folder() {
 
 #[test]
 fn terminal_reopens_the_last_queue_without_autoplay() {
-    let temp = TempDir::new().expect("temporary directory");
-    let root = temp.path().join("root");
-    initialize_root(&root);
-    fs::write(root.join("audio/library/night.mp3"), id3_fixture()).expect("write tagged fixture");
-    let runtime = temp.path().join("runtime");
-    fs::create_dir(&runtime).expect("create runtime directory");
-    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))
-        .expect("make runtime directory private");
+    let fixture = Fixture::new();
+    let root = &fixture.root;
+    fixture.add_tagged_track("night.mp3");
 
-    let (mut first_master, first_slave) = open_test_pty(80, 24);
-    let mut first = terminal_command(&root, &runtime)
-        .stdin(Stdio::from(duplicate_file(&first_slave)))
-        .stdout(Stdio::from(duplicate_file(&first_slave)))
-        .stderr(Stdio::from(first_slave))
-        .spawn_owned()
-        .expect("start first terminal session");
+    let (mut first_master, mut first) = fixture.spawn_terminal();
     read_pty_until(&mut first_master, &mut first, b"Night Song");
     first_master.write_all(b"\r").expect("queue the track");
     read_pty_until(&mut first_master, &mut first, FIRST_QUEUE_ITEM);
@@ -455,16 +397,31 @@ fn terminal_reopens_the_last_queue_without_autoplay() {
             .windows(b"Night Song".len())
             .any(|bytes| bytes == b"Night Song")
     );
+    // An identical rewrite keeps the bytes, so compare the file's identity too:
+    // a replacement changes the inode and an in-place write the modification time.
+    let identity = |path: &std::path::Path| {
+        let metadata = fs::metadata(path).expect("cache metadata");
+        (
+            metadata.ino(),
+            metadata.modified().expect("cache modification time"),
+        )
+    };
+    let cache_identity = identity(&cache_path);
     let diagnosis = output_with_timeout(
         Command::new(env!("CARGO_BIN_EXE_suzumushi"))
             .arg("--root")
-            .arg(&root)
+            .arg(root)
             .arg("diagnose"),
     );
     assert!(diagnosis.status.success());
     assert_eq!(
         fs::read(&cache_path).expect("cache remains"),
         cache,
+        "diagnose must not change cache contents"
+    );
+    assert_eq!(
+        identity(&cache_path),
+        cache_identity,
         "diagnose must not rewrite cache"
     );
 
@@ -474,13 +431,7 @@ fn terminal_reopens_the_last_queue_without_autoplay() {
     .expect("saved session is valid JSON");
     assert_eq!(saved["queue_entry_ids"].as_array().map(Vec::len), Some(1));
 
-    let (mut second_master, second_slave) = open_test_pty(80, 24);
-    let mut second = terminal_command(&root, &runtime)
-        .stdin(Stdio::from(duplicate_file(&second_slave)))
-        .stdout(Stdio::from(duplicate_file(&second_slave)))
-        .stderr(Stdio::from(second_slave))
-        .spawn_owned()
-        .expect("reopen terminal session");
+    let (mut second_master, mut second) = fixture.spawn_terminal();
     let mut transcript = read_pty_until(&mut second_master, &mut second, b"Stopped");
     second_master
         .write_all(b"q")
@@ -503,30 +454,21 @@ fn terminal_reopens_the_last_queue_without_autoplay() {
 #[test]
 #[ignore = "requires a real Linux default audio output device"]
 fn terminal_user_can_play_a_queued_file_on_the_real_device() {
-    let temp = TempDir::new().expect("temporary directory");
-    let root = temp.path().join("root");
-    initialize_root(&root);
+    let fixture = Fixture::new();
     fs::copy(
         "tests/fixtures/audio/tone.mp3",
-        root.join("audio/library/tone.mp3"),
+        fixture.root.join("audio/library/tone.mp3"),
     )
     .expect("copy playable fixture");
-    let runtime = temp.path().join("runtime");
-    fs::create_dir(&runtime).expect("create runtime directory");
-    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))
-        .expect("make runtime directory private");
     let real_runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .expect("real-device QA requires XDG_RUNTIME_DIR");
 
-    let (mut master, slave) = open_test_pty(160, 24);
-    let mut child = terminal_command(&root, &runtime)
-        .env("XDG_RUNTIME_DIR", real_runtime)
-        .stdin(Stdio::from(duplicate_file(&slave)))
-        .stdout(Stdio::from(duplicate_file(&slave)))
-        .stderr(Stdio::from(slave))
-        .spawn_owned()
-        .expect("start terminal session");
+    let (mut master, mut child) = spawn_in_pty(
+        fixture.command().env("XDG_RUNTIME_DIR", real_runtime),
+        160,
+        24,
+    );
     let mut transcript = read_pty_until(&mut master, &mut child, b"tone");
     master
         .write_all(b"\r")
@@ -541,21 +483,10 @@ fn terminal_user_can_play_a_queued_file_on_the_real_device() {
 
 #[test]
 fn oversized_terminal_resize_is_refused_before_buffer_growth() {
-    let temp = TempDir::new().expect("temporary directory");
-    let root = temp.path().join("root");
-    initialize_root(&root);
-    let runtime = temp.path().join("runtime");
-    fs::create_dir(&runtime).expect("create runtime directory");
-    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))
-        .expect("make runtime directory private");
+    let fixture = Fixture::new();
+    let Fixture { root, runtime, .. } = &fixture;
 
-    let (mut master, slave) = open_test_pty(80, 24);
-    let mut child = terminal_command(&root, &runtime)
-        .stdin(Stdio::from(duplicate_file(&slave)))
-        .stdout(Stdio::from(duplicate_file(&slave)))
-        .stderr(Stdio::from(slave))
-        .spawn_owned()
-        .expect("start terminal session");
+    let (mut master, mut child) = fixture.spawn_terminal();
     let mut transcript = read_pty_until(&mut master, &mut child, b"Library");
     master
         .write_all(b"\t")
@@ -581,30 +512,19 @@ fn oversized_terminal_resize_is_refused_before_buffer_growth() {
         b"above the 8388608-byte UI reservation"
     ));
     assert!(byte_contains(&transcript, b"\x1b[?1049l"));
-    suzumushi::locks::ActiveTuiLease::acquire_in(Some(&runtime))
+    suzumushi::locks::ActiveTuiLease::acquire_in(Some(runtime))
         .expect("active lease is released after resize refusal");
-    suzumushi::locks::RootWriterLease::acquire(&root)
+    suzumushi::locks::RootWriterLease::acquire(root)
         .expect("root lease is released after resize refusal");
 }
 
 #[test]
 fn background_log_failure_is_reported_after_terminal_restoration() {
-    let temp = TempDir::new().expect("temporary directory");
-    let root = temp.path().join("root");
-    initialize_root(&root);
-    tune_terminal_fixture(&root);
-    let runtime = temp.path().join("runtime");
-    fs::create_dir(&runtime).expect("create runtime directory");
-    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))
-        .expect("make runtime directory private");
+    let fixture = Fixture::new();
+    let Fixture { root, runtime, .. } = &fixture;
+    tune_terminal_fixture(root);
 
-    let (mut master, slave) = open_test_pty(80, 24);
-    let mut child = terminal_command(&root, &runtime)
-        .stdin(Stdio::from(duplicate_file(&slave)))
-        .stdout(Stdio::from(duplicate_file(&slave)))
-        .stderr(Stdio::from(slave))
-        .spawn_owned()
-        .expect("start terminal session");
+    let (mut master, mut child) = fixture.spawn_terminal();
     let mut transcript = read_pty_until(&mut master, &mut child, b"Library");
 
     let current = root.join("logs/suzumushi.log");
@@ -627,17 +547,16 @@ fn background_log_failure_is_reported_after_terminal_restoration() {
         "diagnostic must follow terminal restoration"
     );
 
-    suzumushi::locks::ActiveTuiLease::acquire_in(Some(&runtime))
+    suzumushi::locks::ActiveTuiLease::acquire_in(Some(runtime))
         .expect("active lease is released after writer failure");
-    suzumushi::locks::RootWriterLease::acquire(&root)
+    suzumushi::locks::RootWriterLease::acquire(root)
         .expect("root lease is released after writer failure");
 }
 
 #[test]
 fn fifo_log_entry_never_blocks_terminal_startup() {
-    let temp = TempDir::new().expect("temporary directory");
-    let root = temp.path().join("root");
-    initialize_root(&root);
+    let fixture = Fixture::new();
+    let Fixture { root, runtime, .. } = &fixture;
     let fifo = root.join("logs/suzumushi.log");
     mkfifoat(CWD, &fifo, Mode::from_raw_mode(0o600)).expect("create log FIFO");
     let _reader = rustix::fs::open(
@@ -646,37 +565,28 @@ fn fifo_log_entry_never_blocks_terminal_startup() {
         Mode::empty(),
     )
     .expect("hold FIFO reader");
-    let runtime = temp.path().join("runtime");
-    fs::create_dir(&runtime).expect("create runtime directory");
-    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))
-        .expect("make runtime directory private");
 
-    let output = output_with_timeout(&mut terminal_command(&root, &runtime));
+    let output = output_with_timeout(&mut fixture.command());
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).expect("UTF-8 logging error");
     assert!(stderr.contains("single-link regular file"), "{stderr}");
-    suzumushi::locks::ActiveTuiLease::acquire_in(Some(&runtime))
+    suzumushi::locks::ActiveTuiLease::acquire_in(Some(runtime))
         .expect("active lease is released after startup failure");
-    suzumushi::locks::RootWriterLease::acquire(&root)
+    suzumushi::locks::RootWriterLease::acquire(root)
         .expect("root lease is released after startup failure");
 }
 
 #[test]
 fn terminal_startup_reserves_its_open_file_peak_before_opening() {
-    let temp = TempDir::new().expect("temporary directory");
-    let root = temp.path().join("root");
-    initialize_root(&root);
+    let fixture = Fixture::new();
+    let Fixture { root, runtime, .. } = &fixture;
     let config_path = root.join("config.toml");
     let config = fs::read_to_string(&config_path)
         .expect("read fixture config")
         .replacen("max_open_files = 64", "max_open_files = 5", 1);
     fs::write(&config_path, config).expect("lower open-file limit");
-    let runtime = temp.path().join("runtime");
-    fs::create_dir(&runtime).expect("create runtime directory");
-    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))
-        .expect("make runtime directory private");
 
-    let output = output_with_timeout(&mut terminal_command(&root, &runtime));
+    let output = output_with_timeout(&mut fixture.command());
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).expect("UTF-8 resource error");
     assert!(stderr.contains("runtime.max_open_files"), "{stderr}");
@@ -1021,16 +931,65 @@ fn seed_old_log_archives(root: &std::path::Path) {
     }
 }
 
-fn terminal_command(root: &std::path::Path, runtime: &std::path::Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_suzumushi"));
-    command
-        .arg("--root")
-        .arg(root)
-        .env("XDG_RUNTIME_DIR", runtime)
-        .env("TERM", "xterm-256color")
-        .env_remove("DBUS_SESSION_BUS_ADDRESS")
-        .env_remove("NO_COLOR");
-    command
+/// An initialized root beside a private runtime directory for terminal runs.
+struct Fixture {
+    temp: TempDir,
+    root: PathBuf,
+    runtime: PathBuf,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        let temp = TempDir::new().expect("temporary directory");
+        let root = temp.path().join("root");
+        initialize_root(&root);
+        let runtime = temp.path().join("runtime");
+        fs::create_dir(&runtime).expect("create runtime directory");
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))
+            .expect("make runtime directory private");
+        Self {
+            temp,
+            root,
+            runtime,
+        }
+    }
+
+    /// Writes the tagged "Night Song" fixture below the library.
+    fn add_tagged_track(&self, relative: &str) {
+        let path = self.root.join("audio/library").join(relative);
+        fs::create_dir_all(path.parent().expect("track directory"))
+            .expect("create library folders");
+        fs::write(path, id3_fixture()).expect("write tagged fixture");
+    }
+
+    /// A terminal-session command isolated from the caller's session bus.
+    fn command(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_suzumushi"));
+        command
+            .arg("--root")
+            .arg(&self.root)
+            .env("XDG_RUNTIME_DIR", &self.runtime)
+            .env("TERM", "xterm-256color")
+            .env_remove("DBUS_SESSION_BUS_ADDRESS")
+            .env_remove("NO_COLOR");
+        command
+    }
+
+    fn spawn_terminal(&self) -> (File, Child) {
+        spawn_in_pty(&mut self.command(), 80, 24)
+    }
+}
+
+/// Starts `command` on a fresh pseudoterminal and returns its master side.
+fn spawn_in_pty(command: &mut Command, width: u16, height: u16) -> (File, Child) {
+    let (master, slave) = open_test_pty(width, height);
+    let child = command
+        .stdin(Stdio::from(duplicate_file(&slave)))
+        .stdout(Stdio::from(duplicate_file(&slave)))
+        .stderr(Stdio::from(slave))
+        .spawn_owned()
+        .expect("start terminal session");
+    (master, child)
 }
 
 fn open_test_pty(width: u16, height: u16) -> (File, File) {
