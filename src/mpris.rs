@@ -3,6 +3,7 @@
 //! Bounded MPRIS bridge for the active terminal session.
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
@@ -10,7 +11,7 @@ use std::time::Duration;
 
 use zbus::connection;
 use zbus::object_server::SignalEmitter;
-use zbus::zvariant::{ObjectPath, OwnedValue, Value};
+use zbus::{ObjectPath, OwnedVariant, Variant};
 
 use crate::app::{AppState, PlaybackStatus, RepeatMode};
 use crate::errors::{AppError, AppResult};
@@ -22,7 +23,7 @@ const PLAYER_INTERFACE: &str = "org.mpris.MediaPlayer2.Player";
 const TRACK_PATH_PREFIX: &str = "/io/github/nuggocto/suzumushi/track/";
 const NO_TRACK_PATH: &str = "/org/mpris/MediaPlayer2/TrackList/NoTrack";
 pub(crate) const REQUEST_CAPACITY: usize = 32;
-const BUS_MESSAGE_CAPACITY: usize = 8;
+const BUS_MESSAGE_CAPACITY: NonZeroUsize = NonZeroUsize::new(8).unwrap();
 const WORKER_POLL: Duration = Duration::from_millis(25);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const TEXT_MAX_BYTES: usize = 1_024;
@@ -98,6 +99,13 @@ pub(crate) struct MprisRuntime {
 impl MprisRuntime {
     /// Starts the single session-bus identity and its owned worker.
     pub(crate) fn start(initial: MprisProjection) -> AppResult<Self> {
+        Self::start_with(initial, connection::Builder::session().name(BUS_NAME))
+    }
+
+    fn start_with(
+        initial: MprisProjection,
+        builder: connection::Builder<'static>,
+    ) -> AppResult<Self> {
         let (action_sender, actions) = mpsc::sync_channel(REQUEST_CAPACITY);
         let latest = Arc::new(Mutex::new(None));
         let worker_latest = Arc::clone(&latest);
@@ -106,13 +114,14 @@ impl MprisRuntime {
         let worker = thread::Builder::new()
             .name("suzumushi-mpris".into())
             .spawn(move || {
-                worker_main(
+                zbus::block_on(worker_main(
+                    builder,
                     initial,
                     action_sender,
                     &worker_latest,
                     &shutdown_receiver,
                     &ready_sender,
-                );
+                ));
             })
             .map_err(|error| AppError::Mpris(format!("cannot start worker: {error}")))?;
         match ready_receiver.recv() {
@@ -169,7 +178,8 @@ impl Drop for MprisRuntime {
     }
 }
 
-fn worker_main(
+async fn worker_main(
+    builder: connection::Builder<'static>,
     initial: MprisProjection,
     actions: SyncSender<AppAction>,
     latest: &Arc<Mutex<Option<MprisProjection>>>,
@@ -184,13 +194,11 @@ fn worker_main(
         actions,
         state: Arc::clone(&state),
     };
-    let built = connection::Builder::session()
-        .and_then(|builder| builder.max_queued(BUS_MESSAGE_CAPACITY).name(BUS_NAME))
-        .and_then(|builder| builder.serve_at(OBJECT_PATH, root))
-        .and_then(|builder| builder.serve_at(OBJECT_PATH, player))
-        .map_err(|error| error.to_string())
-        .and_then(|builder| connect_with_timeout(builder, CONNECT_TIMEOUT));
-    let connection = match built {
+    let builder = builder
+        .max_queued(BUS_MESSAGE_CAPACITY)
+        .serve_at(OBJECT_PATH, root)
+        .serve_at(OBJECT_PATH, player);
+    let connection = match connect_with_timeout(builder, CONNECT_TIMEOUT).await {
         Ok(connection) => connection,
         Err(error) => {
             let _ = ready.send(Err(error));
@@ -203,9 +211,11 @@ fn worker_main(
     }
 
     loop {
-        match shutdown.recv_timeout(WORKER_POLL) {
-            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        // Yield to the runtime so it can serve desktop requests while idle.
+        async_io::Timer::after(WORKER_POLL).await;
+        match shutdown.try_recv() {
+            Ok(()) | Err(mpsc::TryRecvError::Disconnected) => break,
+            Err(mpsc::TryRecvError::Empty) => {}
         }
         let next = latest.lock().ok().and_then(|mut slot| slot.take());
         let Some(next) = next else {
@@ -215,33 +225,37 @@ fn worker_main(
             Ok(mut current) => std::mem::replace(&mut *current, next.clone()),
             Err(_) => break,
         };
-        if let Err(error) = emit_changes(&connection, &previous, &next) {
+        if let Err(error) = emit_changes(&connection, &previous, &next).await {
             tracing::warn!(%error, "MPRIS property update failed");
         }
     }
-    if let Some(next) = latest.lock().ok().and_then(|mut slot| slot.take())
-        && let Ok(mut current) = state.write()
-    {
-        let previous = std::mem::replace(&mut *current, next.clone());
-        let _ = emit_changes(&connection, &previous, &next);
+    let next = latest.lock().ok().and_then(|mut slot| slot.take());
+    if let Some(next) = next {
+        let previous = state
+            .write()
+            .ok()
+            .map(|mut current| std::mem::replace(&mut *current, next.clone()));
+        if let Some(previous) = previous {
+            let _ = emit_changes(&connection, &previous, &next).await;
+        }
     }
     drop(connection);
 }
 
-fn connect_with_timeout(
+async fn connect_with_timeout(
     builder: connection::Builder<'_>,
     timeout: Duration,
-) -> Result<zbus::blocking::Connection, String> {
+) -> Result<zbus::Connection, String> {
     // Dropping the losing build future closes its socket and cancels setup.
     // The worker then returns its startup error and can be joined normally.
-    async_io::block_on(futures_lite::future::or(
+    futures_lite::future::or(
         async { builder.build().await.map_err(|error| error.to_string()) },
         async {
             async_io::Timer::after(timeout).await;
             Err("session bus connection timed out".into())
         },
-    ))
-    .map(zbus::blocking::Connection::from)
+    )
+    .await
 }
 
 struct RootInterface {
@@ -469,7 +483,7 @@ impl PlayerInterface {
     }
 
     #[zbus(property)]
-    fn metadata(&self) -> zbus::fdo::Result<HashMap<String, OwnedValue>> {
+    fn metadata(&self) -> zbus::fdo::Result<HashMap<String, OwnedVariant>> {
         self.with_state(metadata_from_projection)
     }
 
@@ -541,8 +555,8 @@ impl PlayerInterface {
     async fn seeked(emitter: &SignalEmitter<'_>, position: i64) -> zbus::Result<()>;
 }
 
-fn emit_changes(
-    connection: &zbus::blocking::Connection,
+async fn emit_changes(
+    connection: &zbus::Connection,
     previous: &MprisProjection,
     current: &MprisProjection,
 ) -> zbus::Result<()> {
@@ -550,19 +564,22 @@ fn emit_changes(
     if previous.playback_status != current.playback_status {
         changed.insert(
             "PlaybackStatus",
-            Value::from(playback_status_label(current.playback_status)),
+            Variant::from(playback_status_label(current.playback_status)),
         );
     }
     if previous.repeat != current.repeat {
-        changed.insert("LoopStatus", Value::from(loop_status_label(current.repeat)));
+        changed.insert(
+            "LoopStatus",
+            Variant::from(loop_status_label(current.repeat)),
+        );
     }
     if previous.shuffle != current.shuffle {
-        changed.insert("Shuffle", Value::from(current.shuffle));
+        changed.insert("Shuffle", Variant::from(current.shuffle));
     }
     if previous.volume_percent != current.volume_percent {
         changed.insert(
             "Volume",
-            Value::from(f64::from(current.volume_percent) / 100.0),
+            Variant::from(f64::from(current.volume_percent) / 100.0),
         );
     }
     if previous.track_token != current.track_token
@@ -570,48 +587,55 @@ fn emit_changes(
         || previous.creator != current.creator
         || previous.duration != current.duration
     {
-        changed.insert("Metadata", Value::from(metadata_from_projection(current)));
+        changed.insert("Metadata", Variant::from(metadata_from_projection(current)));
     }
     if has_capability(previous, CAN_GO_NEXT) != has_capability(current, CAN_GO_NEXT) {
         changed.insert(
             "CanGoNext",
-            Value::from(has_capability(current, CAN_GO_NEXT)),
+            Variant::from(has_capability(current, CAN_GO_NEXT)),
         );
     }
     if has_capability(previous, CAN_GO_PREVIOUS) != has_capability(current, CAN_GO_PREVIOUS) {
         changed.insert(
             "CanGoPrevious",
-            Value::from(has_capability(current, CAN_GO_PREVIOUS)),
+            Variant::from(has_capability(current, CAN_GO_PREVIOUS)),
         );
     }
     if has_capability(previous, CAN_PLAY) != has_capability(current, CAN_PLAY) {
-        changed.insert("CanPlay", Value::from(has_capability(current, CAN_PLAY)));
+        changed.insert("CanPlay", Variant::from(has_capability(current, CAN_PLAY)));
     }
     if has_capability(previous, CAN_PAUSE) != has_capability(current, CAN_PAUSE) {
-        changed.insert("CanPause", Value::from(has_capability(current, CAN_PAUSE)));
+        changed.insert(
+            "CanPause",
+            Variant::from(has_capability(current, CAN_PAUSE)),
+        );
     }
     if has_capability(previous, CAN_SEEK) != has_capability(current, CAN_SEEK) {
-        changed.insert("CanSeek", Value::from(has_capability(current, CAN_SEEK)));
+        changed.insert("CanSeek", Variant::from(has_capability(current, CAN_SEEK)));
     }
     if !changed.is_empty() {
-        connection.emit_signal(
-            None::<&str>,
-            OBJECT_PATH,
-            "org.freedesktop.DBus.Properties",
-            "PropertiesChanged",
-            &(PLAYER_INTERFACE, changed, Vec::<&str>::new()),
-        )?;
+        connection
+            .emit_signal(
+                None::<&str>,
+                OBJECT_PATH,
+                "org.freedesktop.DBus.Properties",
+                "PropertiesChanged",
+                &(PLAYER_INTERFACE, changed, Vec::<&str>::new()),
+            )
+            .await?;
     }
     if previous.track_token == current.track_token
         && previous.seek_revision != current.seek_revision
     {
-        connection.emit_signal(
-            None::<&str>,
-            OBJECT_PATH,
-            PLAYER_INTERFACE,
-            "Seeked",
-            &duration_micros(current.position),
-        )?;
+        connection
+            .emit_signal(
+                None::<&str>,
+                OBJECT_PATH,
+                PLAYER_INTERFACE,
+                "Seeked",
+                &duration_micros(current.position),
+            )
+            .await?;
     }
     Ok(())
 }
@@ -648,22 +672,22 @@ const fn has_capability(projection: &MprisProjection, capability: u8) -> bool {
     projection.capabilities & capability != 0
 }
 
-fn metadata_from_projection(projection: &MprisProjection) -> HashMap<String, OwnedValue> {
+fn metadata_from_projection(projection: &MprisProjection) -> HashMap<String, OwnedVariant> {
     let mut metadata = HashMap::new();
     let track_path = projection
         .track_token
         .map_or_else(|| NO_TRACK_PATH.to_owned(), track_path);
     if let Ok(path) = ObjectPath::try_from(track_path) {
-        metadata.insert("mpris:trackid".into(), OwnedValue::from(path));
+        metadata.insert("mpris:trackid".into(), OwnedVariant::from(path));
     }
     let Some(_) = projection.track_token else {
         return metadata;
     };
-    if let Ok(title) = OwnedValue::try_from(Value::from(projection.title.clone())) {
+    if let Ok(title) = OwnedVariant::try_from(Variant::from(projection.title.clone())) {
         metadata.insert("xesam:title".into(), title);
     }
     if !projection.creator.is_empty()
-        && let Ok(artist) = OwnedValue::try_from(Value::from(vec![projection.creator.clone()]))
+        && let Ok(artist) = OwnedVariant::try_from(Variant::from(vec![projection.creator.clone()]))
     {
         metadata.insert("xesam:artist".into(), artist);
     }
@@ -724,7 +748,7 @@ mod tests {
     use std::sync::{Arc, RwLock, mpsc};
     use std::time::Duration;
 
-    use zbus::zvariant::{ObjectPath, OwnedObjectPath};
+    use zbus::{ObjectPath, OwnedObjectPath};
 
     use super::{
         CAN_GO_NEXT, CAN_GO_PREVIOUS, CAN_PAUSE, CAN_PLAY, CAN_SEEK, MprisProjection,
@@ -757,10 +781,10 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("test deadline");
         let worker = std::thread::spawn(move || {
-            super::connect_with_timeout(
-                zbus::connection::Builder::async_io_unix_stream(client),
+            zbus::block_on(super::connect_with_timeout(
+                zbus::connection::Builder::unix_stream(client),
                 Duration::from_millis(100),
-            )
+            ))
         });
         let mut request = Vec::new();
         server
@@ -777,6 +801,125 @@ mod tests {
                 .expect_err("stalled bus"),
             "session bus connection timed out"
         );
+    }
+
+    async fn exercise_desktop_connection(client: UnixStream) {
+        use std::collections::HashMap;
+
+        use futures_lite::StreamExt;
+        use zbus::{MessageStream, OwnedVariant};
+
+        let connection = zbus::connection::Builder::unix_stream(client)
+            .p2p()
+            .build()
+            .await
+            .expect("connect desktop client");
+        let mut messages = MessageStream::from(&connection);
+        let reply = connection
+            .call_method(
+                None::<&str>,
+                super::OBJECT_PATH,
+                Some("org.freedesktop.DBus.Properties"),
+                "Get",
+                &(super::PLAYER_INTERFACE, "Metadata"),
+            )
+            .await
+            .expect("read metadata over D-Bus");
+        let value: OwnedVariant = reply.body().deserialize().expect("metadata variant");
+        let metadata: HashMap<String, OwnedVariant> =
+            value.try_into().expect("metadata dictionary");
+        assert_eq!(
+            <&str>::try_from(&metadata["xesam:title"]).expect("title string"),
+            "Title"
+        );
+        connection
+            .call_method(
+                None::<&str>,
+                super::OBJECT_PATH,
+                Some(super::PLAYER_INTERFACE),
+                "Pause",
+                &(),
+            )
+            .await
+            .expect("pause over D-Bus while the worker has no updates");
+        connection
+            .call_method(
+                None::<&str>,
+                super::OBJECT_PATH,
+                Some("org.freedesktop.DBus.Properties"),
+                "Set",
+                &(super::PLAYER_INTERFACE, "Volume", zbus::Variant::from(0.4)),
+            )
+            .await
+            .expect("set volume over D-Bus");
+
+        let mut changed = false;
+        let mut seeked = false;
+        while !changed || !seeked {
+            let message = messages
+                .next()
+                .await
+                .expect("signal stream")
+                .expect("message");
+            let header = message.header();
+            match header.member().map(zbus::names::MemberName::as_str) {
+                Some("PropertiesChanged") => {
+                    let (interface, properties, _): (
+                        String,
+                        HashMap<String, OwnedVariant>,
+                        Vec<String>,
+                    ) = message.body().deserialize().expect("property signal");
+                    changed |= interface == super::PLAYER_INTERFACE
+                        && properties.get("Volume") == Some(&OwnedVariant::from(0.4));
+                }
+                Some("Seeked") => {
+                    let position: i64 = message.body().deserialize().expect("seek signal");
+                    assert_eq!(position, 9_000_000);
+                    seeked = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn live_connection_serves_idle_requests_and_publishes_state_changes() {
+        let (server, client) = UnixStream::pair().expect("isolated desktop connection");
+        let client = std::thread::spawn(move || {
+            zbus::block_on(futures_lite::future::or(
+                exercise_desktop_connection(client),
+                async {
+                    async_io::Timer::after(Duration::from_secs(5)).await;
+                    panic!("desktop connection stopped making progress");
+                },
+            ));
+        });
+        let builder = zbus::connection::Builder::unix_stream(server)
+            .server(zbus::Guid::generate())
+            .p2p();
+        let runtime =
+            super::MprisRuntime::start_with(projection(), builder).expect("desktop worker");
+        assert_eq!(
+            runtime
+                .actions
+                .recv_timeout(Duration::from_secs(2))
+                .expect("desktop action"),
+            AppAction::Pause
+        );
+        assert_eq!(
+            runtime
+                .actions
+                .recv_timeout(Duration::from_secs(2))
+                .expect("volume action"),
+            AppAction::SetVolume(40)
+        );
+        let mut updated = projection();
+        updated.volume_percent = 40;
+        updated.position = Duration::from_secs(9);
+        updated.seek_revision = 1;
+        runtime.publish(updated).expect("publish playback update");
+        client.join().expect("desktop client");
+        runtime.shutdown().expect("join desktop worker");
     }
 
     #[test]

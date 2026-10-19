@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Migrated desktop controls to zbus 6 and its async API, removing the unmaintained
+  zbus_names, zvariant, and zvariant_derive dependencies. Updated rustix to 1.1.5
+  for the new runtime, and added an isolated live D-Bus regression test.
 - Built final track entries during scanning instead of retaining an intermediate
   model and converting it afterward, with memory accounting updated accordingly.
 - Removed unused terminal dimensions, unreachable audio-runtime states, and
