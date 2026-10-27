@@ -13,6 +13,21 @@ the meadow settles into quiet, dewy grass. In a tall Player, a night sky opens
 above the title: faint stars twinkle, and a crescent moon crosses the sky as the
 track plays.
 
+## Install on x86-64 Linux
+
+Run:
+
+```sh
+curl -fsS https://suzumushi.org/install.sh | sh
+```
+
+The installer puts `suzumushi` and the `suzu` shortcut in `~/.local/bin`
+without sudo. It checks the release archive against the SHA-256 recorded in the
+script and confirms the player starts before replacing anything. The player
+needs the ALSA, PipeWire, and D-Bus runtime libraries, which most desktop
+distributions already include. Pass a different directory with
+`sh -s -- --bin-dir /absolute/directory`.
+
 ## Install on Arch Linux
 
 Install [`suzumushi-bin`](https://aur.archlinux.org/packages/suzumushi-bin)
@@ -23,7 +38,6 @@ yay -S suzumushi-bin
 ```
 
 The package installs both `suzumushi` and the relative `suzu` command symlink.
-The verified archive below remains available for direct installation.
 
 ## Install on NixOS
 
@@ -31,7 +45,7 @@ On x86-64 NixOS with Nix installed, add the repository flake to your user profil
 
 ```sh
 nix --extra-experimental-features 'nix-command flakes' \
-  profile add github:nuggocto/suzumushi/v1.2.1
+  profile add github:nuggocto/suzumushi/v1.2.2
 ```
 
 This installs both `suzumushi` and `suzu`. Nix builds from source with pinned
@@ -49,24 +63,22 @@ Your desktop needs a working audio session. See [Nix packaging](docs/nix.md) for
 declarative NixOS and Home Manager installation, running without installation,
 and local build checks.
 
-## Install the Linux release
+## Install the release archive by hand
 
-The verified binary archive is built for 64-bit GNU/Linux. Download the archive
-and `SHA256SUMS` from the
-[`v1.2.1` release](https://github.com/nuggocto/suzumushi/releases/tag/v1.2.1),
-either in your browser or with:
+To check each step yourself, download the archive and `SHA256SUMS` from the
+[`v1.2.2` release](https://github.com/nuggocto/suzumushi/releases/tag/v1.2.2):
 
 ```sh
 curl -fLO \
-  'https://github.com/nuggocto/suzumushi/releases/download/v1.2.1/{SHA256SUMS,suzumushi-v1.2.1-x86_64-unknown-linux-gnu.tar.xz}'
+  'https://github.com/nuggocto/suzumushi/releases/download/v1.2.2/{SHA256SUMS,suzumushi-v1.2.2-x86_64-unknown-linux-gnu.tar.xz}'
 ```
 
 Then verify and install the downloaded archive:
 
 ```sh
 sha256sum --check --ignore-missing SHA256SUMS
-tar -xf suzumushi-v1.2.1-x86_64-unknown-linux-gnu.tar.xz
-cd suzumushi-v1.2.1-x86_64-unknown-linux-gnu
+tar -xf suzumushi-v1.2.2-x86_64-unknown-linux-gnu.tar.xz
+cd suzumushi-v1.2.2-x86_64-unknown-linux-gnu
 sudo install -Dm755 suzumushi /usr/local/bin/suzumushi
 sudo ln -s suzumushi /usr/local/bin/suzu
 ```
@@ -219,7 +231,7 @@ automatic resampling are not current support claims.
 
 ## Status
 
-Version `1.2.1` is the current stable release. Its tag-driven Linux archive is
+Version `1.2.2` is the current stable release. Its tag-driven Linux archive is
 fully verified before GitHub publishes it. Arch users can install the matching
 `suzumushi-bin` package from AUR.
 

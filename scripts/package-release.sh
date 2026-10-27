@@ -46,7 +46,7 @@ if [[ "$binary_version" != "suzumushi $VERSION" ]]; then
 fi
 
 mkdir -p -- "$OUTPUT_DIR"
-if [[ -e "$OUTPUT_DIR/$ARCHIVE" || -e "$OUTPUT_DIR/SHA256SUMS" ]]; then
+if [[ -e "$OUTPUT_DIR/$ARCHIVE" || -e "$OUTPUT_DIR/SHA256SUMS" || -e "$OUTPUT_DIR/install.sh" ]]; then
   echo "error: refusing to overwrite existing release output" >&2
   exit 1
 fi
@@ -83,8 +83,19 @@ LC_ALL=C tar \
   sha256sum "$ARCHIVE" >SHA256SUMS
 )
 
+# The installer embeds this exact archive hash, so it only ever installs this release.
+archive_sha="$(cut -d' ' -f1 "$OUTPUT_DIR/SHA256SUMS")"
+sed -e "s/@VERSION@/$VERSION/g" -e "s/@SHA256@/$archive_sha/g" \
+  scripts/install.sh.in >"$OUTPUT_DIR/install.sh"
+if grep -q '@[A-Z0-9_]*@' "$OUTPUT_DIR/install.sh"; then
+  echo "error: unresolved installer template value" >&2
+  exit 1
+fi
+
 scripts/verify-release-archive.sh \
   "$VERSION" \
   "$TARGET" \
   "$OUTPUT_DIR/$ARCHIVE" \
   "$OUTPUT_DIR/SHA256SUMS"
+
+scripts/verify-installer.sh "$VERSION" "$OUTPUT_DIR"

@@ -1,0 +1,88 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# Installs one exact Suzumushi release. Use --bin-dir to choose a directory.
+# Safe to pipe into sh: main runs only after the shell has read the last line.
+set -eu
+umask 077
+version='@VERSION@'
+expected='@SHA256@'
+base_url="https://github.com/nuggocto/suzumushi/releases/download/v$version"
+work=''
+staging=''
+fail() { printf 'error: %s\n' "$1" >&2; exit 1; }
+cleanup() {
+    if [ -n "$work" ]; then rm -rf "$work"; fi
+    if [ -n "$staging" ]; then rm -rf "$staging"; fi
+}
+
+main() {
+    if [ "$#" = 1 ] && [ "$1" = --help ]; then
+        printf '%s\n' 'Usage: sh install.sh [--bin-dir /directory]' \
+            '   or: curl -fsS https://suzumushi.org/install.sh | sh -s -- --bin-dir /directory' \
+            'Default: .local/bin under your home directory (created if needed).' \
+            'Installs suzumushi and the suzu shortcut without sudo or profile changes.'
+        exit 0
+    fi
+    case "$#" in
+        0) [ -n "${HOME:-}" ] || fail 'HOME is not set'; bin_dir="$HOME/.local/bin" ;;
+        2) [ "$1" = --bin-dir ] || fail 'expected --bin-dir DIRECTORY'; bin_dir=$2 ;;
+        *) fail 'expected no arguments or --bin-dir DIRECTORY' ;;
+    esac
+    case "$bin_dir" in /*) ;; *) fail 'installation directory must be absolute' ;; esac
+    [ "${#bin_dir}" -le 4096 ] || fail 'installation path is too long'
+    if [ -e "$bin_dir" ]; then
+        [ -d "$bin_dir" ] && [ -w "$bin_dir" ] || fail 'installation directory must be writable'
+    fi
+    destination="$bin_dir/suzumushi"
+    shortcut="$bin_dir/suzu"
+    [ ! -L "$destination" ] || fail 'destination must not be a symbolic link'
+    if [ -e "$destination" ]; then
+        [ -f "$destination" ] || fail 'destination must be a regular file'
+    fi
+    # Replace suzu only when it is our own relative link.
+    if [ -e "$shortcut" ] || [ -L "$shortcut" ]; then
+        [ -L "$shortcut" ] && [ "$(readlink "$shortcut")" = suzumushi ] ||
+            fail "$shortcut belongs to another program"
+    fi
+    [ "$(uname -s):$(uname -m)" = Linux:x86_64 ] || fail 'Suzumushi releases support x86_64 Linux only'
+    for tool in curl tar xz sha256sum mktemp readlink chmod ln mv; do
+        command -v "$tool" >/dev/null || fail "missing tool: $tool"
+    done
+    work=$(mktemp -d "${TMPDIR:-/tmp}/suzumushi-install.XXXXXXXX")
+    trap cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM HUP
+    folder="suzumushi-v$version-x86_64-unknown-linux-gnu"
+    curl --fail --silent --show-error --location --max-redirs 5 \
+        --proto '=https' --proto-redir '=https' --tlsv1.2 \
+        --connect-timeout 15 --max-time 300 --max-filesize 67108864 \
+        --output "$work/archive.tar.xz" "$base_url/$folder.tar.xz" || fail 'archive download failed'
+    actual=$(sha256sum "$work/archive.tar.xz")
+    [ "${actual%% *}" = "$expected" ] || fail 'archive checksum mismatch'
+    listing=$(LC_ALL=C tar -tJf "$work/archive.tar.xz" | LC_ALL=C sort) || fail 'cannot read archive'
+    expected_listing=$(printf '%s\n' "$folder/" "$folder/CHANGELOG.md" "$folder/LICENSE" \
+        "$folder/README.md" "$folder/suzu" "$folder/suzumushi")
+    [ "$listing" = "$expected_listing" ] || fail 'unexpected archive layout'
+    tar -xJf "$work/archive.tar.xz" -C "$work" || fail 'archive extraction failed'
+    [ -f "$work/$folder/suzumushi" ] && [ ! -L "$work/$folder/suzumushi" ] || fail 'missing regular executable'
+    chmod 755 "$work/$folder/suzumushi"
+    actual_version=$("$work/$folder/suzumushi" --version </dev/null) ||
+        fail 'suzumushi cannot start; install the ALSA, PipeWire, and D-Bus runtime libraries'
+    [ "$actual_version" = "suzumushi $version" ] || fail 'downloaded executable version mismatch'
+    mkdir -p "$bin_dir" || fail 'cannot create installation directory'
+    bin_dir=$(CDPATH='' cd -P "$bin_dir" && pwd)
+    staging=$(mktemp -d "$bin_dir/.suzumushi-install.XXXXXXXX")
+    cp "$work/$folder/suzumushi" "$staging/suzumushi"
+    chmod 755 "$staging/suzumushi"
+    ln -s suzumushi "$staging/suzu"
+    # Rename within the destination filesystem only after every check succeeds.
+    mv -f "$staging/suzumushi" "$bin_dir/"
+    mv -f "$staging/suzu" "$bin_dir/"
+    printf 'Installed Suzumushi %s in %s.\n' "$version" "$bin_dir"
+    case ":${PATH:-}:" in
+        *":$bin_dir:"*) printf '%s\n' 'Run suzumushi init ./suzumushi to create your library.' ;;
+        *) printf 'Add %s to PATH in your shell settings, then run suzumushi init ./suzumushi.\n' "$bin_dir" ;;
+    esac
+}
+
+main "$@"

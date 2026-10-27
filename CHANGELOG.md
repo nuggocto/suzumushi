@@ -5,7 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.2.2] - 2026-10-27
+
+### Added
+
+- Install with `curl -fsS https://suzumushi.org/install.sh | sh`. The installer
+  puts `suzumushi` and `suzu` in `~/.local/bin` without sudo, checks the archive
+  against its recorded SHA-256, and runs nothing if the download stops partway.
+  Each release now publishes its `install.sh`.
 
 ### Changed
 

@@ -33,12 +33,23 @@ repository permission and performs these operations:
 3. Require Rust 1.98.1 and build the locked GNU/Linux release binary.
 4. Create and independently inspect the fixed-content archive.
 5. Produce and verify `SHA256SUMS`.
-6. Run the extracted binary's version and initialization commands, then scan
+6. Render `install.sh` from `scripts/install.sh.in` with the archive hash, then
+   run `scripts/verify-installer.sh` against the local archive. It pipes
+   truncated copies and requires them to install nothing, installs and
+   reinstalls both commands, and checks that a wrong hash or a foreign `suzu`
+   leaves existing files alone.
+7. Run the extracted binary's version and initialization commands, then scan
    the MP3 fixture through the packaged `suzu` symlink. Each command has a
    ten-second timeout, with forced termination one second later if needed.
 
 A separate job receives only those verified files and the permission needed to
-create the GitHub release. Prerelease versions are marked as prereleases and
+create the GitHub release with the archive, `SHA256SUMS`, and `install.sh`. A
+final job pipes the published `install.sh` into `sh` on a clean runner and
+checks that both commands report the release version.
+
+suzumushi.org serves a byte-for-byte copy of the latest release's `install.sh`.
+After each release, copy it into the website's `public/install.sh` and record
+its SHA-256 there; the website build refuses a copy whose hash differs. Prerelease versions are marked as prereleases and
 are never selected as the latest stable release. The workflow refuses to
 overwrite existing archive or checksum files.
 
