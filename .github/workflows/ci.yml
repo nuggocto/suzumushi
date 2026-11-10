@@ -40,7 +40,7 @@ jobs:
 
   ci:
     name: mise run ci
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       CARGO_INCREMENTAL: "0"
     steps:

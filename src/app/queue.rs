@@ -6,13 +6,9 @@ use std::mem::size_of;
 use std::ops::Range;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use super::reserve_exact;
 use crate::config::Config;
 use crate::errors::{AppError, AppResult};
 use crate::model::{ScanIndex, TrackEntryId};
-
-// Config validation charges this many bytes per item before any queue exists.
-const _: () = assert!(size_of::<QueueItem>() == crate::config::QUEUE_ITEM_ACCOUNTING_BYTES);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct QueueItem {
@@ -25,7 +21,7 @@ pub(crate) struct QueueItem {
 #[derive(Debug)]
 pub(super) struct QueueState {
     items: Vec<QueueItem>,
-    queued_assets: Vec<u8>,
+    queued_assets: Vec<bool>,
     pub(super) selection: usize,
     generation: u64,
     next_item_id: u64,
@@ -41,7 +37,6 @@ pub(super) enum QueueError {
     Unavailable,
     Duplicate,
     Limit,
-    GenerationExhausted,
 }
 
 pub(super) struct RestoredQueue {
@@ -51,37 +46,19 @@ pub(super) struct RestoredQueue {
 }
 
 impl QueueState {
-    pub(super) fn new(config: &Config, asset_count: usize) -> AppResult<Self> {
-        // Checking the whole reservation here lets `max_items` alone bound
-        // later appends to `max_bytes`.
-        let mut queue = Vec::new();
-        reserve_exact(&mut queue, config.queue.max_items, "queue")?;
-        let queue_bytes = queue
-            .capacity()
-            .checked_mul(size_of::<QueueItem>())
-            .ok_or_else(|| AppError::Resource("queue byte reservation overflow".into()))?;
-        if queue_bytes > config.queue.max_bytes {
-            return Err(AppError::InvalidConfig(
-                "reserved queue capacity exceeds queue.max_bytes".into(),
-            ));
-        }
-        let mut shuffle_order = Vec::new();
-        reserve_exact(&mut shuffle_order, config.queue.max_items, "shuffle order")?;
-        let mut queued_assets = Vec::new();
-        reserve_exact(&mut queued_assets, asset_count, "queued assets")?;
-        queued_assets.resize(asset_count, 0);
-        Ok(Self {
-            items: queue,
-            queued_assets,
+    pub(super) fn new(config: &Config, asset_count: usize) -> Self {
+        Self {
+            items: Vec::new(),
+            queued_assets: vec![false; asset_count],
             selection: 0,
             generation: 0,
             next_item_id: 1,
             max_items: config.queue.max_items,
             shuffle: false,
-            shuffle_order,
+            shuffle_order: Vec::new(),
             shuffle_cursor: None,
             shuffle_seed: random_seed(),
-        })
+        }
     }
 
     pub(super) fn items(&self) -> &[QueueItem] {
@@ -101,18 +78,16 @@ impl QueueState {
         index: &ScanIndex,
         snapshot: &crate::state::SessionSnapshot,
     ) -> AppResult<Option<RestoredQueue>> {
-        let mut wanted = Vec::new();
-        reserve_exact(
-            &mut wanted,
-            snapshot.queue_entry_ids.len(),
-            "resume entry lookup",
-        )?;
-        wanted.extend(snapshot.queue_entry_ids.iter().copied().map(TrackEntryId));
+        let mut wanted: Vec<TrackEntryId> = snapshot
+            .queue_entry_ids
+            .iter()
+            .copied()
+            .map(TrackEntryId)
+            .collect();
         wanted.sort_unstable();
         wanted.dedup();
 
-        let mut available = Vec::new();
-        reserve_exact(&mut available, wanted.len(), "resume entry map")?;
+        let mut available = Vec::with_capacity(wanted.len());
         for (entry_index, entry) in index.entries.iter().enumerate() {
             if wanted.binary_search(&entry.id).is_ok() {
                 available.push((entry.id, entry_index));
@@ -218,84 +193,63 @@ impl QueueState {
             .get(entry_index)
             .and_then(|entry| self.queued_assets.get_mut(entry.asset_index))
             .ok_or(QueueError::Unavailable)?;
-        if *queued != 0 {
+        if *queued {
             return Err(QueueError::Duplicate);
         }
-        *queued = 1;
+        *queued = true;
         Ok(())
     }
 
     fn unmark_assets(&mut self, index: &ScanIndex, entries: impl Iterator<Item = usize>) {
         for entry_index in entries {
             let asset_index = index.entries[entry_index].asset_index;
-            self.queued_assets[asset_index] = 0;
-        }
-    }
-
-    fn check_generation(&self) -> Result<(), QueueError> {
-        if self.generation == u64::MAX {
-            Err(QueueError::GenerationExhausted)
-        } else {
-            Ok(())
+            self.queued_assets[asset_index] = false;
         }
     }
 
     fn check_append(&self, count: usize) -> Result<(), QueueError> {
-        let next_items = self.items.len().checked_add(count);
-        let identities_fit = u64::try_from(count)
-            .ok()
-            .and_then(|count| self.next_item_id.checked_add(count))
-            .is_some();
-        if next_items.is_none_or(|items| items > self.max_items) || !identities_fit {
+        if self.items.len() + count > self.max_items {
             return Err(QueueError::Limit);
         }
-        self.check_generation()
+        Ok(())
     }
 
-    pub(super) fn remove_selected(
-        &mut self,
-        index: &ScanIndex,
-    ) -> Result<Option<QueueItem>, QueueError> {
-        let Some(item) = self.items.get(self.selection).copied() else {
-            return Ok(None);
-        };
-        self.check_generation()?;
+    pub(super) fn remove_selected(&mut self, index: &ScanIndex) -> Option<QueueItem> {
+        let item = self.items.get(self.selection).copied()?;
         self.items.remove(self.selection);
         self.unmark_assets(index, std::iter::once(item.entry_index));
         self.remove_from_shuffle_order(item.instance_id);
         self.selection = self.selection.min(self.items.len().saturating_sub(1));
         self.generation += 1;
-        Ok(Some(item))
+        Some(item)
     }
 
-    pub(super) fn clear(&mut self) -> Result<bool, QueueError> {
+    pub(super) fn clear(&mut self) -> bool {
         if self.items.is_empty() {
-            return Ok(false);
+            return false;
         }
-        self.check_generation()?;
         self.items.clear();
-        self.queued_assets.fill(0);
+        self.queued_assets.fill(false);
         self.shuffle_order.clear();
         self.shuffle_cursor = None;
         self.selection = 0;
         self.generation += 1;
-        Ok(true)
+        true
     }
 
-    pub(super) fn move_selected(&mut self, down: bool) -> Result<bool, QueueError> {
+    pub(super) fn move_selected(&mut self, down: bool) -> bool {
         let destination = if down {
             self.selection.checked_add(1)
         } else {
             self.selection.checked_sub(1)
         };
         let Some(destination) = destination.filter(|position| *position < self.items.len()) else {
-            return Ok(false);
+            return false;
         };
-        self.check_generation()?;
         self.items.swap(self.selection, destination);
         self.selection = destination;
         self.generation += 1;
-        Ok(true)
+        true
     }
 
     pub(super) fn select_current(&mut self, item: QueueItem) {

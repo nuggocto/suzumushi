@@ -5,12 +5,12 @@ use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use super::browser::{contains_ascii_case_insensitive, rebuild_ascii_case_prefix};
+use super::browser::contains_ignoring_ascii_case;
 use super::{
     AppState, BrowserRow, ColorMode, Focus, PlaybackIntent, PlaybackStatus, RepeatMode, StatusKind,
 };
 use crate::audio::{AudioEvent, AudioFormat, AudioPosition};
-use crate::config::Config;
+use crate::config::{Config, Theme};
 use crate::input::AppAction;
 use crate::model::{
     FileIdentity, MediaAsset, Playlist, PlaylistId, ScanCounters, ScanIndex, SearchFields,
@@ -136,7 +136,7 @@ fn fixture_entries(playlist_id: PlaylistId) -> Vec<TrackEntry> {
 }
 
 fn app_with_two_queued_tracks() -> AppState {
-    let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+    let mut app = AppState::new(&Config::default(), fixture_index());
     select_entry(&mut app, 0);
     app.apply(AppAction::Activate)
         .expect("idle Enter starts playback");
@@ -149,8 +149,7 @@ fn app_playing_three_distinct_tracks() -> AppState {
     let mut app = AppState::new(
         &Config::default(),
         fixture_index_with_distinct_context_assets(),
-    )
-    .expect("app state");
+    );
     for entry_index in 0..3 {
         select_entry(&mut app, entry_index);
         app.apply(AppAction::Activate);
@@ -202,7 +201,7 @@ fn select_entry(app: &mut AppState, entry_index: usize) {
 
 #[test]
 fn focus_cycles_both_directions() {
-    let mut app = AppState::new(&Config::default(), empty_index()).expect("app state");
+    let mut app = AppState::new(&Config::default(), empty_index());
     assert_eq!(app.focus, Focus::Library);
     app.apply(AppAction::FocusNext);
     assert_eq!(app.focus, Focus::Player);
@@ -220,7 +219,7 @@ fn focus_cycles_both_directions() {
 
 #[test]
 fn help_is_modal_and_closes_without_triggering_hidden_actions() {
-    let mut app = AppState::new(&Config::default(), empty_index()).expect("app state");
+    let mut app = AppState::new(&Config::default(), empty_index());
 
     app.apply(AppAction::ToggleHelp);
     assert!(app.help_visible());
@@ -241,7 +240,7 @@ fn missing_creator_metadata_is_omitted() {
     let mut index = fixture_index();
     index.assets[0].tags.artist = None;
     index.assets[0].tags.album_artist = None;
-    let mut app = AppState::new(&Config::default(), index).expect("app state");
+    let mut app = AppState::new(&Config::default(), index);
     app.apply(AppAction::Activate)
         .expect("untagged fixture starts");
 
@@ -252,17 +251,26 @@ fn missing_creator_metadata_is_omitted() {
 #[test]
 fn mono_is_chosen_by_theme_no_color_or_a_dumb_terminal() {
     assert_eq!(
-        ColorMode::resolve("terminal", false, false),
+        ColorMode::resolve(Theme::Terminal, false, false),
         ColorMode::Terminal
     );
-    assert_eq!(ColorMode::resolve("mono", false, false), ColorMode::Mono);
-    assert_eq!(ColorMode::resolve("terminal", true, false), ColorMode::Mono);
-    assert_eq!(ColorMode::resolve("terminal", false, true), ColorMode::Mono);
+    assert_eq!(
+        ColorMode::resolve(Theme::Mono, false, false),
+        ColorMode::Mono
+    );
+    assert_eq!(
+        ColorMode::resolve(Theme::Terminal, true, false),
+        ColorMode::Mono
+    );
+    assert_eq!(
+        ColorMode::resolve(Theme::Terminal, false, true),
+        ColorMode::Mono
+    );
 }
 
 #[test]
 fn browser_rows_preserve_nested_folders_and_folder_playlists() {
-    let app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+    let app = AppState::new(&Config::default(), fixture_index());
 
     assert!(matches!(app.browser.rows[0], BrowserRow::LibraryRoot));
     assert!(matches!(
@@ -294,7 +302,7 @@ fn browser_rows_preserve_nested_folders_and_folder_playlists() {
 
 #[test]
 fn folder_activation_hides_descendants_without_hiding_search_results() {
-    let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+    let mut app = AppState::new(&Config::default(), fixture_index());
     let expanded_rows = app.library_row_count();
     app.browser.selection = (0..expanded_rows)
         .position(|position| {
@@ -337,7 +345,7 @@ fn folder_activation_hides_descendants_without_hiding_search_results() {
 
 #[test]
 fn nested_folder_collapse_survives_parent_toggle() {
-    let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+    let mut app = AppState::new(&Config::default(), fixture_index());
     let expanded_rows = app.library_row_count();
     app.browser.selection = (0..expanded_rows)
         .position(|position| {
@@ -399,22 +407,11 @@ fn nested_folder_collapse_survives_parent_toggle() {
 }
 
 #[test]
-fn browser_refuses_an_index_that_exceeds_its_recorded_scan_bound() {
-    let mut index = fixture_index();
-    index.counters.encountered_entries -= 1;
-
-    let error = AppState::new(&Config::default(), index)
-        .expect_err("browser must not grow beyond its reserved bound");
-
-    assert!(error.to_string().contains("scanner-derived row bound"));
-}
-
-#[test]
 fn search_is_bounded_and_matches_metadata() {
     let mut config = Config::default();
     config.search.max_results = 1;
     config.search.max_query_bytes = 8;
-    let mut app = AppState::new(&config, fixture_index()).expect("app state");
+    let mut app = AppState::new(&config, fixture_index());
 
     app.key(key(KeyCode::Char('/')), Duration::ZERO);
     for character in "ARTIST".chars() {
@@ -435,8 +432,8 @@ fn search_is_bounded_and_matches_metadata() {
 
     app.key(key(KeyCode::Esc), Duration::ZERO);
     assert!(!app.browser.search.active);
-    assert!(app.browser.search.query.is_empty());
-    assert!(app.browser.search.results.is_empty());
+    assert_eq!(app.browser.search.query, "");
+    assert_eq!(app.browser.search.results, Vec::<usize>::new());
 }
 
 #[test]
@@ -456,7 +453,7 @@ fn search_independently_matches_filename_and_relative_path() {
     }
     index.entries[0].search.filename = "filename-only-token".into();
     index.entries[1].search.relative_path = "folder/path-only-token.flac".into();
-    let mut app = AppState::new(&Config::default(), index).expect("app state");
+    let mut app = AppState::new(&Config::default(), index);
 
     app.key(key(KeyCode::Char('/')), Duration::ZERO);
     for character in "filename-only-token".chars() {
@@ -476,7 +473,7 @@ fn search_independently_matches_filename_and_relative_path() {
 
 #[test]
 fn q_is_search_text_while_ctrl_c_is_global() {
-    let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+    let mut app = AppState::new(&Config::default(), fixture_index());
 
     app.key(key(KeyCode::Char('/')), Duration::ZERO);
     app.key(key(KeyCode::Char('q')), Duration::ZERO);
@@ -491,26 +488,28 @@ fn q_is_search_text_while_ctrl_c_is_global() {
 }
 
 #[test]
-fn ascii_case_search_stays_linear_on_repetitive_near_matches() {
-    let haystack = vec![b'a'; 16_384];
-    let mut needle = vec![b'a'; 1_024];
-    *needle.last_mut().expect("non-empty needle") = b'b';
-    let mut prefix_table = Vec::new();
-    rebuild_ascii_case_prefix(&needle, &mut prefix_table);
-
-    let result = contains_ascii_case_insensitive(&haystack, &needle, &prefix_table);
-
-    assert!(!result.found);
-    assert!(
-        result.comparisons <= haystack.len().saturating_mul(2),
-        "{} comparisons exceeded the linear bound",
-        result.comparisons
-    );
+fn search_matching_ignores_ascii_case_only() {
+    assert!(contains_ignoring_ascii_case(b"Night Song", b"nIGHT s"));
+    assert!(contains_ignoring_ascii_case(
+        b"library/JDR/night.mp3",
+        b"jdr/"
+    ));
+    assert!(!contains_ignoring_ascii_case(b"Night", b"nights"));
+    assert!(!contains_ignoring_ascii_case(b"Night", b""));
+    // Bytes outside ASCII compare exactly.
+    assert!(contains_ignoring_ascii_case(
+        "Été".as_bytes(),
+        "Té".as_bytes()
+    ));
+    assert!(!contains_ignoring_ascii_case(
+        "Été".as_bytes(),
+        "été".as_bytes()
+    ));
 }
 
 #[test]
 fn activating_a_playlist_queues_its_tracks_as_one_mutation() {
-    let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+    let mut app = AppState::new(&Config::default(), fixture_index());
     app.browser.selection = 1;
     app.apply(AppAction::Activate);
     app.browser.selection = (0..app.library_row_count())
@@ -540,8 +539,7 @@ fn activating_a_playlist_queues_its_tracks_as_one_mutation() {
 
     let mut config = Config::default();
     config.queue.max_items = 1;
-    config.queue.max_bytes = 32;
-    let mut limited = AppState::new(&config, fixture_index()).expect("limited app state");
+    let mut limited = AppState::new(&config, fixture_index());
     limited.browser.selection = (0..limited.library_row_count())
         .position(|position| {
             matches!(
@@ -568,7 +566,7 @@ fn activating_a_playlist_queues_its_tracks_as_one_mutation() {
 
 #[test]
 fn duplicate_audio_activation_does_not_mutate_the_queue() {
-    let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+    let mut app = AppState::new(&Config::default(), fixture_index());
     select_entry(&mut app, 0);
     app.apply(AppAction::Activate);
     select_entry(&mut app, 2);
@@ -595,7 +593,7 @@ fn duplicate_audio_activation_does_not_mutate_the_queue() {
 
 #[test]
 fn playlist_with_queued_audio_is_rejected_atomically() {
-    let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+    let mut app = AppState::new(&Config::default(), fixture_index());
     select_entry(&mut app, 1);
     app.apply(AppAction::Activate);
     app.browser.selection = (0..app.library_row_count())
@@ -627,9 +625,7 @@ fn playlist_with_queued_audio_is_rejected_atomically() {
 fn queue_mutations_are_bounded_and_advance_generation_once() {
     let mut config = Config::default();
     config.queue.max_items = 2;
-    config.queue.max_bytes = 64;
-    let mut app =
-        AppState::new(&config, fixture_index_with_distinct_context_assets()).expect("app state");
+    let mut app = AppState::new(&config, fixture_index_with_distinct_context_assets());
 
     select_entry(&mut app, 0);
     app.apply(AppAction::Activate);
@@ -654,7 +650,7 @@ fn queue_mutations_are_bounded_and_advance_generation_once() {
     assert_eq!(app.queue.items().len(), 1);
     assert_eq!(app.queue.generation(), 4);
     app.apply(AppAction::QueueClear);
-    assert!(app.queue.items().is_empty());
+    assert_eq!(app.queue.items(), []);
     assert_eq!(app.queue.generation(), 5);
     app.apply(AppAction::QueueClear);
     assert_eq!(
@@ -676,7 +672,7 @@ fn queue_mutations_are_bounded_and_advance_generation_once() {
 
 #[test]
 fn playback_generations_and_queue_navigation_stay_in_the_app_loop() {
-    let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+    let mut app = AppState::new(&Config::default(), fixture_index());
     select_entry(&mut app, 0);
     let first = app
         .apply(AppAction::Activate)
@@ -763,7 +759,7 @@ fn playback_generations_and_queue_navigation_stay_in_the_app_loop() {
 
 #[test]
 fn removing_the_current_queue_item_keeps_the_next_position_deterministic() {
-    let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+    let mut app = AppState::new(&Config::default(), fixture_index());
     select_entry(&mut app, 0);
     app.apply(AppAction::Activate);
     select_entry(&mut app, 1);
@@ -787,8 +783,7 @@ fn removing_entries_before_an_absent_playing_item_preserves_its_successor() {
     let mut app = AppState::new(
         &Config::default(),
         fixture_index_with_distinct_context_assets(),
-    )
-    .expect("app state");
+    );
     for index in 0..4 {
         select_entry(&mut app, index);
         app.apply(AppAction::Activate);
@@ -809,7 +804,7 @@ fn removing_entries_before_an_absent_playing_item_preserves_its_successor() {
 
 #[test]
 fn stop_clears_a_failed_playback_without_waiting_for_a_dead_worker_track() {
-    let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+    let mut app = AppState::new(&Config::default(), fixture_index());
     select_entry(&mut app, 0);
     app.apply(AppAction::Activate);
     app.audio_event(AudioEvent::Failed {
@@ -824,7 +819,7 @@ fn stop_clears_a_failed_playback_without_waiting_for_a_dead_worker_track() {
 
 #[test]
 fn playback_controls_are_bounded_and_keep_position_in_app_state() {
-    let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+    let mut app = AppState::new(&Config::default(), fixture_index());
     select_entry(&mut app, 0);
     app.apply(AppAction::Activate)
         .expect("idle Enter starts playback");
@@ -843,11 +838,11 @@ fn playback_controls_are_bounded_and_keep_position_in_app_state() {
     });
 
     assert!(matches!(
-        app.apply(AppAction::SeekBackward),
+        app.apply(AppAction::seek_step(false)),
         Some(PlaybackIntent::Seek { position, .. }) if position == Duration::from_secs(5)
     ));
     assert!(matches!(
-        app.apply(AppAction::SeekForward),
+        app.apply(AppAction::seek_step(true)),
         Some(PlaybackIntent::Seek { position, .. }) if position == Duration::from_secs(10)
     ));
     assert!(matches!(
@@ -870,7 +865,7 @@ fn playback_controls_are_bounded_and_keep_position_in_app_state() {
 
 #[test]
 fn enter_toggles_playback_outside_the_library() {
-    let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+    let mut app = AppState::new(&Config::default(), fixture_index());
     select_entry(&mut app, 0);
     app.apply(AppAction::Activate)
         .expect("idle activation starts playback");
@@ -898,7 +893,7 @@ fn enter_toggles_playback_outside_the_library() {
 
 #[test]
 fn external_controls_use_exact_idempotent_app_actions() {
-    let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+    let mut app = AppState::new(&Config::default(), fixture_index());
     select_entry(&mut app, 0);
     app.apply(AppAction::Activate)
         .expect("idle Enter starts playback");
@@ -1165,7 +1160,7 @@ fn seeking_to_the_end_preserves_pause_when_advancing_or_repeating() {
         (RepeatMode::All, 20),
         (RepeatMode::One, 10),
     ] {
-        let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+        let mut app = AppState::new(&Config::default(), fixture_index());
         select_entry(&mut app, 0);
         app.apply(AppAction::Activate).expect("start first track");
         select_entry(&mut app, 1);
@@ -1212,10 +1207,10 @@ fn next_and_previous_only_select_tracks_while_stopped() {
 
     assert!(app.apply(AppAction::Next).is_none());
     assert_eq!(app.playback.status, PlaybackStatus::Stopped);
-    assert_eq!(app.queue_position(), Some(2));
+    assert_eq!(app.current_queue_index(), Some(1));
     assert!(app.apply(AppAction::Previous).is_none());
     assert_eq!(app.playback.status, PlaybackStatus::Stopped);
-    assert_eq!(app.queue_position(), Some(1));
+    assert_eq!(app.current_queue_index(), Some(0));
 }
 
 #[test]
@@ -1244,7 +1239,7 @@ fn relative_seek_beyond_the_end_advances_to_the_next_track() {
 
 #[test]
 fn absolute_seek_beyond_the_duration_is_ignored() {
-    let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+    let mut app = AppState::new(&Config::default(), fixture_index());
     select_entry(&mut app, 0);
     app.apply(AppAction::Activate)
         .expect("idle Enter starts playback");
@@ -1279,7 +1274,7 @@ fn absolute_seek_beyond_the_duration_is_ignored() {
 
 #[test]
 fn fractional_seek_acknowledgements_allow_progress_to_continue() {
-    let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+    let mut app = AppState::new(&Config::default(), fixture_index());
     app.apply(AppAction::Activate);
     app.audio_event(AudioEvent::Started {
         generation: 1,
@@ -1294,7 +1289,7 @@ fn fractional_seek_acknowledgements_allow_progress_to_continue() {
         position: Duration::from_nanos(256_020_833),
         duration: Some(Duration::from_mins(1)),
     });
-    let intent = app.apply(AppAction::SeekForward);
+    let intent = app.apply(AppAction::seek_step(true));
     app.audio_event(AudioEvent::Seeked {
         generation: 1,
         timeline_revision: 2,
@@ -1315,7 +1310,7 @@ fn fractional_seek_acknowledgements_allow_progress_to_continue() {
 
 #[test]
 fn repeated_seeks_keep_the_latest_target_until_it_is_acknowledged() {
-    let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+    let mut app = AppState::new(&Config::default(), fixture_index());
     select_entry(&mut app, 0);
     app.apply(AppAction::Activate)
         .expect("idle Enter starts playback");
@@ -1329,7 +1324,7 @@ fn repeated_seeks_keep_the_latest_target_until_it_is_acknowledged() {
 
     let mut final_intent = None;
     for _ in 0..20 {
-        final_intent = app.apply(AppAction::SeekForward);
+        final_intent = app.apply(AppAction::seek_step(true));
     }
     assert!(matches!(
         final_intent,
@@ -1366,7 +1361,7 @@ fn repeated_seeks_keep_the_latest_target_until_it_is_acknowledged() {
 
 #[test]
 fn timing_revisions_prevent_cross_lane_position_regressions() {
-    let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+    let mut app = AppState::new(&Config::default(), fixture_index());
     select_entry(&mut app, 0);
     app.apply(AppAction::Activate)
         .expect("idle Enter starts playback");
@@ -1420,8 +1415,7 @@ fn shuffle_is_a_permutation_and_repeat_modes_choose_in_the_app_loop() {
     let mut app = AppState::new(
         &Config::default(),
         fixture_index_with_distinct_context_assets(),
-    )
-    .expect("app state");
+    );
     app.queue.shuffle_seed = 1;
     select_entry(&mut app, 0);
     app.apply(AppAction::Activate);
@@ -1468,7 +1462,7 @@ fn shuffle_is_a_permutation_and_repeat_modes_choose_in_the_app_loop() {
 
 #[test]
 fn saved_session_restores_available_queue_entries_at_position() {
-    let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+    let mut app = AppState::new(&Config::default(), fixture_index());
     let snapshot = crate::state::SessionSnapshot::new(vec![10, 999, 20, 10], 2, 123_400);
 
     app.restore_session(&snapshot).expect("restore session");
@@ -1504,21 +1498,21 @@ fn saved_session_restores_available_queue_entries_at_position() {
 
 #[test]
 fn clearing_the_queue_removes_the_resumable_session() {
-    let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+    let mut app = AppState::new(&Config::default(), fixture_index());
     select_entry(&mut app, 0);
     app.apply(AppAction::Activate);
-    assert!(app.session_snapshot().expect("session snapshot").is_some());
+    assert!(app.session_snapshot().is_some());
 
     app.focus = Focus::Queue;
     app.apply(AppAction::QueueClear);
 
-    assert!(app.session_snapshot().expect("cleared snapshot").is_none());
+    assert!(app.session_snapshot().is_none());
 }
 
 #[test]
 fn a_finished_track_resumes_from_the_beginning() {
     for duration in [Some(Duration::from_secs(10)), None] {
-        let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+        let mut app = AppState::new(&Config::default(), fixture_index());
         select_entry(&mut app, 0);
         app.apply(AppAction::Activate);
         app.audio_event(AudioEvent::Started {
@@ -1539,10 +1533,7 @@ fn a_finished_track_resumes_from_the_beginning() {
         });
         app.audio_event(AudioEvent::Finished { generation: 1 });
 
-        let snapshot = app
-            .session_snapshot()
-            .expect("session snapshot")
-            .expect("saved queue");
+        let snapshot = app.session_snapshot().expect("saved queue");
 
         assert_eq!(snapshot.position_ms, 0);
 
@@ -1554,7 +1545,7 @@ fn a_finished_track_resumes_from_the_beginning() {
 
 #[test]
 fn shuffled_playlist_starts_at_its_first_track_without_skipping_the_round() {
-    let mut app = AppState::new(&Config::default(), fixture_index()).expect("app state");
+    let mut app = AppState::new(&Config::default(), fixture_index());
     app.queue.shuffle = true;
     app.queue.shuffle_seed = 2;
     app.browser.selection = app
@@ -1600,8 +1591,7 @@ fn queue_edits_preserve_the_played_shuffle_prefix() {
     let mut app = AppState::new(
         &Config::default(),
         fixture_index_with_distinct_context_assets(),
-    )
-    .expect("app state");
+    );
     app.queue.shuffle_seed = 1;
     for entry_index in 0..3 {
         select_entry(&mut app, entry_index);

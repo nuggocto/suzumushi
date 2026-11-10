@@ -3,19 +3,18 @@
 //! App-owned library, search, queue, terminal state, and session lifecycle.
 
 use std::ffi::OsStr;
-use std::io;
-use std::mem::size_of;
+use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::audio::{AudioFormat, AudioSpectrum, PlaybackSettings};
-use crate::config::{Config, UI_STATE_SCRATCH_BYTES};
+use crate::config::{Config, DefaultView, Theme};
 use crate::display::{bounded_text, terminal_safe};
-use crate::errors::{AppError, AppResult};
+use crate::errors::AppResult;
 use crate::input::AppAction;
-use crate::locks::{ActiveTuiLease, RootWriterLease};
+use crate::locks::RootWriterLease;
 use crate::model::{ScanIndex, TrackEntry};
 use crate::paths::SelectedRoot;
 
@@ -28,10 +27,9 @@ use playback::PlaybackState;
 pub(crate) use queue::QueueItem;
 use queue::{QueueError, QueueState};
 
+use browser::BrowserState;
 pub(crate) use browser::{BrowserRow, normal_component};
-use browser::{BrowserState, browser_reservation, search_reservation_bytes};
 
-const TUI_STARTUP_OPEN_FILES_PEAK: usize = 6;
 const INFORMATION_NOTICE_LIFETIME: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,8 +78,8 @@ enum Overlay {
 
 impl ColorMode {
     #[must_use]
-    pub fn resolve(theme: &str, no_color: bool, dumb_terminal: bool) -> Self {
-        if theme == "mono" || no_color || dumb_terminal {
+    pub fn resolve(theme: Theme, no_color: bool, dumb_terminal: bool) -> Self {
+        if theme == Theme::Mono || no_color || dumb_terminal {
             Self::Mono
         } else {
             Self::Terminal
@@ -182,50 +180,20 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Builds app-owned browser and queue state from one scan request.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when a validated bounded reservation cannot be made.
-    pub fn new(config: &Config, index: ScanIndex) -> AppResult<Self> {
-        let focus = if config.default_view == "queue" {
-            Focus::Queue
-        } else {
-            Focus::Library
+    /// Builds app-owned browser and queue state from one scan.
+    #[must_use]
+    pub fn new(config: &Config, index: ScanIndex) -> Self {
+        let focus = match config.default_view {
+            DefaultView::Library => Focus::Library,
+            DefaultView::Queue => Focus::Queue,
         };
         let color_mode = ColorMode::resolve(
-            &config.theme,
+            config.theme,
             std::env::var_os("NO_COLOR").is_some(),
             std::env::var_os("TERM").is_some_and(|value| value == "dumb"),
         );
-
-        let (browser_capacity, browser_bytes) = browser_reservation(&index)?;
-        let search_bytes = search_reservation_bytes(config)?;
-        let shuffle_bytes = config
-            .queue
-            .max_items
-            .checked_mul(size_of::<u64>())
-            .ok_or_else(|| AppError::Resource("shuffle reservation overflow".into()))?;
-        let queued_asset_bytes = index
-            .assets
-            .len()
-            .checked_mul(size_of::<u8>())
-            .ok_or_else(|| AppError::Resource("queued asset reservation overflow".into()))?;
-        if browser_bytes
-            .saturating_add(search_bytes)
-            .saturating_add(shuffle_bytes)
-            .saturating_add(queued_asset_bytes)
-            .saturating_add(crate::ui::STAGE_FIELD_BYTES)
-            > UI_STATE_SCRATCH_BYTES
-        {
-            return Err(AppError::InvalidConfig(
-                "library browser, search, queue identity, shuffle, and Player stage reservations exceed the UI/state scratch budget"
-                    .into(),
-            ));
-        }
-
-        let browser = BrowserState::new(&index, config, browser_capacity)?;
-        let queue = QueueState::new(config, index.assets.len())?;
+        let browser = BrowserState::new(&index, config);
+        let queue = QueueState::new(config, index.assets.len());
 
         let (status_message, status_kind) = if index.complete {
             (
@@ -247,7 +215,7 @@ impl AppState {
             )
         };
 
-        Ok(Self {
+        Self {
             focus,
             should_quit: false,
             overlay: Overlay::None,
@@ -264,7 +232,7 @@ impl AppState {
             repeat: RepeatMode::Off,
             status_text_max_bytes: config.runtime.status_text_max_bytes,
             playback: PlaybackState::new(),
-        })
+        }
     }
 
     #[must_use]
@@ -369,8 +337,6 @@ impl AppState {
             AppAction::Stop => return self.stop_playback(),
             AppAction::Next => return self.next_track(),
             AppAction::Previous => return self.previous_track(),
-            AppAction::SeekBackward => return self.seek(false),
-            AppAction::SeekForward => return self.seek(true),
             AppAction::SeekRelative { forward, distance } => {
                 return self.seek_relative(forward, distance);
             }
@@ -527,11 +493,6 @@ impl AppState {
     }
 
     #[must_use]
-    pub(crate) fn queue_position(&self) -> Option<usize> {
-        self.current_queue_index().map(|index| index + 1)
-    }
-
-    #[must_use]
     pub(crate) fn current_track_token(&self) -> Option<(u64, u64)> {
         self.playback
             .current
@@ -570,26 +531,29 @@ impl AppState {
         })
     }
 
-    pub(crate) fn session_snapshot(&self) -> AppResult<Option<crate::state::SessionSnapshot>> {
-        let Some(identity) = self.session_identity() else {
-            return Ok(None);
-        };
-        let mut queue_entry_ids = Vec::new();
-        reserve_exact(
-            &mut queue_entry_ids,
-            self.queue.items().len(),
-            "resume queue",
-        )?;
-        queue_entry_ids.extend(self.queue.items().iter().map(|item| item.entry_id.0));
-        let position = self
-            .current_queue_index()
-            .filter(|index| *index == identity.current_index)
-            .map_or(Duration::ZERO, |_| self.playback.resume_position());
-        Ok(Some(crate::state::SessionSnapshot::new(
+    /// The position a resumed session would start from.
+    #[must_use]
+    pub(crate) fn session_position(&self) -> Duration {
+        self.session_identity()
+            .zip(self.current_queue_index())
+            .filter(|(identity, index)| identity.current_index == *index)
+            .map_or(Duration::ZERO, |_| self.playback.resume_position())
+    }
+
+    pub(crate) fn session_snapshot(&self) -> Option<crate::state::SessionSnapshot> {
+        let identity = self.session_identity()?;
+        let queue_entry_ids = self
+            .queue
+            .items()
+            .iter()
+            .map(|item| item.entry_id.0)
+            .collect();
+        let position = self.session_position();
+        Some(crate::state::SessionSnapshot::new(
             queue_entry_ids,
             identity.current_index,
             u64::try_from(position.as_millis()).unwrap_or(u64::MAX),
-        )))
+        ))
     }
 
     pub(crate) fn restore_session(
@@ -848,7 +812,7 @@ impl AppState {
             return None;
         }
         self.queue.selection = start;
-        self.start_new_shuffle_round(start)
+        self.start_new_shuffle_round(start, Duration::ZERO)
     }
 
     fn queue_error(&mut self, error: QueueError, unavailable: &str) {
@@ -856,7 +820,6 @@ impl AppState {
             QueueError::Unavailable => self.set_warning(unavailable),
             QueueError::Duplicate => self.set_status("Audio already in Queue"),
             QueueError::Limit => self.set_warning("Queue limit reached"),
-            QueueError::GenerationExhausted => self.set_error("Queue generation exhausted"),
         }
     }
 
@@ -866,17 +829,13 @@ impl AppState {
         }
         let removed_before_current = self.current_queue_index().is_none()
             && self.queue.selection < self.playback.position_hint;
-        match self.queue.remove_selected(&self.index) {
-            Ok(Some(removed)) => {
-                if removed_before_current {
-                    self.playback.position_hint -= 1;
-                }
-                self.reconcile_playback_position();
-                let title = self.entry_title(removed.entry_index);
-                self.set_status(&format!("Removed: {title}"));
+        if let Some(removed) = self.queue.remove_selected(&self.index) {
+            if removed_before_current {
+                self.playback.position_hint -= 1;
             }
-            Ok(None) => {}
-            Err(error) => self.queue_error(error, "The selected track is no longer available"),
+            self.reconcile_playback_position();
+            let title = self.entry_title(removed.entry_index);
+            self.set_status(&format!("Removed: {title}"));
         }
     }
 
@@ -884,13 +843,9 @@ impl AppState {
         if self.focus != Focus::Queue {
             return;
         }
-        match self.queue.clear() {
-            Ok(true) => {
-                self.reconcile_playback_position();
-                self.set_status("Queue cleared");
-            }
-            Ok(false) => {}
-            Err(error) => self.queue_error(error, "The queue is no longer available"),
+        if self.queue.clear() {
+            self.reconcile_playback_position();
+            self.set_status("Queue cleared");
         }
     }
 
@@ -898,13 +853,9 @@ impl AppState {
         if self.focus != Focus::Queue {
             return;
         }
-        match self.queue.move_selected(down) {
-            Ok(true) => {
-                self.reconcile_playback_position();
-                self.set_status("Queue order changed");
-            }
-            Ok(false) => {}
-            Err(error) => self.queue_error(error, "The queue is no longer available"),
+        if self.queue.move_selected(down) {
+            self.reconcile_playback_position();
+            self.set_status("Queue order changed");
         }
     }
 
@@ -943,12 +894,6 @@ impl AppState {
     }
 }
 
-fn reserve_exact<T>(items: &mut Vec<T>, capacity: usize, name: &str) -> AppResult<()> {
-    items
-        .try_reserve_exact(capacity)
-        .map_err(|error| AppError::Resource(format!("cannot reserve {name}: {error}")))
-}
-
 fn move_index(selection: &mut usize, len: usize, next: bool) {
     if len == 0 {
         *selection = 0;
@@ -959,47 +904,26 @@ fn move_index(selection: &mut usize, len: usize, next: bool) {
     }
 }
 
-/// Acquires the mutable-session leases, scans once, starts file logging, and owns the TUI.
+/// Takes the root lease, opens the log, scans once, and owns the TUI.
 ///
 /// # Errors
 ///
 /// Returns a typed startup, scanning, logging, terminal, or event-loop error.
 pub fn run(root: &SelectedRoot, config: &Config) -> AppResult<()> {
-    reserve_startup_open_files(config.runtime.max_open_files)?;
-    let _active_lease = ActiveTuiLease::acquire()?;
     let _root_lease = RootWriterLease::acquire_from(root.descriptor(), &root.path)?;
-    let logging = crate::logging::initialize_from(root.descriptor(), &root.path, &config.logging)?;
-    tracing::info!("terminal session starting");
+    let logging = crate::logging::initialize_from(root.descriptor(), &root.path)?;
+    crate::logging::info(format_args!("terminal session starting"));
     let result = crate::scan::scan_for_session(root.descriptor(), &root.path, config)
         .and_then(|index| crate::terminal::run(root.descriptor(), &root.path, config, index));
-    if result.is_ok() {
-        tracing::info!("terminal session stopped cleanly");
-    } else {
-        tracing::error!("terminal session failed");
+    match &result {
+        Ok(()) => crate::logging::info(format_args!("terminal session stopped cleanly")),
+        Err(error) => crate::logging::error(format_args!("terminal session failed: {error}")),
     }
-    let logging = logging.finish();
-    if logging.dropped_records > 0 {
-        let mut stderr = io::stderr().lock();
-        crate::logging::report_dropped_records(&mut stderr, logging.dropped_records)
-            .map_err(|error| AppError::io("report dropped diagnostics", "terminal", error))?;
+    if let Some(failure) = logging.finish() {
+        // Losing log lines does not fail the session; say so after the terminal is restored.
+        let _ = writeln!(io::stderr(), "warning: {failure}");
     }
-    match (result, logging.writer_error()) {
-        (Ok(()), None) => Ok(()),
-        (Ok(()), Some(error)) | (Err(error), None) => Err(error),
-        (Err(primary), Some(secondary)) => Err(AppError::Multiple {
-            primary: Box::new(primary),
-            secondary: Box::new(secondary),
-        }),
-    }
-}
-
-fn reserve_startup_open_files(limit: usize) -> AppResult<()> {
-    if limit < TUI_STARTUP_OPEN_FILES_PEAK {
-        return Err(AppError::InvalidConfig(format!(
-            "runtime.max_open_files must be at least {TUI_STARTUP_OPEN_FILES_PEAK} for terminal startup"
-        )));
-    }
-    Ok(())
+    result
 }
 
 #[cfg(test)]

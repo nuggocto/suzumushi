@@ -25,8 +25,6 @@ use crate::config::{MEADOW_MAX_ROWS, STAGE_MAX_COLUMNS, STAGE_MAX_ROWS};
 const DOTS_PER_COLUMN: usize = 2;
 const DOTS_PER_ROW: usize = 4;
 const FIELD_DOTS: usize = STAGE_MAX_COLUMNS * DOTS_PER_COLUMN * STAGE_MAX_ROWS * DOTS_PER_ROW;
-/// The fixed dot field reserved once for the whole session.
-pub(crate) const STAGE_FIELD_BYTES: usize = FIELD_DOTS * std::mem::size_of::<Dot>();
 
 const FAST_FRAME: Duration = Duration::from_millis(33);
 const DRIFT_FRAME: Duration = Duration::from_millis(50);
@@ -1095,7 +1093,7 @@ mod tests {
                 .filter(|cell| cell.symbol() != " ")
                 .map(|cell| cell.fg)
                 .collect();
-            assert!(!colors.is_empty());
+            assert_ne!(colors, []);
             for color in colors {
                 let expected = match (depth, color_mode) {
                     (_, ColorMode::Mono) => matches!(color, Color::Reset),

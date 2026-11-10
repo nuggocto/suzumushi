@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-11-10
+
+### Fixed
+
+- Resizing the terminal beyond about 105,000 cells (for example 500x250 on a
+  zoomed-out 5K display) no longer ends the session. The player follows any
+  terminal size.
+- `suzumushi diagnose | head` and `suzumushi --help | head` no longer panic when
+  the reader closes the pipe early.
+- Log lines carry a UTC timestamp, and a failed session logs its error.
+- The key guide lines up every description in one column.
+- Scan warnings name the built-in limit that stopped the scan, such as
+  `built-in file count limit reached`, instead of a config key.
+
+### Changed
+
+- `config.toml` holds only `theme`, `default_view`, and the `[scan]` options
+  `cross_mounts`, `follow_file_symlinks`, and `ignore_hidden_audio`. Capacity
+  limits, the memory budget, and the logging queue settings are compiled in.
+  Existing files keep loading and their retired keys are ignored.
+- Removed `state/now-playing.json`. Nothing in Suzumushi read it, and MPRIS
+  publishes the same information. The file is deleted at the next start.
+- The resume checkpoint is written only when it changes, instead of every five
+  seconds while the queue is not empty.
+- Removed the per-user lock and its `XDG_RUNTIME_DIR` requirement. Each root
+  still admits one player; a second player on another root takes an MPRIS
+  instance name.
+- Replaced the threaded, rotating logger and the `tracing` crates with a small
+  synchronous file logger that keeps one 1 MiB archive.
+- The MPRIS worker sleeps until the player state changes instead of waking
+  every 25 ms, and the audio worker checks in every 100 ms while paused instead
+  of every 5 ms.
+- A first scan of a large library shows a running track count on the terminal.
+- Release builds use fat LTO and abort on panic. A panic hook restores the
+  terminal first, and helper processes exit quietly instead of aborting.
+- Audio output renders F32, I16, I24, and I32 samples. Devices that offered only
+  other formats need a server or plug layer that converts.
+- Dependencies are no longer pinned to exact versions; `Cargo.lock` pins them.
+- Built with Rust 1.99.1.
+
 ## [1.2.2] - 2026-10-27
 
 ### Added

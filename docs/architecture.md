@@ -7,8 +7,8 @@ CLI and desktop media controls feed the same app actions.
 
 - `src/app.rs` coordinates actions, notices, presentation, and session snapshots.
 - `src/app/browser.rs` owns browser rows, folder visibility, selection, and
-  search. Search retains a bounded prefix table to avoid quadratic matching on
-  repetitive input. Closing search restores the normal browser selection.
+  search. Search compares each field with the query, ignoring ASCII case, and
+  stops at the result limit. Closing search restores the normal browser selection.
 - `src/app/queue.rs` owns queue items, asset membership, item identities, and
   shuffle order. Insertion checks the complete batch before committing it;
   duplicate audio rejects the entire playlist. Queue edits advance one
@@ -21,9 +21,17 @@ The playing item can outlive its queue membership. Removing it or clearing the
 queue leaves its audio running. Its position hint keeps subsequent navigation
 predictable until another track is selected.
 
-The scan index is immutable during a session. Queue membership uses one byte
-per canonical asset, while queue order and shuffle order use bounded vectors.
-The app validates their startup reservations against the configured budgets.
+The scan index is immutable during a session. Queue membership uses one flag
+per canonical asset, and the queue holds at most 10,000 items.
+
+`src/config.rs` parses `config.toml`, which holds only the theme, the first
+focused view, and three scan behaviors. Capacity limits are compiled into
+`Config::default()`; tests lower them through its public fields.
+
+`src/state.rs` writes `state/session.json`, the resume checkpoint. The event loop
+writes it when the queue or current track changes, every five seconds at most
+while the position moves, and once at exit. A stopped or paused session writes
+nothing.
 
 ## Player stage
 
@@ -33,7 +41,7 @@ falls back under gravity; on pause the lights fly as fireflies along
 deterministic paths. On resume each light keeps its flight while an eased pull
 brings it home, in a wave, and its stalk grows to meet it, so nothing stops or
 jumps. Shapes render into a fixed
-dot field, reserved once and counted in the UI budget, then into braille cells:
+dot field, allocated once per session, then into braille cells:
 solid shapes stay solid, glow becomes an ordered stipple, and bare stalk columns
 become hairlines. When the Player has room, the stage extends above the title
 into a sky of fixed-share stars and a moon placed by track progress. The title
@@ -67,6 +75,14 @@ half a second, so rapid toggles never restart the device stream mid-cycle.
 Teardown waits, briefly, for the fade-out to reach the backend. Seeks arriving
 within 150 ms of a restart are held silently and applied once, at the latest
 target, so a held arrow key restarts the decoder once.
+
+`src/logging.rs` appends timestamped lines to `logs/suzumushi.log` under a mutex.
+At 1 MiB the file becomes `suzumushi.log.1`, replacing the previous archive.
+
+Release builds abort on panic. The terminal session installs a panic hook that
+restores the terminal before the message prints, and each helper process
+installs one that exits quietly, so a malformed file never produces a crash
+report.
 
 ## Verification
 

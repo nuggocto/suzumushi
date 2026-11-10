@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, ResolveFlags};
 
-use crate::config::{Config, ScanConfig, scan_reservation_bytes};
+use crate::config::{Config, ScanConfig};
 use crate::display::terminal_safe;
 use crate::errors::{AppError, AppResult};
 use crate::metadata;
@@ -62,11 +62,59 @@ pub trait ScanObserver {
 
     /// Called immediately before the secure adapter opens a file symlink.
     fn before_symlink_open(&mut self, _relative: &Path) {}
+
+    /// Called after each track entry joins the index, with the running count.
+    fn track_added(&mut self, _tracks: usize) {}
 }
 
-#[derive(Default)]
-struct NoopObserver;
-impl ScanObserver for NoopObserver {}
+/// Shows a running track count on a terminal's stderr while a slow scan runs.
+///
+/// A first scan reads every file's tags in a helper process, so a large
+/// library can take tens of seconds before the player appears. Scans that end
+/// within [`ProgressLine::DELAY`] print nothing.
+struct ProgressLine {
+    started: Instant,
+    last_shown: Option<Instant>,
+    enabled: bool,
+}
+
+impl ProgressLine {
+    const DELAY: Duration = Duration::from_millis(500);
+    const INTERVAL: Duration = Duration::from_millis(100);
+
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            last_shown: None,
+            enabled: std::io::IsTerminal::is_terminal(&std::io::stderr()),
+        }
+    }
+}
+
+impl ScanObserver for ProgressLine {
+    fn track_added(&mut self, tracks: usize) {
+        let now = Instant::now();
+        if !self.enabled
+            || now.duration_since(self.started) < Self::DELAY
+            || self
+                .last_shown
+                .is_some_and(|shown| now.duration_since(shown) < Self::INTERVAL)
+        {
+            return;
+        }
+        self.last_shown = Some(now);
+        eprint!("\rScanning audio: {tracks} tracks");
+    }
+}
+
+impl Drop for ProgressLine {
+    fn drop(&mut self) {
+        if self.last_shown.is_some() {
+            // Erase the line so the terminal session or report starts clean.
+            eprint!("\r\x1b[2K");
+        }
+    }
+}
 
 /// Coarse path class used by the scanner and its path fuzz target.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -143,7 +191,7 @@ fn scan_cached_from<Fd: AsFd>(
     save_cache: bool,
 ) -> AppResult<ScanIndex> {
     let mut reader = crate::metadata_cache::CachedMetadataReader::load(root_file.as_fd(), root);
-    let mut observer = NoopObserver;
+    let mut observer = ProgressLine::new();
     let result = scan_with_components_from(
         &root_file,
         root,
@@ -193,13 +241,6 @@ fn scan_with_components_from<Fd: AsFd>(
     reader: &mut dyn metadata::MetadataReader,
     observer: &mut dyn ScanObserver,
 ) -> AppResult<ScanIndex> {
-    if scan_reservation_bytes(config.scan.max_index_bytes)?
-        > config.runtime.process_memory_budget_bytes
-    {
-        return Err(AppError::InvalidConfig(
-            "index and scan scratch exceed process memory budget".into(),
-        ));
-    }
     let audio_fd = open_direct_directory(root_file, OsStr::new("audio"), false)
         .map_err(|error| AppError::io("open audio root", root.join("audio"), error.into()))?;
     let root_device = options.root_device_override.unwrap_or(
@@ -408,7 +449,7 @@ impl<'a> Scanner<'a> {
             return Ok(());
         }
         if depth > self.limits.max_depth {
-            self.limit(&child, "scan.max_depth");
+            self.limit(&child, "folder depth");
             return Ok(());
         }
         if playlist_key(&child).is_some_and(|key| {
@@ -529,7 +570,7 @@ impl<'a> Scanner<'a> {
             return Ok(());
         }
         if self.counters.symlink_resolutions >= self.limits.max_symlink_resolutions {
-            self.limit(&child, "scan.max_symlink_resolutions");
+            self.limit(&child, "symlink");
             return Ok(());
         }
         self.counters.symlink_resolutions += 1;
@@ -624,7 +665,7 @@ impl<'a> Scanner<'a> {
     #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
     fn accept_media(&mut self, file: File, child: PathBuf, symlink: bool) -> AppResult<()> {
         if self.counters.media_files >= self.limits.max_files {
-            self.limit(&child, "scan.max_files");
+            self.limit(&child, "file count");
             return Ok(());
         }
         let playlist = playlist_key(&child).map(ToOwned::to_owned);
@@ -637,7 +678,7 @@ impl<'a> Scanner<'a> {
                 .get(key)
                 .is_some_and(|value| value.entry_count >= self.limits.max_entries_per_playlist)
             {
-                self.limit(&child, "scan.max_entries_per_playlist");
+                self.limit(&child, "playlist length");
                 return Ok(());
             }
         }
@@ -716,6 +757,7 @@ impl<'a> Scanner<'a> {
             source,
             search,
         });
+        self.observer.track_added(self.entries.len());
         if let Some(key) = playlist
             && let Some(playlist) = self.playlists.get_mut(&key)
         {
@@ -741,7 +783,7 @@ impl<'a> Scanner<'a> {
             return TrackTags::default();
         }
         if self.counters.parser_attempts >= self.limits.max_parser_attempts {
-            self.limit(path, "scan.max_parser_attempts");
+            self.limit(path, "metadata read");
             return TrackTags::default();
         }
         self.counters.parser_attempts += 1;
@@ -762,7 +804,7 @@ impl<'a> Scanner<'a> {
                 if self.counters.metadata_bytes.saturating_add(bytes)
                     > self.limits.max_total_metadata_bytes
                 {
-                    self.limit(path, "scan.max_total_metadata_bytes");
+                    self.limit(path, "total metadata size");
                     TrackTags::default()
                 } else {
                     tags
@@ -772,7 +814,7 @@ impl<'a> Scanner<'a> {
                 self.warn(
                     ScanWarningCode::MetadataRead,
                     path,
-                    "metadata field exceeds scan.max_metadata_field_bytes",
+                    "a metadata field is longer than the built-in limit",
                 );
                 TrackTags::default()
             }
@@ -788,7 +830,7 @@ impl<'a> Scanner<'a> {
             return true;
         }
         if self.playlists.len() >= self.limits.max_playlists {
-            self.limit(path, "scan.max_playlists");
+            self.limit(path, "playlist count");
             return false;
         }
         let id = PlaylistId(stable_id(&[key]));
@@ -811,7 +853,7 @@ impl<'a> Scanner<'a> {
 
     fn encounter(&mut self, path: &Path) -> bool {
         if self.counters.encountered_entries >= self.limits.max_entries {
-            self.enumeration_limit(path, "scan.max_entries");
+            self.enumeration_limit(path, "folder entry");
             return false;
         }
         // Rejected paths still cost enumeration work, even when warning storage
@@ -828,7 +870,7 @@ impl<'a> Scanner<'a> {
             return false;
         }
         if self.counters.path_bytes.saturating_add(bytes) > self.limits.max_total_path_bytes {
-            self.enumeration_limit(path, "scan.max_total_path_bytes");
+            self.enumeration_limit(path, "total path size");
             return false;
         }
         self.counters.path_bytes += bytes;
@@ -837,11 +879,11 @@ impl<'a> Scanner<'a> {
 
     fn acquire_open_slots(&mut self, count: usize, path: &Path) -> bool {
         let Some(next) = self.open_files.checked_add(count) else {
-            self.limit(path, "runtime.max_open_files");
+            self.limit(path, "open file");
             return false;
         };
         if next > self.max_open_files {
-            self.limit(path, "runtime.max_open_files");
+            self.limit(path, "open file");
             return false;
         }
         self.open_files = next;
@@ -860,7 +902,7 @@ impl<'a> Scanner<'a> {
 
     fn account_index(&mut self, bytes: usize, path: &Path) {
         if self.counters.index_bytes.saturating_add(bytes) > self.limits.max_index_bytes {
-            self.limit(path, "scan.max_index_bytes");
+            self.limit(path, "library index size");
         } else {
             self.counters.index_bytes += bytes;
         }
@@ -875,7 +917,7 @@ impl<'a> Scanner<'a> {
         self.warn(
             ScanWarningCode::LimitReached,
             path,
-            format!("{name} limit reached"),
+            format!("built-in {name} limit reached"),
         );
     }
 
@@ -884,7 +926,7 @@ impl<'a> Scanner<'a> {
         self.warn(
             ScanWarningCode::LimitReached,
             path,
-            format!("{name} limit reached"),
+            format!("built-in {name} limit reached"),
         );
     }
 

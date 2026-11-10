@@ -1,5 +1,5 @@
 [tools]
-rust = "1.98.1"
+rust = "1.99.1"
 "cargo:cargo-deny" = "0.20.2"
 "cargo:cargo-fuzz" = "0.13.2"
 

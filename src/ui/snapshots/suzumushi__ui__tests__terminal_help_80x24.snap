@@ -4,9 +4,9 @@ expression: "rendered(&app, 80, 24, Duration::ZERO)"
 ---
 ┌────────────────────────────────Suzumushi Help────────────────────────────────┐
 │Navigation                                                                    │
-│  Tab or Shift+Tab     focus Library, Player, or Queue                        │
-│  Up or Down, j or k   move the selection                                     │
-│  Home or End, g or G  jump to the first or last item                         │
+│  Tab or Shift+Tab      focus Library, Player, or Queue                       │
+│  Up or Down, j or k    move the selection                                    │
+│  Home or End, g or G   jump to the first or last item                        │
 │                                                                              │
 │Library and search                                                            │
 │  /                     search artist, title, filename, and path              │
@@ -18,11 +18,11 @@ expression: "rendered(&app, 80, 24, Duration::ZERO)"
 │  d or Delete           remove item    c clear Queue                          │
 │                                                                              │
 │Playback                                                                      │
-│  Space or Enter outside Library  play or pause                               │
+│  Space                 play or pause; Enter too, outside Library             │
 │  s                     stop    p previous    n next                          │
-│  Left or Right          seek back or forward five seconds                    │
-│  - or +                 volume down or up    m mute                          │
+│  Left or Right         seek back or forward five seconds                     │
+│  - or +                volume down or up    m mute                           │
 │  x                     shuffle    r repeat                                   │
 │                                                                              │
-│  ? or Esc               close help    q quit    Ctrl+c quit anywhere         │
+│  ? or Esc              close help    q quit    Ctrl+c quit anywhere          │
 └──────────────────────────────────────────────────────────────────────────────┘

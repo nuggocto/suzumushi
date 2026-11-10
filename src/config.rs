@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Strict, bounded configuration parsing.
+//! User configuration and the compiled limits the rest of the app runs under.
+//!
+//! `config.toml` holds only choices a listener makes: the color theme, the first
+//! focused view, and three scan behaviors. Every capacity limit is a compiled
+//! constant. Tests lower them through the public [`Config`] fields.
 
 use serde::Deserialize;
 use std::fs::File;
@@ -16,14 +20,6 @@ use crate::errors::{AppError, AppResult};
 /// Maximum accepted configuration file size.
 pub const MAX_CONFIG_BYTES: usize = 65_536;
 
-pub(crate) const SCAN_PARSER_SCRATCH_BYTES: usize = 32 * 1_048_576;
-pub(crate) const UI_STATE_SCRATCH_BYTES: usize = 8 * 1_048_576;
-pub(crate) const TERMINAL_BUFFER_BYTES: usize = 8 * 1_048_576;
-pub(crate) const AUDIO_WORKER_BYTES: usize = 6 * 1_048_576;
-// Cache tags, at most 10,000 tree nodes, bounded record parsing and a 4 MiB write buffer.
-pub(crate) const METADATA_CACHE_BYTES: usize = 16 * 1_048_576;
-pub(crate) const MAX_LOG_FILES: usize = 5;
-pub(crate) const QUEUE_ITEM_ACCOUNTING_BYTES: usize = 32;
 /// The Player's night meadow never draws more cells than this; wider or taller
 /// panels center it.
 pub(crate) const STAGE_MAX_COLUMNS: usize = 128;
@@ -31,89 +27,48 @@ pub(crate) const STAGE_MAX_ROWS: usize = 40;
 /// Stalks grow in at most this many rows; taller stages add sky above.
 pub(crate) const MEADOW_MAX_ROWS: usize = 16;
 
-pub(crate) fn scan_reservation_bytes(index_bytes: usize) -> AppResult<usize> {
-    index_bytes
-        .checked_add(SCAN_PARSER_SCRATCH_BYTES)
-        .and_then(|bytes| bytes.checked_add(METADATA_CACHE_BYTES))
-        .ok_or_else(|| AppError::InvalidConfig("scan reservation overflow".into()))
-}
-
 /// The default configuration written by `init`.
-pub const DEFAULT_CONFIG: &str = r#"config_version = 1
+pub const DEFAULT_CONFIG: &str = r#"# "terminal" uses the terminal's colors; "mono" draws without color.
 theme = "terminal"
+# The pane focused at startup: "library" or "queue".
 default_view = "library"
 
 [scan]
-max_files = 50000
-max_entries = 100000
-max_depth = 16
-max_playlists = 2000
-max_entries_per_playlist = 10000
-max_symlink_resolutions = 50000
-max_parser_attempts = 50000
+# Scan folders on other filesystems mounted inside the audio folder.
 cross_mounts = false
-max_path_bytes = 4096
-max_total_path_bytes = 25165824
-max_metadata_field_bytes = 16384
-max_total_metadata_bytes = 50331648
-max_warning_bytes = 8388608
-max_index_bytes = 117440512
+# Play file symlinks. Directory symlinks are always skipped.
 follow_file_symlinks = true
-follow_directory_symlinks = false
+# Skip audio files whose names start with a dot.
 ignore_hidden_audio = true
-
-[search]
-max_results = 200
-max_query_bytes = 4096
-
-[queue]
-max_items = 10000
-max_bytes = 1048576
-
-[runtime]
-process_memory_budget_bytes = 402653184
-max_open_files = 64
-status_text_max_bytes = 4096
-
-[logging]
-max_file_bytes = 10485760
-max_files = 5
-max_record_bytes = 16384
-queue_capacity = 512
-queue_max_bytes = 8388608
-queue_full_policy = "drop_and_count"
 "#;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum Theme {
+    #[default]
+    Terminal,
+    Mono,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum DefaultView {
+    #[default]
+    Library,
+    Queue,
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct Config {
-    pub config_version: u32,
-    pub theme: String,
-    pub default_view: String,
+    pub theme: Theme,
+    pub default_view: DefaultView,
     pub scan: ScanConfig,
     pub search: SearchConfig,
     pub queue: QueueConfig,
     pub runtime: RuntimeConfig,
-    pub logging: LoggingConfig,
 }
 
-macro_rules! section {
-    ($name:ident { $($field:ident : $ty:ty),+ $(,)? }) => {
-        #[derive(Clone, Debug, Deserialize)]
-        #[serde(deny_unknown_fields)]
-        pub struct $name { $(pub $field: $ty),+ }
-    };
-}
-
-section!(SearchConfig {
-    max_results: usize,
-    max_query_bytes: usize
-});
-section!(QueueConfig {
-    max_items: usize,
-    max_bytes: usize
-});
-
-/// Supported file-symlink behavior after validating the version-1 config.
+/// File-symlink behavior during a scan.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SymlinkPolicy {
     Ignore,
@@ -146,99 +101,34 @@ pub struct ScanConfig {
     pub symlink_policy: SymlinkPolicy,
     pub ignore_hidden_audio: bool,
 }
-section!(RuntimeConfig {
-    process_memory_budget_bytes: usize,
-    max_open_files: usize,
-    status_text_max_bytes: usize
-});
-section!(LoggingConfig {
-    max_file_bytes: usize,
-    max_files: usize,
-    max_record_bytes: usize,
-    queue_capacity: usize,
-    queue_max_bytes: usize,
-    queue_full_policy: String
-});
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ParsedConfig {
-    config_version: u32,
-    theme: String,
-    default_view: String,
-    #[serde(default)]
-    input: Option<RetiredInputConfig>,
-    scan: ParsedScanConfig,
-    #[serde(default)]
-    search: SearchConfig,
-    #[serde(default)]
-    queue: QueueConfig,
-    runtime: RuntimeConfig,
-    logging: LoggingConfig,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-// Version 1 persists four boolean keys. Parsing them verbatim keeps existing
-// config files compatible before the symlink pair becomes one enum.
-#[allow(clippy::struct_excessive_bools)]
-struct ParsedScanConfig {
-    max_files: usize,
-    max_entries: usize,
-    max_depth: usize,
-    max_playlists: usize,
-    max_entries_per_playlist: usize,
-    max_symlink_resolutions: usize,
-    max_parser_attempts: usize,
-    cross_mounts: bool,
-    max_path_bytes: usize,
-    max_total_path_bytes: usize,
-    max_metadata_field_bytes: usize,
-    max_total_metadata_bytes: usize,
-    max_warning_bytes: usize,
-    max_index_bytes: usize,
-    follow_file_symlinks: bool,
-    follow_directory_symlinks: bool,
-    ignore_hidden_audio: bool,
-}
-
-impl ParsedScanConfig {
-    fn into_config(self) -> AppResult<ScanConfig> {
-        if self.follow_directory_symlinks {
-            return Err(AppError::InvalidConfig(
-                "scan.follow_directory_symlinks must be false in v1".into(),
-            ));
+impl Default for ScanConfig {
+    fn default() -> Self {
+        Self {
+            max_files: 50_000,
+            max_entries: 100_000,
+            max_depth: 16,
+            max_playlists: 2_000,
+            max_entries_per_playlist: 10_000,
+            max_symlink_resolutions: 50_000,
+            max_parser_attempts: 50_000,
+            cross_mounts: false,
+            max_path_bytes: 4_096,
+            max_total_path_bytes: 24 * 1_048_576,
+            max_metadata_field_bytes: 16_384,
+            max_total_metadata_bytes: 48 * 1_048_576,
+            max_warning_bytes: 8 * 1_048_576,
+            max_index_bytes: 112 * 1_048_576,
+            symlink_policy: SymlinkPolicy::FollowFiles,
+            ignore_hidden_audio: true,
         }
-        let symlink_policy = if self.follow_file_symlinks {
-            SymlinkPolicy::FollowFiles
-        } else {
-            SymlinkPolicy::Ignore
-        };
-        Ok(ScanConfig {
-            max_files: self.max_files,
-            max_entries: self.max_entries,
-            max_depth: self.max_depth,
-            max_playlists: self.max_playlists,
-            max_entries_per_playlist: self.max_entries_per_playlist,
-            max_symlink_resolutions: self.max_symlink_resolutions,
-            max_parser_attempts: self.max_parser_attempts,
-            cross_mounts: self.cross_mounts,
-            max_path_bytes: self.max_path_bytes,
-            max_total_path_bytes: self.max_total_path_bytes,
-            max_metadata_field_bytes: self.max_metadata_field_bytes,
-            max_total_metadata_bytes: self.max_total_metadata_bytes,
-            max_warning_bytes: self.max_warning_bytes,
-            max_index_bytes: self.max_index_bytes,
-            symlink_policy,
-            ignore_hidden_audio: self.ignore_hidden_audio,
-        })
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RetiredInputConfig {
-    leader_timeout_ms: u64,
+#[derive(Clone, Debug)]
+pub struct SearchConfig {
+    pub max_results: usize,
+    pub max_query_bytes: usize,
 }
 
 impl Default for SearchConfig {
@@ -250,21 +140,120 @@ impl Default for SearchConfig {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct QueueConfig {
+    pub max_items: usize,
+}
+
 impl Default for QueueConfig {
     fn default() -> Self {
+        Self { max_items: 10_000 }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RuntimeConfig {
+    pub max_open_files: usize,
+    pub status_text_max_bytes: usize,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
         Self {
-            max_items: 10_000,
-            max_bytes: 1_048_576,
+            max_open_files: 64,
+            status_text_max_bytes: 4_096,
         }
     }
 }
 
-/// Parses a bounded TOML document and validates every compiled range.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ParsedConfig {
+    #[serde(default)]
+    theme: Theme,
+    #[serde(default)]
+    default_view: DefaultView,
+    #[serde(default)]
+    scan: ParsedScanConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ParsedScanConfig {
+    #[serde(default)]
+    cross_mounts: bool,
+    #[serde(default = "enabled")]
+    follow_file_symlinks: bool,
+    #[serde(default = "enabled")]
+    ignore_hidden_audio: bool,
+}
+
+impl Default for ParsedScanConfig {
+    fn default() -> Self {
+        Self {
+            cross_mounts: false,
+            follow_file_symlinks: true,
+            ignore_hidden_audio: true,
+        }
+    }
+}
+
+const fn enabled() -> bool {
+    true
+}
+
+/// Top-level keys and tables that earlier releases wrote. They no longer change
+/// anything, and are dropped so those files keep loading.
+const RETIRED_TOP_LEVEL: &[&str] = &[
+    "config_version",
+    "input",
+    "search",
+    "queue",
+    "runtime",
+    "logging",
+    // The unversioned 0.x prototype.
+    "default_volume",
+    "volume_step",
+    "speed_min",
+    "speed_max",
+    "speed_step",
+    "seek_short_seconds",
+    "seek_long_seconds",
+    "shuffle",
+    "repeat",
+    "queue_max_items",
+    "queue_max_bytes",
+    "queue_max_history_items",
+    "artwork",
+    "visualizer",
+    "desktop",
+    "tags",
+    "mutation",
+];
+
+/// `[scan]` limits that version 1 config files carry. They are compiled now.
+const RETIRED_SCAN: &[&str] = &[
+    "max_files",
+    "max_entries",
+    "max_depth",
+    "max_playlists",
+    "max_entries_per_playlist",
+    "max_symlink_resolutions",
+    "max_parser_attempts",
+    "max_path_bytes",
+    "max_total_path_bytes",
+    "max_metadata_field_bytes",
+    "max_total_metadata_bytes",
+    "max_warning_bytes",
+    "max_index_bytes",
+    "follow_directory_symlinks",
+];
+
+/// Parses a bounded TOML document.
 ///
 /// # Errors
 ///
-/// Returns [`AppError::InvalidConfig`] for oversized, malformed, unknown,
-/// contradictory, or out-of-range input.
+/// Returns [`AppError::InvalidConfig`] for oversized, malformed, or unknown input.
 pub fn parse(input: &[u8]) -> AppResult<Config> {
     if input.len() > MAX_CONFIG_BYTES {
         return Err(AppError::InvalidConfig(format!(
@@ -275,89 +264,48 @@ pub fn parse(input: &[u8]) -> AppResult<Config> {
         .map_err(|error| AppError::InvalidConfig(format!("config is not UTF-8: {error}")))?;
     let mut document: toml::Table =
         toml::from_str(text).map_err(|error| AppError::InvalidConfig(error.to_string()))?;
-    if !document.contains_key("config_version") {
-        remove_released_prototype_fields(&mut document);
-        document.insert("config_version".into(), toml::Value::Integer(1));
-    }
+    remove_retired_fields(&mut document);
     let parsed: ParsedConfig = toml::Value::Table(document)
         .try_into()
         .map_err(|error| AppError::InvalidConfig(error.to_string()))?;
-    if let Some(input) = parsed.input {
-        inclusive(
-            "input.leader_timeout_ms",
-            input.leader_timeout_ms,
-            50,
-            2_000,
-        )?;
-    }
-    let scan = parsed.scan.into_config()?;
-    let config = Config {
-        config_version: parsed.config_version,
+    Ok(Config {
         theme: parsed.theme,
         default_view: parsed.default_view,
-        scan,
-        search: parsed.search,
-        queue: parsed.queue,
-        runtime: parsed.runtime,
-        logging: parsed.logging,
-    };
-    config.validate()?;
-    Ok(config)
+        scan: ScanConfig {
+            cross_mounts: parsed.scan.cross_mounts,
+            symlink_policy: if parsed.scan.follow_file_symlinks {
+                SymlinkPolicy::FollowFiles
+            } else {
+                SymlinkPolicy::Ignore
+            },
+            ignore_hidden_audio: parsed.scan.ignore_hidden_audio,
+            ..ScanConfig::default()
+        },
+        ..Config::default()
+    })
 }
 
-fn remove_released_prototype_fields(document: &mut toml::Table) {
-    for key in [
-        "default_volume",
-        "volume_step",
-        "speed_min",
-        "speed_max",
-        "speed_step",
-        "seek_short_seconds",
-        "seek_long_seconds",
-        "shuffle",
-        "repeat",
-        "queue_max_items",
-        "queue_max_bytes",
-        "queue_max_history_items",
-        "search",
-        "artwork",
-        "visualizer",
-        "desktop",
-        "tags",
-        "mutation",
-    ] {
-        document.remove(key);
+fn remove_retired_fields(document: &mut toml::Table) {
+    for key in RETIRED_TOP_LEVEL {
+        document.remove(*key);
     }
+    // The prototype's playlists view became part of the library.
     if document.get("default_view").and_then(toml::Value::as_str) == Some("playlists") {
         document.insert("default_view".into(), toml::Value::String("library".into()));
     }
-    if let Some(runtime) = document
-        .get_mut("runtime")
-        .and_then(toml::Value::as_table_mut)
-    {
-        for key in [
-            "command_channel_capacity",
-            "event_channel_capacity",
-            "position_channel_capacity",
-            "visualizer_channel_capacity",
-            "max_blocking_jobs",
-            "max_parser_helpers",
-            "tokio_worker_threads",
-            "audio_prefetch_frames",
-            "state_file_max_bytes",
-            "shutdown_timeout_ms",
-        ] {
-            runtime.remove(key);
+    if let Some(scan) = document.get_mut("scan").and_then(toml::Value::as_table_mut) {
+        for key in RETIRED_SCAN {
+            scan.remove(*key);
         }
     }
 }
 
-/// Loads `config.toml` from a pinned root without following the file target.
+/// Loads `config.toml` from a root path without following the file target.
 ///
 /// # Errors
 ///
-/// Returns safe compiled defaults when the file is absent. Returns an error
-/// when an existing file cannot be opened safely or its contents do not validate.
+/// Returns compiled defaults when the file is absent. Returns an error when an
+/// existing file cannot be opened safely or does not parse.
 pub fn load(root: &Path) -> AppResult<Config> {
     let root_file = rustix::fs::open(
         root,
@@ -372,8 +320,7 @@ pub fn load(root: &Path) -> AppResult<Config> {
 ///
 /// # Errors
 ///
-/// Returns an error for unsafe file identity, ownership, modes, size, syntax,
-/// or values.
+/// Returns an error for unsafe file identity, ownership, modes, size, or syntax.
 pub fn load_from<Fd: AsFd>(root_file: Fd, root: &Path) -> AppResult<Config> {
     let fd = match rustix::fs::openat(
         root_file,
@@ -411,371 +358,97 @@ pub fn load_from<Fd: AsFd>(root_file: Fd, root: &Path) -> AppResult<Config> {
     parse(&bytes)
 }
 
-#[allow(clippy::needless_pass_by_value)]
-fn inclusive<T: PartialOrd + std::fmt::Display>(
-    name: &str,
-    value: T,
-    min: T,
-    max: T,
-) -> AppResult<()> {
-    if value < min || value > max {
-        return Err(AppError::InvalidConfig(format!(
-            "{name} must be in {min}..={max}, got {value}"
-        )));
-    }
-    Ok(())
-}
-
-fn one_of(name: &str, value: &str, accepted: &[&str]) -> AppResult<()> {
-    if !accepted.contains(&value) {
-        return Err(AppError::InvalidConfig(format!(
-            "{name} must be one of {}, got {value:?}",
-            accepted.join(", ")
-        )));
-    }
-    Ok(())
-}
-
-fn validate_scan(scan: &ScanConfig) -> AppResult<()> {
-    inclusive("scan.max_files", scan.max_files, 1, 50_000)?;
-    inclusive("scan.max_entries", scan.max_entries, 1, 100_000)?;
-    if scan.max_entries < scan.max_files {
-        return Err(AppError::InvalidConfig(
-            "scan.max_entries must be at least scan.max_files".into(),
-        ));
-    }
-    inclusive("scan.max_depth", scan.max_depth, 1, 16)?;
-    inclusive("scan.max_playlists", scan.max_playlists, 1, 2_000)?;
-    inclusive(
-        "scan.max_entries_per_playlist",
-        scan.max_entries_per_playlist,
-        1,
-        10_000,
-    )?;
-    inclusive(
-        "scan.max_symlink_resolutions",
-        scan.max_symlink_resolutions,
-        1,
-        50_000,
-    )?;
-    inclusive(
-        "scan.max_parser_attempts",
-        scan.max_parser_attempts,
-        1,
-        50_000,
-    )?;
-    inclusive("scan.max_path_bytes", scan.max_path_bytes, 1, 4_096)?;
-    inclusive(
-        "scan.max_total_path_bytes",
-        scan.max_total_path_bytes,
-        1,
-        25_165_824,
-    )?;
-    inclusive(
-        "scan.max_metadata_field_bytes",
-        scan.max_metadata_field_bytes,
-        1,
-        16_384,
-    )?;
-    inclusive(
-        "scan.max_total_metadata_bytes",
-        scan.max_total_metadata_bytes,
-        1,
-        50_331_648,
-    )?;
-    inclusive(
-        "scan.max_warning_bytes",
-        scan.max_warning_bytes,
-        1,
-        8_388_608,
-    )?;
-    inclusive("scan.max_index_bytes", scan.max_index_bytes, 1, 117_440_512)?;
-    Ok(())
-}
-
-fn validate_logging(logging: &LoggingConfig) -> AppResult<()> {
-    inclusive(
-        "logging.max_file_bytes",
-        logging.max_file_bytes,
-        1,
-        10_485_760,
-    )?;
-    inclusive("logging.max_files", logging.max_files, 1, MAX_LOG_FILES)?;
-    inclusive(
-        "logging.max_record_bytes",
-        logging.max_record_bytes,
-        1,
-        16_384,
-    )?;
-    inclusive("logging.queue_capacity", logging.queue_capacity, 1, 512)?;
-    inclusive(
-        "logging.queue_max_bytes",
-        logging.queue_max_bytes,
-        1,
-        8_388_608,
-    )?;
-    one_of(
-        "logging.queue_full_policy",
-        &logging.queue_full_policy,
-        &["drop_and_count"],
-    )?;
-    let queued_bytes = logging
-        .queue_capacity
-        .checked_mul(logging.max_record_bytes)
-        .ok_or_else(|| AppError::InvalidConfig("logging queue reservation overflow".into()))?;
-    if queued_bytes > logging.queue_max_bytes {
-        return Err(AppError::InvalidConfig(
-            "logging.queue_capacity times logging.max_record_bytes must fit logging.queue_max_bytes"
-                .into(),
-        ));
-    }
-    if logging.max_record_bytes > logging.max_file_bytes {
-        return Err(AppError::InvalidConfig(
-            "logging.max_record_bytes must not exceed logging.max_file_bytes".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_search(search: &SearchConfig) -> AppResult<()> {
-    inclusive("search.max_results", search.max_results, 1, 200)?;
-    inclusive("search.max_query_bytes", search.max_query_bytes, 1, 4_096)
-}
-
-fn validate_queue(queue: &QueueConfig) -> AppResult<()> {
-    inclusive("queue.max_items", queue.max_items, 1, 10_000)?;
-    inclusive("queue.max_bytes", queue.max_bytes, 1, 8_388_608)?;
-    let retained = queue
-        .max_items
-        .checked_mul(QUEUE_ITEM_ACCOUNTING_BYTES)
-        .ok_or_else(|| AppError::InvalidConfig("queue reservation overflow".into()))?;
-    if retained > queue.max_bytes {
-        return Err(AppError::InvalidConfig(
-            "queue.max_items must fit queue.max_bytes".into(),
-        ));
-    }
-    Ok(())
-}
-
-impl Config {
-    /// Enforces the exact compiled safety contract.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AppError::InvalidConfig`] when any compiled invariant fails.
-    pub fn validate(&self) -> AppResult<()> {
-        if self.config_version != 1 {
-            return Err(AppError::InvalidConfig(format!(
-                "config_version must equal 1, got {}",
-                self.config_version
-            )));
-        }
-        one_of("theme", &self.theme, &["terminal", "mono"])?;
-        one_of("default_view", &self.default_view, &["library", "queue"])?;
-        validate_scan(&self.scan)?;
-        validate_search(&self.search)?;
-        validate_queue(&self.queue)?;
-        let r = &self.runtime;
-        inclusive(
-            "runtime.process_memory_budget_bytes",
-            r.process_memory_budget_bytes,
-            67_108_864,
-            402_653_184,
-        )?;
-        inclusive("runtime.max_open_files", r.max_open_files, 1, 64)?;
-        inclusive(
-            "runtime.status_text_max_bytes",
-            r.status_text_max_bytes,
-            1,
-            4_096,
-        )?;
-        validate_logging(&self.logging)?;
-        let reserved_app = scan_reservation_bytes(self.scan.max_index_bytes)?
-            .checked_add(self.logging.queue_max_bytes)
-            .and_then(|value| value.checked_add(UI_STATE_SCRATCH_BYTES))
-            .and_then(|value| value.checked_add(TERMINAL_BUFFER_BYTES))
-            .and_then(|value| value.checked_add(AUDIO_WORKER_BYTES))
-            .and_then(|value| value.checked_add(self.queue.max_bytes))
-            .ok_or_else(|| AppError::InvalidConfig("application reservation overflow".into()))?;
-        if reserved_app > r.process_memory_budget_bytes {
-            return Err(AppError::InvalidConfig(
-                "index, scan/parser scratch, metadata cache, queues, terminal buffers, audio buffers, and UI/state scratch exceed process_memory_budget_bytes".into(),
-            ));
-        }
-        Ok(())
-    }
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        parse(DEFAULT_CONFIG.as_bytes()).expect("compiled default config must remain valid")
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_CONFIG, MAX_CONFIG_BYTES, SymlinkPolicy, parse};
+    use super::{DEFAULT_CONFIG, DefaultView, MAX_CONFIG_BYTES, SymlinkPolicy, Theme, parse};
 
-    fn replace_once(source: &str, old: &str, new: &str) -> String {
-        assert_eq!(
-            source.matches(old).count(),
-            1,
-            "test replacement must be unique: {old}"
-        );
-        source.replacen(old, new, 1)
+    /// The file `init` wrote through release 1.2.2.
+    const VERSION_ONE_CONFIG: &str = r#"config_version = 1
+theme = "mono"
+default_view = "queue"
+
+[scan]
+max_files = 50000
+max_entries = 100000
+max_depth = 16
+max_playlists = 2000
+max_entries_per_playlist = 10000
+max_symlink_resolutions = 50000
+max_parser_attempts = 50000
+cross_mounts = true
+max_path_bytes = 4096
+max_total_path_bytes = 25165824
+max_metadata_field_bytes = 16384
+max_total_metadata_bytes = 50331648
+max_warning_bytes = 8388608
+max_index_bytes = 117440512
+follow_file_symlinks = false
+follow_directory_symlinks = false
+ignore_hidden_audio = false
+
+[search]
+max_results = 200
+max_query_bytes = 4096
+
+[queue]
+max_items = 10000
+max_bytes = 1048576
+
+[runtime]
+process_memory_budget_bytes = 402653184
+max_open_files = 64
+status_text_max_bytes = 4096
+
+[logging]
+max_file_bytes = 10485760
+max_files = 5
+max_record_bytes = 16384
+queue_capacity = 512
+queue_max_bytes = 8388608
+queue_full_policy = "drop_and_count"
+"#;
+
+    #[test]
+    fn default_config_matches_the_compiled_defaults() {
+        let config = parse(DEFAULT_CONFIG.as_bytes()).expect("default config parses");
+        assert_eq!(config.theme, Theme::Terminal);
+        assert_eq!(config.default_view, DefaultView::Library);
+        assert!(!config.scan.cross_mounts);
+        assert_eq!(config.scan.symlink_policy, SymlinkPolicy::FollowFiles);
+        assert!(config.scan.ignore_hidden_audio);
+        let empty = parse(b"").expect("an empty file uses the defaults");
+        assert_eq!(empty.theme, Theme::Terminal);
+        assert_eq!(empty.scan.symlink_policy, SymlinkPolicy::FollowFiles);
     }
 
     #[test]
-    fn default_config_is_strict_and_valid() {
-        parse(DEFAULT_CONFIG.as_bytes()).expect("compiled default validates");
-        let unknown = format!("{DEFAULT_CONFIG}\nunknown_limit = 1\n");
-        assert!(parse(unknown.as_bytes()).is_err());
-        assert!(parse(&vec![b'x'; MAX_CONFIG_BYTES + 1]).is_err());
-    }
-
-    #[test]
-    fn released_prototype_config_migrates_to_the_smaller_contract() {
-        let legacy = replace_once(DEFAULT_CONFIG, "config_version = 1\n", "");
-        let mut legacy = replace_once(
-            &legacy,
-            "default_view = \"library\"",
-            "default_view = \"playlists\"\ndefault_volume = 0.70",
-        );
-        legacy = replace_once(
-            &legacy,
-            "max_open_files = 64",
-            "command_channel_capacity = 32\nvisualizer_channel_capacity = 2\nmax_open_files = 64",
-        );
-        legacy.push_str("\n[artwork]\nenabled = true\n");
-        let config = parse(legacy.as_bytes()).expect("released prototype config remains readable");
-        assert_eq!(config.default_view, "library");
-
-        let current = format!("{DEFAULT_CONFIG}\n[artwork]\nenabled = true\n");
-        assert!(
-            parse(current.as_bytes()).is_err(),
-            "retired fields are accepted only by the unversioned migration"
-        );
-    }
-
-    #[test]
-    fn existing_version_one_configs_receive_current_search_and_queue_defaults() {
-        let without_search = DEFAULT_CONFIG.replace(
-            "[search]\nmax_results = 200\nmax_query_bytes = 4096\n\n",
-            "",
-        );
-        let without_current_sections =
-            without_search.replace("[queue]\nmax_items = 10000\nmax_bytes = 1048576\n\n", "");
-
-        let config = parse(without_current_sections.as_bytes())
-            .expect("known version one configs remain readable");
-        assert_eq!(config.search.max_results, 200);
-        assert_eq!(config.search.max_query_bytes, 4_096);
-        assert_eq!(config.queue.max_items, 10_000);
-        assert_eq!(config.queue.max_bytes, 1_048_576);
-    }
-
-    #[test]
-    fn version_one_symlink_flags_map_to_the_supported_policy() {
-        let followed = parse(DEFAULT_CONFIG.as_bytes()).expect("default config remains readable");
-        assert_eq!(followed.scan.symlink_policy, SymlinkPolicy::FollowFiles);
-
-        let ignored = replace_once(
-            DEFAULT_CONFIG,
-            "follow_file_symlinks = true",
-            "follow_file_symlinks = false",
-        );
-        let ignored = parse(ignored.as_bytes()).expect("disabled file symlinks remain readable");
-        assert_eq!(ignored.scan.symlink_policy, SymlinkPolicy::Ignore);
-
-        let directories = replace_once(
-            DEFAULT_CONFIG,
-            "follow_directory_symlinks = false",
-            "follow_directory_symlinks = true",
-        );
-        let error = parse(directories.as_bytes()).expect_err("directory symlinks remain forbidden");
-        assert!(
-            error
-                .to_string()
-                .contains("scan.follow_directory_symlinks must be false in v1")
-        );
-    }
-
-    #[test]
-    fn released_leader_setting_is_accepted_only_in_its_known_shape() {
-        let released = format!("{DEFAULT_CONFIG}\n[input]\nleader_timeout_ms = 250\n");
-        parse(released.as_bytes()).expect("released input setting remains readable");
-
-        let unknown = format!("{DEFAULT_CONFIG}\n[input]\nleader_timeout_ms = 250\nchord = true\n");
-        assert!(
-            parse(unknown.as_bytes()).is_err(),
-            "retired compatibility must not weaken strict configuration parsing"
-        );
-    }
-
-    #[test]
-    fn current_scan_and_runtime_bounds_reject_limit_plus_one() {
-        let invalid_replacements = [
-            ("max_files = 50000", "max_files = 50001"),
-            ("max_entries = 100000", "max_entries = 100001"),
-            ("max_depth = 16", "max_depth = 17"),
-            ("max_playlists = 2000", "max_playlists = 2001"),
-            (
-                "max_entries_per_playlist = 10000",
-                "max_entries_per_playlist = 10001",
-            ),
-            (
-                "max_symlink_resolutions = 50000",
-                "max_symlink_resolutions = 50001",
-            ),
-            ("max_parser_attempts = 50000", "max_parser_attempts = 50001"),
-            ("max_path_bytes = 4096", "max_path_bytes = 4097"),
-            (
-                "max_total_path_bytes = 25165824",
-                "max_total_path_bytes = 25165825",
-            ),
-            (
-                "max_metadata_field_bytes = 16384",
-                "max_metadata_field_bytes = 16385",
-            ),
-            (
-                "max_total_metadata_bytes = 50331648",
-                "max_total_metadata_bytes = 50331649",
-            ),
-            ("max_warning_bytes = 8388608", "max_warning_bytes = 8388609"),
-            ("max_index_bytes = 117440512", "max_index_bytes = 117440513"),
-            ("max_results = 200", "max_results = 201"),
-            ("max_query_bytes = 4096", "max_query_bytes = 4097"),
-            ("max_items = 10000", "max_items = 10001"),
-            ("max_bytes = 1048576", "max_bytes = 8388609"),
-            ("max_open_files = 64", "max_open_files = 65"),
-            (
-                "process_memory_budget_bytes = 402653184",
-                "process_memory_budget_bytes = 402653185",
-            ),
-        ];
-        for (valid, invalid) in invalid_replacements {
-            let config = replace_once(DEFAULT_CONFIG, valid, invalid);
-            assert!(parse(config.as_bytes()).is_err(), "accepted {invalid}");
+    fn unknown_keys_and_values_are_refused() {
+        for text in [
+            format!("{DEFAULT_CONFIG}\nunknown_limit = 1\n"),
+            DEFAULT_CONFIG.replace("[scan]\n", "[scan]\nchord = true\n"),
+            DEFAULT_CONFIG.replace("theme = \"terminal\"", "theme = \"neon\""),
+            DEFAULT_CONFIG.replace("default_view = \"library\"", "default_view = \"player\""),
+        ] {
+            assert!(parse(text.as_bytes()).is_err(), "accepted {text}");
         }
+        assert!(parse(&vec![b'#'; MAX_CONFIG_BYTES + 1]).is_err());
     }
 
     #[test]
-    fn cross_field_contradictions_fail_before_work_starts() {
-        let text = replace_once(
-            DEFAULT_CONFIG,
-            "max_file_bytes = 10485760",
-            "max_file_bytes = 16383",
-        );
-        assert!(parse(text.as_bytes()).is_err());
+    fn version_one_files_keep_their_choices_and_drop_retired_limits() {
+        let config = parse(VERSION_ONE_CONFIG.as_bytes()).expect("released config loads");
+        assert_eq!(config.theme, Theme::Mono);
+        assert_eq!(config.default_view, DefaultView::Queue);
+        assert!(config.scan.cross_mounts);
+        assert_eq!(config.scan.symlink_policy, SymlinkPolicy::Ignore);
+        assert!(!config.scan.ignore_hidden_audio);
+        assert_eq!(config.scan.max_files, 50_000);
+    }
 
-        let text = replace_once(
-            DEFAULT_CONFIG,
-            "max_entries = 100000",
-            "max_entries = 49999",
-        );
-        assert!(parse(text.as_bytes()).is_err());
-
-        let text = replace_once(DEFAULT_CONFIG, "max_bytes = 1048576", "max_bytes = 319999");
-        assert!(parse(text.as_bytes()).is_err());
+    #[test]
+    fn prototype_files_still_load() {
+        let prototype = "theme = \"terminal\"\ndefault_view = \"playlists\"\ndefault_volume = 0.70\n\n[artwork]\nenabled = true\n\n[input]\nleader_timeout_ms = 250\n";
+        let config = parse(prototype.as_bytes()).expect("prototype config loads");
+        assert_eq!(config.default_view, DefaultView::Library);
     }
 }

@@ -24,7 +24,7 @@ const TRACK_PATH_PREFIX: &str = "/io/github/nuggocto/suzumushi/track/";
 const NO_TRACK_PATH: &str = "/org/mpris/MediaPlayer2/TrackList/NoTrack";
 pub(crate) const REQUEST_CAPACITY: usize = 32;
 const BUS_MESSAGE_CAPACITY: NonZeroUsize = NonZeroUsize::new(8).unwrap();
-const WORKER_POLL: Duration = Duration::from_millis(25);
+const NAME_TAKEN: &str = "another player owns the MPRIS name";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const TEXT_MAX_BYTES: usize = 1_024;
 const CAN_GO_NEXT: u8 = 1 << 0;
@@ -92,14 +92,33 @@ impl MprisProjection {
 pub(crate) struct MprisRuntime {
     actions: Receiver<AppAction>,
     latest: Arc<Mutex<Option<MprisProjection>>>,
-    shutdown: Option<SyncSender<()>>,
+    published: Option<MprisProjection>,
+    /// Wakes the worker after `latest` changes. Dropping it stops the worker.
+    wake: Option<SyncSender<()>>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl MprisRuntime {
-    /// Starts the single session-bus identity and its owned worker.
+    /// Claims the player's session-bus name and starts its worker.
+    ///
+    /// When another Suzumushi already owns the name, this one takes an instance
+    /// name, as the MPRIS specification describes for a second running player.
     pub(crate) fn start(initial: MprisProjection) -> AppResult<Self> {
-        Self::start_with(initial, connection::Builder::session().name(BUS_NAME))
+        // zbus otherwise requests names with REPLACE_EXISTING, and a second
+        // player would silently take the name from the first.
+        let session = |name: String| {
+            connection::Builder::session()
+                .name(name)
+                .allow_name_replacements(false)
+                .replace_existing_names(false)
+        };
+        match Self::start_with(initial.clone(), session(BUS_NAME.to_owned())) {
+            Err(AppError::Mpris(message)) if message == NAME_TAKEN => {
+                let instance = format!("{BUS_NAME}.instance{}", std::process::id());
+                Self::start_with(initial, session(instance))
+            }
+            result => result,
+        }
     }
 
     fn start_with(
@@ -109,26 +128,27 @@ impl MprisRuntime {
         let (action_sender, actions) = mpsc::sync_channel(REQUEST_CAPACITY);
         let latest = Arc::new(Mutex::new(None));
         let worker_latest = Arc::clone(&latest);
-        let (shutdown, shutdown_receiver) = mpsc::sync_channel(1);
+        let (wake, wake_receiver) = mpsc::sync_channel(1);
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name("suzumushi-mpris".into())
             .spawn(move || {
-                zbus::block_on(worker_main(
+                worker_main(
                     builder,
                     initial,
                     action_sender,
                     &worker_latest,
-                    &shutdown_receiver,
+                    &wake_receiver,
                     &ready_sender,
-                ));
+                );
             })
             .map_err(|error| AppError::Mpris(format!("cannot start worker: {error}")))?;
         match ready_receiver.recv() {
             Ok(Ok(())) => Ok(Self {
                 actions,
                 latest,
-                shutdown: Some(shutdown),
+                published: None,
+                wake: Some(wake),
                 worker: Some(worker),
             }),
             Ok(Err(error)) => {
@@ -142,13 +162,20 @@ impl MprisRuntime {
         }
     }
 
-    pub(crate) fn publish(&self, projection: MprisProjection) -> AppResult<()> {
-        let mut latest = self
+    /// Hands the worker a new projection. An unchanged projection does nothing.
+    pub(crate) fn publish(&mut self, projection: MprisProjection) {
+        if self.published.as_ref() == Some(&projection) {
+            return;
+        }
+        *self
             .latest
             .lock()
-            .map_err(|_| AppError::Mpris("projection lane was poisoned".into()))?;
-        *latest = Some(projection);
-        Ok(())
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(projection.clone());
+        self.published = Some(projection);
+        if let Some(wake) = &self.wake {
+            // A full channel already holds a wake-up the worker has not taken.
+            let _ = wake.try_send(());
+        }
     }
 
     pub(crate) fn try_action(&self) -> Option<AppAction> {
@@ -160,9 +187,7 @@ impl MprisRuntime {
     }
 
     fn shutdown_inner(&mut self) -> AppResult<()> {
-        if let Some(sender) = self.shutdown.take() {
-            let _ = sender.send(());
-        }
+        self.wake.take();
         let Some(worker) = self.worker.take() else {
             return Ok(());
         };
@@ -178,12 +203,12 @@ impl Drop for MprisRuntime {
     }
 }
 
-async fn worker_main(
+fn worker_main(
     builder: connection::Builder<'static>,
     initial: MprisProjection,
     actions: SyncSender<AppAction>,
-    latest: &Arc<Mutex<Option<MprisProjection>>>,
-    shutdown: &Receiver<()>,
+    latest: &Mutex<Option<MprisProjection>>,
+    wake: &Receiver<()>,
     ready: &SyncSender<Result<(), String>>,
 ) {
     let state = Arc::new(RwLock::new(initial));
@@ -198,7 +223,9 @@ async fn worker_main(
         .max_queued(BUS_MESSAGE_CAPACITY)
         .serve_at(OBJECT_PATH, root)
         .serve_at(OBJECT_PATH, player);
-    let connection = match connect_with_timeout(builder, CONNECT_TIMEOUT).await {
+    // zbus serves desktop requests on its own executor thread, so this thread
+    // only needs to run while there is a new projection to announce.
+    let connection = match zbus::block_on(connect_with_timeout(builder, CONNECT_TIMEOUT)) {
         Ok(connection) => connection,
         Err(error) => {
             let _ = ready.send(Err(error));
@@ -206,18 +233,17 @@ async fn worker_main(
         }
     };
     if ready.send(Ok(())).is_err() {
-        drop(connection);
         return;
     }
 
-    loop {
-        // Yield to the runtime so it can serve desktop requests while idle.
-        async_io::Timer::after(WORKER_POLL).await;
-        match shutdown.try_recv() {
-            Ok(()) | Err(mpsc::TryRecvError::Disconnected) => break,
-            Err(mpsc::TryRecvError::Empty) => {}
-        }
-        let next = latest.lock().ok().and_then(|mut slot| slot.take());
+    // `recv` fails once the runtime drops its sender, after any queued wake-up.
+    let mut stopping = false;
+    while !stopping {
+        stopping = wake.recv().is_err();
+        let next = latest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         let Some(next) = next else {
             continue;
         };
@@ -225,21 +251,10 @@ async fn worker_main(
             Ok(mut current) => std::mem::replace(&mut *current, next.clone()),
             Err(_) => break,
         };
-        if let Err(error) = emit_changes(&connection, &previous, &next).await {
-            tracing::warn!(%error, "MPRIS property update failed");
+        if let Err(error) = zbus::block_on(emit_changes(&connection, &previous, &next)) {
+            crate::logging::warn(format_args!("MPRIS property update failed: {error}"));
         }
     }
-    let next = latest.lock().ok().and_then(|mut slot| slot.take());
-    if let Some(next) = next {
-        let previous = state
-            .write()
-            .ok()
-            .map(|mut current| std::mem::replace(&mut *current, next.clone()));
-        if let Some(previous) = previous {
-            let _ = emit_changes(&connection, &previous, &next).await;
-        }
-    }
-    drop(connection);
 }
 
 async fn connect_with_timeout(
@@ -249,7 +264,12 @@ async fn connect_with_timeout(
     // Dropping the losing build future closes its socket and cancels setup.
     // The worker then returns its startup error and can be joined normally.
     futures_lite::future::or(
-        async { builder.build().await.map_err(|error| error.to_string()) },
+        async {
+            builder.build().await.map_err(|error| match error {
+                zbus::Error::NameTaken => NAME_TAKEN.to_owned(),
+                other => other.to_string(),
+            })
+        },
         async {
             async_io::Timer::after(timeout).await;
             Err("session bus connection timed out".into())
@@ -897,7 +917,7 @@ mod tests {
         let builder = zbus::connection::Builder::unix_stream(server)
             .server(zbus::Guid::generate())
             .p2p();
-        let runtime =
+        let mut runtime =
             super::MprisRuntime::start_with(projection(), builder).expect("desktop worker");
         assert_eq!(
             runtime
@@ -917,7 +937,7 @@ mod tests {
         updated.volume_percent = 40;
         updated.position = Duration::from_secs(9);
         updated.seek_revision = 1;
-        runtime.publish(updated).expect("publish playback update");
+        runtime.publish(updated);
         client.join().expect("desktop client");
         runtime.shutdown().expect("join desktop worker");
     }
@@ -1037,7 +1057,7 @@ mod tests {
                 ..ScanCounters::default()
             },
         };
-        let mut app = AppState::new(&Config::default(), index).expect("app state");
+        let mut app = AppState::new(&Config::default(), index);
         app.apply(AppAction::Activate)
             .expect("start selected track");
         app.audio_event(AudioEvent::Started {
@@ -1052,7 +1072,7 @@ mod tests {
         });
         app.focus = Focus::Queue;
         app.apply(AppAction::QueueClear);
-        assert!(app.queue().is_empty());
+        assert_eq!(app.queue(), []);
 
         let (sender, receiver) = mpsc::sync_channel(REQUEST_CAPACITY);
         let player = PlayerInterface {
@@ -1121,7 +1141,7 @@ mod tests {
             warnings: Vec::new(),
             counters: ScanCounters::default(),
         };
-        let mut app = AppState::new(&Config::default(), index).expect("app state");
+        let mut app = AppState::new(&Config::default(), index);
         app.apply(AppAction::SetVolume(40));
         let audible = MprisProjection::from_app(&app);
         app.apply(AppAction::ToggleMute);

@@ -1,642 +1,331 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Bounded private file logging with app-owned byte rotation.
+//! The session log: `logs/suzumushi.log`, one timestamped line per record.
+//!
+//! The app logs a handful of lines per session, so records are written straight
+//! to the file under a mutex. When the file would pass [`MAX_FILE_BYTES`] it is
+//! renamed to `suzumushi.log.1`, replacing the previous archive.
 
+use std::fmt::{self, Write as _};
 use std::fs::File;
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
+use std::sync::{Mutex, PoisonError};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustix::fd::AsFd;
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::process::getuid;
-use tracing_subscriber::fmt::MakeWriter;
 
-use crate::config::{LoggingConfig, MAX_LOG_FILES};
 use crate::errors::{AppError, AppResult};
 
 const CURRENT_LOG: &str = "suzumushi.log";
-const TRUNCATED: &[u8] = b" [truncated]\n";
+const ARCHIVE_LOG: &str = "suzumushi.log.1";
+/// Archives that releases before 1.3 kept beside the current one.
+const RETIRED_ARCHIVES: [&str; 3] = ["suzumushi.log.2", "suzumushi.log.3", "suzumushi.log.4"];
+const MAX_FILE_BYTES: u64 = 1_048_576;
+const MAX_MESSAGE_BYTES: usize = 4_096;
 
-/// Keeps the logging worker owned until every queued record is flushed.
-pub struct LoggingGuard {
-    worker: Option<JoinHandle<()>>,
-    queue: Arc<LogQueue>,
-    write_failed: Arc<AtomicBool>,
-    current_path: PathBuf,
+static LOG: Mutex<Option<Logger>> = Mutex::new(None);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Level {
+    Info,
+    Warn,
+    Error,
 }
 
-impl LoggingGuard {
-    /// Waits for queued records before reporting queue and writer failures.
-    #[must_use]
-    pub fn finish(mut self) -> LoggingReport {
-        self.shutdown();
-        LoggingReport {
-            dropped_records: self.queue.dropped_records(),
-            write_failed: self.write_failed.load(Ordering::Acquire),
-            current_path: self.current_path.clone(),
+impl Level {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Info => "INFO",
+            Self::Warn => "WARN",
+            Self::Error => "ERROR",
         }
     }
+}
 
-    fn shutdown(&mut self) {
-        self.queue.close();
-        if self
-            .worker
-            .take()
-            .is_some_and(|worker| worker.join().is_err())
-        {
-            self.write_failed.store(true, Ordering::Release);
-        }
+pub(crate) fn info(message: fmt::Arguments<'_>) {
+    write(Level::Info, message);
+}
+
+pub(crate) fn warn(message: fmt::Arguments<'_>) {
+    write(Level::Warn, message);
+}
+
+pub(crate) fn error(message: fmt::Arguments<'_>) {
+    write(Level::Error, message);
+}
+
+/// Appends one record when a session log is open, and does nothing otherwise.
+fn write(level: Level, message: fmt::Arguments<'_>) {
+    let mut log = LOG.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(logger) = log.as_mut() {
+        logger.write(level, message, SystemTime::now());
+    }
+}
+
+/// Owns the open session log. Finishing it closes the file.
+#[must_use = "the log closes when the guard is finished or dropped"]
+pub struct LoggingGuard(());
+
+impl LoggingGuard {
+    /// Closes the log and returns the first write failure, if any record was lost.
+    #[must_use]
+    pub fn finish(self) -> Option<String> {
+        let logger = LOG.lock().unwrap_or_else(PoisonError::into_inner).take();
+        std::mem::forget(self);
+        logger.and_then(|logger| {
+            logger.failure.map(|error| {
+                format!(
+                    "could not write {}: {error}",
+                    logger.directory_path.join(CURRENT_LOG).display()
+                )
+            })
+        })
     }
 }
 
 impl Drop for LoggingGuard {
     fn drop(&mut self) {
-        self.shutdown();
+        LOG.lock().unwrap_or_else(PoisonError::into_inner).take();
     }
 }
 
-/// Final state of the bounded logging pipeline.
-pub struct LoggingReport {
-    pub dropped_records: usize,
-    write_failed: bool,
-    current_path: PathBuf,
-}
-
-impl LoggingReport {
-    /// Returns an application error when the background writer lost data.
-    #[must_use]
-    pub fn writer_error(&self) -> Option<AppError> {
-        self.write_failed.then(|| {
-            AppError::io(
-                "write log",
-                &self.current_path,
-                io::Error::other("background log writer failed"),
-            )
-        })
-    }
-}
-
-/// Installs logging beneath an already pinned session root.
+/// Opens the session log beneath an already pinned root.
 ///
 /// # Errors
 ///
-/// Returns an error for unsafe storage, rotation failure, or an existing global
-/// tracing subscriber.
-pub fn initialize_from<Fd: AsFd>(
-    root_fd: Fd,
-    root: &Path,
-    config: &LoggingConfig,
-) -> AppResult<LoggingGuard> {
-    let writer = RotatingWriter::open_from(root_fd, root, config.max_file_bytes, config.max_files)?;
-    let current_path = writer.current_path();
-    let write_failed = Arc::new(AtomicBool::new(false));
-    let (queue, receiver) = LogQueue::new(config.queue_capacity, Arc::clone(&write_failed));
-    let worker = spawn_log_worker(writer, receiver, Arc::clone(&write_failed), &current_path)?;
-    let bounded = BoundedMakeWriter {
-        queue: Arc::clone(&queue),
-        max_record_bytes: config.max_record_bytes,
-    };
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_target(false)
-        .without_time()
-        .with_writer(bounded)
-        .finish();
-    let guard = LoggingGuard {
-        worker: Some(worker),
-        queue,
-        write_failed,
-        current_path,
-    };
-    if let Err(error) = tracing::subscriber::set_global_default(subscriber) {
-        let report = guard.finish();
-        return Err(AppError::io(
-            "install file logging",
-            report.current_path,
-            io::Error::other(error),
-        ));
-    }
-    Ok(guard)
+/// Returns an error when `logs` or the log file is not private to the current
+/// user, or cannot be opened.
+pub fn initialize_from<Fd: AsFd>(root_fd: Fd, root: &Path) -> AppResult<LoggingGuard> {
+    let logger = Logger::open(root_fd, root, MAX_FILE_BYTES)?;
+    *LOG.lock().unwrap_or_else(PoisonError::into_inner) = Some(logger);
+    Ok(LoggingGuard(()))
 }
 
-pub(crate) fn report_dropped_records(writer: &mut impl Write, count: usize) -> io::Result<()> {
-    writeln!(writer, "warning: {count} diagnostic records were dropped")
-}
-
-struct LogQueue {
-    sender: Mutex<Option<SyncSender<Vec<u8>>>>,
-    dropped_records: AtomicUsize,
-    write_failed: Arc<AtomicBool>,
-}
-
-impl LogQueue {
-    fn new(capacity: usize, write_failed: Arc<AtomicBool>) -> (Arc<Self>, Receiver<Vec<u8>>) {
-        let (sender, receiver) = mpsc::sync_channel(capacity);
-        (
-            Arc::new(Self {
-                sender: Mutex::new(Some(sender)),
-                dropped_records: AtomicUsize::new(0),
-                write_failed,
-            }),
-            receiver,
-        )
-    }
-
-    fn enqueue(&self, record: Vec<u8>) {
-        let sender = self
-            .sender
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(sender) = sender.as_ref() else {
-            self.write_failed.store(true, Ordering::Release);
-            return;
-        };
-        match sender.try_send(record) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
-                let _ = self.dropped_records.fetch_update(
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                    |count| Some(count.saturating_add(1)),
-                );
-            }
-            Err(TrySendError::Disconnected(_)) => {
-                self.write_failed.store(true, Ordering::Release);
-            }
-        }
-    }
-
-    fn close(&self) {
-        self.sender
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-    }
-
-    fn dropped_records(&self) -> usize {
-        self.dropped_records.load(Ordering::Relaxed)
-    }
-}
-
-fn spawn_log_worker<W: Write + Send + 'static>(
-    writer: W,
-    receiver: Receiver<Vec<u8>>,
-    write_failed: Arc<AtomicBool>,
-    display: &Path,
-) -> AppResult<JoinHandle<()>> {
-    thread::Builder::new()
-        .name("suzumushi-log".into())
-        .spawn(move || run_log_worker(writer, &receiver, &write_failed))
-        .map_err(|error| AppError::io("spawn log worker", display, error))
-}
-
-fn run_log_worker<W: Write>(
-    mut writer: W,
-    receiver: &Receiver<Vec<u8>>,
-    write_failed: &AtomicBool,
-) {
-    while let Ok(record) = receiver.recv() {
-        if write_failed.load(Ordering::Acquire) {
-            continue;
-        }
-        if writer
-            .write_all(&record)
-            .and_then(|()| writer.flush())
-            .is_err()
-        {
-            write_failed.store(true, Ordering::Release);
-        }
-    }
-    if !write_failed.load(Ordering::Acquire) && writer.flush().is_err() {
-        write_failed.store(true, Ordering::Release);
-    }
-}
-
-#[derive(Clone)]
-struct BoundedMakeWriter {
-    queue: Arc<LogQueue>,
-    max_record_bytes: usize,
-}
-
-impl<'a> MakeWriter<'a> for BoundedMakeWriter {
-    type Writer = BoundedRecordWriter;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        BoundedRecordWriter {
-            queue: Arc::clone(&self.queue),
-            bytes: Vec::with_capacity(self.max_record_bytes.min(1_024)),
-            max_record_bytes: self.max_record_bytes,
-            state: RecordState::Open,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RecordState {
-    Open,
-    Truncated,
-    Emitted,
-}
-
-struct BoundedRecordWriter {
-    queue: Arc<LogQueue>,
-    bytes: Vec<u8>,
-    max_record_bytes: usize,
-    state: RecordState,
-}
-
-impl BoundedRecordWriter {
-    fn emit(&mut self) {
-        if self.state == RecordState::Emitted || self.bytes.is_empty() {
-            return;
-        }
-        if self.state == RecordState::Truncated {
-            mark_truncated(&mut self.bytes, self.max_record_bytes);
-        }
-        self.bytes.truncate(self.max_record_bytes);
-        self.queue.enqueue(std::mem::take(&mut self.bytes));
-        self.state = RecordState::Emitted;
-    }
-}
-
-impl Write for BoundedRecordWriter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if self.state == RecordState::Emitted {
-            return Ok(bytes.len());
-        }
-        let remaining = self.max_record_bytes.saturating_sub(self.bytes.len());
-        let accepted = remaining.min(bytes.len());
-        self.bytes.extend_from_slice(&bytes[..accepted]);
-        if accepted < bytes.len() {
-            self.state = RecordState::Truncated;
-        }
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.emit();
-        Ok(())
-    }
-}
-
-impl Drop for BoundedRecordWriter {
-    fn drop(&mut self) {
-        self.emit();
-    }
-}
-
-struct RotatingWriter {
+struct Logger {
     directory: File,
     directory_path: PathBuf,
     file: File,
-    bytes_written: usize,
-    max_file_bytes: usize,
-    max_files: usize,
+    bytes: u64,
+    max_bytes: u64,
+    failure: Option<io::Error>,
 }
 
-impl RotatingWriter {
-    fn open_from<Fd: AsFd>(
-        root_fd: Fd,
-        root: &Path,
-        max_file_bytes: usize,
-        max_files: usize,
-    ) -> AppResult<Self> {
+impl Logger {
+    fn open<Fd: AsFd>(root_fd: Fd, root: &Path, max_bytes: u64) -> AppResult<Self> {
         let directory_path = root.join("logs");
-        let directory_fd = rustix::fs::openat(
+        let directory = rustix::fs::openat(
             root_fd,
             "logs",
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )
         .map_err(|error| AppError::io("open log directory", &directory_path, error.into()))?;
-        let directory_stat = rustix::fs::fstat(&directory_fd).map_err(|error| {
+        let stat = rustix::fs::fstat(&directory).map_err(|error| {
             AppError::io("inspect log directory", &directory_path, error.into())
         })?;
-        if !FileType::from_raw_mode(directory_stat.st_mode).is_dir()
-            || directory_stat.st_uid != getuid().as_raw()
-            || directory_stat.st_mode & 0o777 != 0o700
+        if !FileType::from_raw_mode(stat.st_mode).is_dir()
+            || stat.st_uid != getuid().as_raw()
+            || stat.st_mode & 0o777 != 0o700
         {
             return Err(AppError::InvalidRoot {
                 path: directory_path,
                 reason: "logs must be a current-user-owned directory with mode 0700".into(),
             });
         }
-        let directory = File::from(directory_fd);
-        prune_archives(&directory, &directory_path, max_files)
-            .map_err(|error| AppError::io("prune old log archives", &directory_path, error))?;
-        let (file, bytes_written) = open_log_file(&directory, &directory_path, CURRENT_LOG)?;
-        let mut writer = Self {
+        let directory = File::from(directory);
+        for name in RETIRED_ARCHIVES {
+            match rustix::fs::unlinkat(&directory, name, AtFlags::empty()) {
+                Ok(()) => {}
+                Err(error) if error == rustix::io::Errno::NOENT => {}
+                Err(error) => {
+                    return Err(AppError::io(
+                        "remove old log archive",
+                        directory_path.join(name),
+                        error.into(),
+                    ));
+                }
+            }
+        }
+        let file = open_log_file(&directory)
+            .map_err(|error| AppError::io("open log", directory_path.join(CURRENT_LOG), error))?;
+        let bytes = rustix::fs::fstat(&file)
+            .map_err(|error| {
+                AppError::io(
+                    "inspect log",
+                    directory_path.join(CURRENT_LOG),
+                    error.into(),
+                )
+            })?
+            .st_size
+            .unsigned_abs();
+        Ok(Self {
             directory,
             directory_path,
             file,
-            bytes_written,
-            max_file_bytes,
-            max_files,
-        };
-        if writer.bytes_written >= writer.max_file_bytes {
-            writer
-                .rotate()
-                .map_err(|error| AppError::io("rotate full log", writer.current_path(), error))?;
-        }
-        Ok(writer)
+            bytes,
+            max_bytes,
+            failure: None,
+        })
     }
 
-    fn rotate(&mut self) -> io::Result<()> {
-        self.file.flush()?;
-        verify_open_log(&self.file, &self.current_path())?;
-        let current = open_existing_log(&self.directory, &self.directory_path, CURRENT_LOG)?
-            .ok_or_else(|| io::Error::other("current log path disappeared before rotation"))?;
-        let current_stat = rustix::fs::fstat(&current)?;
-        let held_stat = rustix::fs::fstat(&self.file)?;
-        if current_stat.st_dev != held_stat.st_dev || current_stat.st_ino != held_stat.st_ino {
-            return Err(io::Error::other(
-                "current log identity changed before rotation",
-            ));
+    fn write(&mut self, level: Level, message: fmt::Arguments<'_>, now: SystemTime) {
+        if self.failure.is_some() {
+            return;
         }
-        drop(current);
+        let line = format_record(level, message, now);
+        let result = self.rotate_for(line.len()).and_then(|()| {
+            self.file.write_all(line.as_bytes())?;
+            self.bytes += line.len() as u64;
+            Ok(())
+        });
+        if let Err(error) = result {
+            self.failure = Some(error);
+        }
+    }
 
-        if self.max_files == 1 {
-            self.file.set_len(0)?;
-            self.file.seek(SeekFrom::Start(0))?;
-            self.bytes_written = 0;
+    fn rotate_for(&mut self, line_bytes: usize) -> io::Result<()> {
+        if self.bytes == 0 || self.bytes + line_bytes as u64 <= self.max_bytes {
             return Ok(());
         }
-
-        for destination_index in (1..self.max_files).rev() {
-            let source = if destination_index == 1 {
-                CURRENT_LOG.to_owned()
-            } else {
-                archive_name(destination_index - 1)
-            };
-            if open_existing_log(&self.directory, &self.directory_path, &source)?.is_none() {
-                continue;
-            }
-            let destination = archive_name(destination_index);
-            if open_existing_log(&self.directory, &self.directory_path, &destination)?.is_some() {
-                rustix::fs::unlinkat(&self.directory, &destination, AtFlags::empty())?;
-            }
-            rustix::fs::renameat(&self.directory, &source, &self.directory, &destination)?;
-        }
-        let (file, bytes_written) =
-            create_log_file(&self.directory, &self.directory_path, CURRENT_LOG)?;
-        self.file = file;
-        self.bytes_written = bytes_written;
+        rustix::fs::renameat(&self.directory, CURRENT_LOG, &self.directory, ARCHIVE_LOG)?;
+        self.file = open_log_file(&self.directory)?;
+        self.bytes = 0;
         Ok(())
     }
-
-    fn current_path(&self) -> PathBuf {
-        self.directory_path.join(CURRENT_LOG)
-    }
 }
 
-impl Write for RotatingWriter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let projected = self
-            .bytes_written
-            .checked_add(bytes.len())
-            .ok_or_else(|| io::Error::other("log byte count overflow"))?;
-        if self.bytes_written > 0 && projected > self.max_file_bytes {
-            self.rotate()?;
-        }
-        let written = self.file.write(bytes)?;
-        self.bytes_written = self
-            .bytes_written
-            .checked_add(written)
-            .ok_or_else(|| io::Error::other("log byte count overflow"))?;
-        Ok(written)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.file.flush()
-    }
-}
-
-fn open_log_file(directory: &File, display: &Path, name: &str) -> AppResult<(File, usize)> {
-    match create_log_file(directory, display, name) {
-        Ok(value) => Ok(value),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            let file = open_existing_log(directory, display, name)
-                .map_err(|error| AppError::io("open existing log", display.join(name), error))?
-                .ok_or_else(|| {
-                    AppError::io(
-                        "open existing log",
-                        display.join(name),
-                        io::Error::new(io::ErrorKind::NotFound, "log disappeared"),
-                    )
-                })?;
-            let size = log_size(&file, &display.join(name))
-                .map_err(|error| AppError::io("inspect existing log", display.join(name), error))?;
-            Ok((file, size))
-        }
-        Err(error) => Err(AppError::io("create log", display.join(name), error)),
-    }
-}
-
-fn create_log_file(directory: &File, display: &Path, name: &str) -> io::Result<(File, usize)> {
+/// Opens or creates the current log without following a link or waiting on a FIFO.
+fn open_log_file(directory: &File) -> io::Result<File> {
     let fd = rustix::fs::openat(
         directory,
-        name,
+        CURRENT_LOG,
         OFlags::WRONLY
             | OFlags::APPEND
             | OFlags::CREATE
-            | OFlags::EXCL
+            | OFlags::NONBLOCK
             | OFlags::NOFOLLOW
             | OFlags::CLOEXEC,
         Mode::from_raw_mode(0o600),
     )?;
-    rustix::fs::fchmod(&fd, Mode::from_raw_mode(0o600))?;
-    let file = File::from(fd);
-    verify_open_log(&file, &display.join(name))?;
-    Ok((file, 0))
-}
-
-fn open_existing_log(directory: &File, display: &Path, name: &str) -> io::Result<Option<File>> {
-    let fd = match rustix::fs::openat(
-        directory,
-        name,
-        OFlags::WRONLY | OFlags::APPEND | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) {
-        Ok(fd) => fd,
-        Err(error) if error == rustix::io::Errno::NOENT => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    let file = File::from(fd);
-    verify_open_log(&file, &display.join(name))?;
-    Ok(Some(file))
-}
-
-fn verify_open_log(file: &File, display: &Path) -> io::Result<()> {
-    let stat = rustix::fs::fstat(file)?;
+    let stat = rustix::fs::fstat(&fd)?;
     if !FileType::from_raw_mode(stat.st_mode).is_file()
         || stat.st_uid != getuid().as_raw()
         || stat.st_mode & 0o777 != 0o600
         || stat.st_nlink != 1
     {
-        return Err(io::Error::other(format!(
-            "{} must be a current-user-owned, single-link regular file with mode 0600",
-            display.display()
-        )));
+        return Err(io::Error::other(
+            "the log must be a current-user-owned, single-link regular file with mode 0600",
+        ));
     }
-    Ok(())
+    Ok(File::from(fd))
 }
 
-fn log_size(file: &File, display: &Path) -> io::Result<usize> {
-    let stat = rustix::fs::fstat(file)?;
-    usize::try_from(stat.st_size).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{} has an invalid size", display.display()),
-        )
-    })
+fn format_record(level: Level, message: fmt::Arguments<'_>, now: SystemTime) -> String {
+    let mut text = String::new();
+    let _ = text.write_fmt(message);
+    let message = crate::display::terminal_safe(text.as_bytes(), MAX_MESSAGE_BYTES);
+    let seconds = now
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let (year, month, day) = civil_from_days(seconds / 86_400);
+    let time = seconds % 86_400;
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z {} {message}\n",
+        time / 3_600,
+        time % 3_600 / 60,
+        time % 60,
+        level.label(),
+    )
 }
 
-fn archive_name(index: usize) -> String {
-    format!("{CURRENT_LOG}.{index}")
-}
-
-fn prune_archives(directory: &File, display: &Path, max_files: usize) -> io::Result<()> {
-    for index in max_files..MAX_LOG_FILES {
-        let name = archive_name(index);
-        if open_existing_log(directory, display, &name)?.is_some() {
-            rustix::fs::unlinkat(directory, &name, AtFlags::empty())?;
-        }
-    }
-    Ok(())
-}
-
-fn mark_truncated(bytes: &mut Vec<u8>, limit: usize) {
-    if limit >= TRUNCATED.len() {
-        bytes.truncate(limit - TRUNCATED.len());
-        bytes.extend_from_slice(TRUNCATED);
+/// Converts days since 1970-01-01 to a proleptic Gregorian date.
+///
+/// Howard Hinnant's `civil_from_days`, limited to dates after the epoch.
+const fn civil_from_days(days: u64) -> (u64, u64, u64) {
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let day_of_era = z % 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
     } else {
-        bytes.clear();
-        bytes.extend_from_slice(&b"~\n"[..limit.min(2)]);
-    }
+        shifted_month - 9
+    };
+    let year = year_of_era + era * 400 + if month <= 2 { 1 } else { 0 };
+    (year, month, day)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io::{self, Write};
-    use std::path::PathBuf;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::mpsc;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use super::{
-        BoundedRecordWriter, LogQueue, LoggingGuard, RecordState, TRUNCATED, mark_truncated,
-        report_dropped_records, spawn_log_worker,
-    };
+    use super::{Level, Logger, civil_from_days, format_record};
 
-    #[test]
-    fn oversized_records_keep_a_visible_marker_inside_the_bound() {
-        let limit = 20;
-        let mut record = b"a diagnostic that is too long".to_vec();
-        mark_truncated(&mut record, limit);
-        assert_eq!(record.len(), limit);
-        assert!(record.ends_with(TRUNCATED));
-
-        let mut tiny = b"long".to_vec();
-        mark_truncated(&mut tiny, 1);
-        assert_eq!(tiny, b"~");
+    fn at(seconds: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(seconds)
     }
 
     #[test]
-    fn record_writer_truncates_and_emits_only_once() {
-        let failed = Arc::new(AtomicBool::new(false));
-        let (queue, receiver) = LogQueue::new(2, failed);
-        let mut writer = BoundedRecordWriter {
-            queue: Arc::clone(&queue),
-            bytes: Vec::new(),
-            max_record_bytes: 20,
-            state: RecordState::Open,
-        };
-
-        writer
-            .write_all(&[b'x'; 32])
-            .expect("bounded record accepts the formatter write");
-        writer.flush().expect("first flush emits the record");
-        writer
-            .write_all(b"ignored after emission")
-            .expect("later formatter writes remain harmless");
-        writer.flush().expect("later flush remains idempotent");
-        drop(writer);
-
-        let record = receiver.try_recv().expect("one record was emitted");
-        assert_eq!(record.len(), 20);
-        assert!(record.ends_with(TRUNCATED));
-        assert!(matches!(
-            receiver.try_recv(),
-            Err(mpsc::TryRecvError::Empty)
-        ));
+    fn records_carry_a_utc_timestamp_and_escape_control_bytes() {
+        let line = format_record(
+            Level::Warn,
+            format_args!("audio output ring underrun: {} samples\nforged", 128),
+            at(1_762_748_400),
+        );
+        assert_eq!(
+            line,
+            "2025-11-10T04:20:00Z WARN audio output ring underrun: 128 samples\\x0Aforged\n"
+        );
     }
 
     #[test]
-    fn background_failures_and_queue_drops_have_independent_reports() {
-        struct BrokenWriter;
+    fn calendar_conversion_handles_leap_days_and_century_rules() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(11_016), (2000, 2, 29));
+        assert_eq!(civil_from_days(11_017), (2000, 3, 1));
+        assert_eq!(civil_from_days(47_541), (2100, 3, 1));
+    }
 
-        impl Write for BrokenWriter {
-            fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
-                Err(io::Error::other("fixture write failure"))
-            }
-
-            fn flush(&mut self) -> io::Result<()> {
-                Err(io::Error::other("fixture flush failure"))
-            }
+    #[test]
+    fn a_full_log_moves_to_one_archive_and_old_archives_are_removed() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let logs = root.path().join("logs");
+        fs::create_dir(&logs).expect("log directory");
+        fs::set_permissions(&logs, fs::Permissions::from_mode(0o700)).expect("private logs");
+        for name in ["suzumushi.log.1", "suzumushi.log.2", "suzumushi.log.4"] {
+            fs::write(logs.join(name), b"old\n").expect("seed archive");
         }
+        let root_file = fs::File::open(root.path()).expect("open root");
 
-        let failed = Arc::new(AtomicBool::new(false));
-        let (queue, receiver) = LogQueue::new(1, Arc::clone(&failed));
-        queue.enqueue(b"kept".to_vec());
-        queue.enqueue(b"dropped one".to_vec());
-        queue.enqueue(b"dropped two".to_vec());
-        assert_eq!(queue.dropped_records(), 2);
-        assert!(!failed.load(Ordering::Acquire));
+        // Room for two 32- and 33-byte records, not three.
+        let mut logger = Logger::open(&root_file, root.path(), 70).expect("open log");
+        assert!(!logs.join("suzumushi.log.2").exists());
+        assert!(!logs.join("suzumushi.log.4").exists());
+        logger.write(Level::Info, format_args!("first"), at(0));
+        logger.write(Level::Info, format_args!("second"), at(0));
+        logger.write(Level::Info, format_args!("third"), at(0));
+        assert!(logger.failure.is_none());
 
-        let worker = spawn_log_worker(
-            BrokenWriter,
-            receiver,
-            Arc::clone(&failed),
-            std::path::Path::new("fixture.log"),
-        )
-        .expect("spawn fixture worker");
-        queue.close();
-        worker.join().expect("join fixture worker");
-        assert!(failed.load(Ordering::Acquire));
-
-        let mut warning = Vec::new();
-        report_dropped_records(&mut warning, queue.dropped_records())
-            .expect("write direct warning");
-        assert_eq!(warning, b"warning: 2 diagnostic records were dropped\n");
-    }
-
-    #[test]
-    fn logging_guard_reports_worker_panic_before_returning() {
-        let failed = Arc::new(AtomicBool::new(false));
-        let (queue, receiver) = LogQueue::new(1, Arc::clone(&failed));
-        let worker = std::thread::spawn(move || {
-            // Closing the queue starts this failure. Only joining the worker
-            // can observe its panic and include it in the returned report.
-            assert!(matches!(
-                receiver.recv_timeout(std::time::Duration::from_secs(1)),
-                Err(mpsc::RecvTimeoutError::Disconnected)
-            ));
-            panic!("fixture worker failed during shutdown");
-        });
-        let guard = LoggingGuard {
-            worker: Some(worker),
-            queue,
-            write_failed: failed,
-            current_path: PathBuf::from("fixture.log"),
-        };
-
-        let report = guard.finish();
-
-        assert!(report.writer_error().is_some());
-        assert_eq!(report.dropped_records, 0);
+        let current = fs::read_to_string(logs.join("suzumushi.log")).expect("current log");
+        let archive = fs::read_to_string(logs.join("suzumushi.log.1")).expect("archive");
+        assert_eq!(current, "1970-01-01T00:00:00Z INFO third\n");
+        assert_eq!(
+            archive,
+            "1970-01-01T00:00:00Z INFO first\n1970-01-01T00:00:00Z INFO second\n"
+        );
+        let mode = fs::metadata(logs.join("suzumushi.log"))
+            .expect("log metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }

@@ -3,6 +3,7 @@
 //! Command-line surface for root initialization and diagnostics.
 
 use std::ffi::OsString;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use clap::{Arg, Command};
@@ -79,8 +80,7 @@ where
                 clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
             ) =>
         {
-            print!("{error}");
-            return Ok(());
+            return print_report(|out| write!(out, "{error}"));
         }
         Err(error) => {
             let rendered = error.to_string();
@@ -123,10 +123,18 @@ where
                 .get_one::<PathBuf>("path")
                 .ok_or_else(|| AppError::InvalidArguments("init destination is required".into()))?;
             let initialized = init::initialize(path)?;
-            println!("initialized {}", safe_path(&initialized.root, 4_096));
-            println!("add audio below {}", safe_path(&initialized.library, 4_096));
-            println!("then run `suzumushi --root <ROOT>` using the initialized path");
-            Ok(())
+            print_report(|out| {
+                writeln!(out, "initialized {}", safe_path(&initialized.root, 4_096))?;
+                writeln!(
+                    out,
+                    "add audio below {}",
+                    safe_path(&initialized.library, 4_096)
+                )?;
+                writeln!(
+                    out,
+                    "then run `suzumushi --root <ROOT>` using the initialized path"
+                )
+            })
         }
         Some(("diagnose", _)) => diagnose(
             explicit.as_deref(),
@@ -152,17 +160,39 @@ fn diagnose(explicit: Option<&Path>, current_dir: &Path) -> AppResult<()> {
     let selected = paths::discover_root(explicit, current_dir)?;
     let config = config::load_from(selected.descriptor(), &selected.path)?;
     let index = scan::scan_from(selected.descriptor(), &selected.path, &config, 1)?;
-    println!(
+    print_report(|out| write_diagnosis(out, &selected.path, &config, &index))
+}
+
+/// Writes a command's report to stdout. A reader that closes the pipe early,
+/// as `suzumushi diagnose | head` does, has taken all it wanted.
+fn print_report(write: impl FnOnce(&mut io::StdoutLock<'_>) -> io::Result<()>) -> AppResult<()> {
+    let mut out = io::stdout().lock();
+    match write(&mut out).and_then(|()| out.flush()) {
+        Err(error) if error.kind() != io::ErrorKind::BrokenPipe => {
+            Err(AppError::io("write report", "stdout", error))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn write_diagnosis(
+    out: &mut impl Write,
+    root: &Path,
+    config: &config::Config,
+    index: &crate::model::ScanIndex,
+) -> io::Result<()> {
+    writeln!(
+        out,
         "root: {}",
-        safe_path(&selected.path, config.runtime.status_text_max_bytes)
-    );
-    println!("complete: {}", index.complete);
-    println!("assets: {}", index.assets.len());
-    println!("tracks: {}", index.entries.len());
-    println!("playlists: {}", index.playlists.len());
-    println!("warnings: {}", index.warnings.len());
+        safe_path(root, config.runtime.status_text_max_bytes)
+    )?;
+    writeln!(out, "complete: {}", index.complete)?;
+    writeln!(out, "assets: {}", index.assets.len())?;
+    writeln!(out, "tracks: {}", index.entries.len())?;
+    writeln!(out, "playlists: {}", index.playlists.len())?;
+    writeln!(out, "warnings: {}", index.warnings.len())?;
     if index.entries.is_empty() {
-        println!("hint: add audio below audio/library/");
+        writeln!(out, "hint: add audio below audio/library/")?;
     }
     for entry in &index.entries {
         let asset = index.asset_for_entry(entry);
@@ -174,21 +204,23 @@ fn diagnose(explicit: Option<&Path>, current_dir: &Path) -> AppResult<()> {
             );
         if let Some(artist) = asset.and_then(|asset| asset.tags.artist.as_deref()) {
             let artist = terminal_safe(artist.as_bytes(), config.scan.max_metadata_field_bytes);
-            println!(
-                "track: {} - {} [{}]",
-                artist, title, entry.search.relative_path
-            );
+            writeln!(
+                out,
+                "track: {artist} - {title} [{}]",
+                entry.search.relative_path
+            )?;
         } else {
-            println!("track: {} [{}]", title, entry.search.relative_path);
+            writeln!(out, "track: {title} [{}]", entry.search.relative_path)?;
         }
     }
     for warning in &index.warnings {
-        println!(
+        writeln!(
+            out,
             "warning: {:?}: {}: {}",
             warning.code,
             safe_path(&warning.path, config.scan.max_path_bytes),
             warning.message
-        );
+        )?;
     }
     Ok(())
 }

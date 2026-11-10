@@ -85,7 +85,7 @@ impl CachedMetadataReader {
             Ok(Some(file)) => match Self::read_records(file) {
                 Ok(cache) => cache,
                 Err(error) => {
-                    tracing::debug!(%error, "ignoring invalid metadata cache");
+                    crate::logging::info(format_args!("ignoring invalid metadata cache: {error}"));
                     Self::default()
                 }
             },
@@ -166,7 +166,9 @@ impl CachedMetadataReader {
     /// Called only by the terminal startup while holding the root writer lease.
     pub(crate) fn save(&mut self, root: BorrowedFd<'_>, path: &Path) {
         if let Err(error) = self.save_inner(root, path) {
-            tracing::warn!(%error, "metadata cache update failed; playback continues");
+            crate::logging::warn(format_args!(
+                "metadata cache update failed; playback continues: {error}"
+            ));
         }
     }
 

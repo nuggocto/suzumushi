@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{
     BufferSize, Device, Error, ErrorKind, FromSample, I24, OutputCallbackInfo, SampleFormat,
-    SizedSample, Stream, StreamConfig, StreamInstant, SupportedStreamConfigRange, U24,
+    SizedSample, Stream, StreamConfig, StreamInstant, SupportedStreamConfigRange,
 };
 use rtrb::{Consumer, Producer, RingBuffer};
 
@@ -305,16 +305,9 @@ impl OutputStream for CpalOutput {
             .as_mut()
             .ok_or_else(|| "audio output ring is unavailable".to_owned())?;
         let frames = (samples.len() / source_channels).min(producer.slots() / self.output_channels);
-        let output_samples = frames
-            .checked_mul(self.output_channels)
-            .ok_or_else(|| "audio output sample count overflow".to_owned())?;
-        self.written = self
-            .written
-            .checked_add(
-                u64::try_from(output_samples)
-                    .map_err(|_| "audio output sample count overflow".to_owned())?,
-            )
-            .ok_or_else(|| "audio output sample generation exhausted".to_owned())?;
+        // Both factors are bounded by the ring size, so neither line can overflow.
+        let output_samples = frames * self.output_channels;
+        self.written += output_samples as u64;
         self.drain_deadline = None;
         // Commit the batch once so the callback can never observe half a frame.
         let mut chunk = producer
@@ -438,18 +431,10 @@ fn build_stream(
     callback: CallbackState,
 ) -> Result<Stream, String> {
     match format {
-        SampleFormat::I8 => typed_stream::<i8>(device, config, pcm_reader, callback),
+        SampleFormat::F32 => typed_stream::<f32>(device, config, pcm_reader, callback),
         SampleFormat::I16 => typed_stream::<i16>(device, config, pcm_reader, callback),
         SampleFormat::I24 => typed_stream::<I24>(device, config, pcm_reader, callback),
         SampleFormat::I32 => typed_stream::<i32>(device, config, pcm_reader, callback),
-        SampleFormat::I64 => typed_stream::<i64>(device, config, pcm_reader, callback),
-        SampleFormat::U8 => typed_stream::<u8>(device, config, pcm_reader, callback),
-        SampleFormat::U16 => typed_stream::<u16>(device, config, pcm_reader, callback),
-        SampleFormat::U24 => typed_stream::<U24>(device, config, pcm_reader, callback),
-        SampleFormat::U32 => typed_stream::<u32>(device, config, pcm_reader, callback),
-        SampleFormat::U64 => typed_stream::<u64>(device, config, pcm_reader, callback),
-        SampleFormat::F32 => typed_stream::<f32>(device, config, pcm_reader, callback),
-        SampleFormat::F64 => typed_stream::<f64>(device, config, pcm_reader, callback),
         _ => Err(format!("unsupported output sample format {format}")),
     }
 }
@@ -692,21 +677,13 @@ fn select_output_config(
     })
 }
 
+/// The formats `build_stream` renders. `PipeWire` and `PulseAudio` always offer
+/// F32, ALSA's plug layer converts, and I24 covers hardware that takes only
+/// 24-bit samples. Each extra format is one more copy of the render callback.
 fn is_pcm_format(format: SampleFormat) -> bool {
     matches!(
         format,
-        SampleFormat::I8
-            | SampleFormat::I16
-            | SampleFormat::I24
-            | SampleFormat::I32
-            | SampleFormat::I64
-            | SampleFormat::U8
-            | SampleFormat::U16
-            | SampleFormat::U24
-            | SampleFormat::U32
-            | SampleFormat::U64
-            | SampleFormat::F32
-            | SampleFormat::F64
+        SampleFormat::F32 | SampleFormat::I16 | SampleFormat::I24 | SampleFormat::I32
     )
 }
 

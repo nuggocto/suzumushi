@@ -3,12 +3,9 @@
 //! Bounded browser rows, folder visibility, and incremental search state.
 
 use std::ffi::OsStr;
-use std::mem::size_of;
 use std::path::{Component, Path};
 
-use super::reserve_exact;
 use crate::config::Config;
-use crate::errors::{AppError, AppResult};
 use crate::model::{PlaylistId, ScanIndex, TrackEntry, TrackEntrySource};
 
 /// One lightweight row in the normal library browser.
@@ -46,7 +43,6 @@ pub(crate) struct SearchState {
     pub active: bool,
     pub query: String,
     pub results: Vec<usize>,
-    prefix_table: Vec<usize>,
     saved_selection: usize,
     max_results: usize,
     max_query_bytes: usize,
@@ -61,24 +57,27 @@ pub(super) struct BrowserState {
 }
 
 impl BrowserState {
-    pub(super) fn new(index: &ScanIndex, config: &Config, capacity: usize) -> AppResult<Self> {
-        let mut rows = Vec::new();
-        reserve_exact(&mut rows, capacity, "library browser")?;
-        build_browser_rows(index, &mut rows, capacity)?;
-        let mut visible_rows = Vec::new();
-        reserve_exact(&mut visible_rows, capacity, "library browser visibility")?;
-        visible_rows.extend(0..rows.len());
-        let selection = visible_rows
+    pub(super) fn new(index: &ScanIndex, config: &Config) -> Self {
+        let rows = build_browser_rows(index);
+        let visible_rows = (0..rows.len()).collect();
+        let selection = rows
             .iter()
-            .position(|position| matches!(rows[*position], BrowserRow::Track { .. }))
+            .position(|row| matches!(row, BrowserRow::Track { .. }))
             .unwrap_or(0);
 
-        Ok(Self {
+        Self {
             rows,
             visible_rows,
             selection,
-            search: allocate_search(config, selection)?,
-        })
+            search: SearchState {
+                active: false,
+                query: String::new(),
+                results: Vec::new(),
+                saved_selection: selection,
+                max_results: config.search.max_results,
+                max_query_bytes: config.search.max_query_bytes,
+            },
+        }
     }
 
     pub(super) fn playlist_entries(
@@ -182,7 +181,6 @@ impl BrowserState {
         let SearchState {
             query,
             results,
-            prefix_table,
             max_results,
             ..
         } = &mut self.search;
@@ -191,10 +189,9 @@ impl BrowserState {
             return;
         }
         let needle = query.as_bytes();
-        rebuild_ascii_case_prefix(needle, prefix_table);
         for (entry_index, entry) in index.entries.iter().enumerate() {
             let tags = index.asset_for_entry(entry).map(|asset| &asset.tags);
-            if entry_matches(entry, tags, needle, prefix_table) {
+            if entry_matches(entry, tags, needle) {
                 results.push(entry_index);
                 if results.len() == *max_results {
                     break;
@@ -234,164 +231,31 @@ impl BrowserState {
     }
 }
 
-pub(super) fn browser_reservation(index: &ScanIndex) -> AppResult<(usize, usize)> {
-    let capacity = index
-        .counters
-        .encountered_entries
-        .checked_add(index.playlists.len())
-        .and_then(|value| value.checked_add(2))
-        .ok_or_else(|| AppError::Resource("library browser reservation overflow".into()))?;
-    let row_bytes = capacity
-        .checked_mul(size_of::<BrowserRow>())
-        .ok_or_else(|| AppError::Resource("library browser byte reservation overflow".into()))?;
-    let visible_bytes = capacity.checked_mul(size_of::<usize>()).ok_or_else(|| {
-        AppError::Resource("library browser visibility reservation overflow".into())
-    })?;
-    let reserved_bytes = row_bytes.checked_add(visible_bytes).ok_or_else(|| {
-        AppError::Resource("combined library browser reservation overflow".into())
-    })?;
-    Ok((capacity, reserved_bytes))
-}
-
-fn allocate_search(config: &Config, saved_selection: usize) -> AppResult<SearchState> {
-    let mut query = String::new();
-    query
-        .try_reserve_exact(config.search.max_query_bytes)
-        .map_err(|error| AppError::Resource(format!("cannot reserve search query: {error}")))?;
-    let mut results = Vec::new();
-    reserve_exact(&mut results, config.search.max_results, "search results")?;
-    let mut prefix_table = Vec::new();
-    reserve_exact(
-        &mut prefix_table,
-        config.search.max_query_bytes,
-        "search prefix table",
-    )?;
-    Ok(SearchState {
-        active: false,
-        query,
-        results,
-        prefix_table,
-        saved_selection,
-        max_results: config.search.max_results,
-        max_query_bytes: config.search.max_query_bytes,
-    })
-}
-
-pub(super) fn search_reservation_bytes(config: &Config) -> AppResult<usize> {
-    config
-        .search
-        .max_results
-        .checked_mul(size_of::<usize>())
-        .and_then(|value| value.checked_add(config.search.max_query_bytes))
-        .and_then(|value| {
-            config
-                .search
-                .max_query_bytes
-                .checked_mul(size_of::<usize>())
-                .and_then(|prefix_bytes| value.checked_add(prefix_bytes))
-        })
-        .ok_or_else(|| AppError::Resource("search reservation overflow".into()))
-}
-
 fn entry_matches(
     entry: &TrackEntry,
     tags: Option<&crate::model::TrackTags>,
     needle: &[u8],
-    prefix_table: &[usize],
 ) -> bool {
-    contains_ascii_case_insensitive(entry.search.filename.as_bytes(), needle, prefix_table).found
-        || contains_ascii_case_insensitive(
-            entry.search.relative_path.as_bytes(),
-            needle,
-            prefix_table,
-        )
-        .found
+    contains_ignoring_ascii_case(entry.search.filename.as_bytes(), needle)
+        || contains_ignoring_ascii_case(entry.search.relative_path.as_bytes(), needle)
         || tags.is_some_and(|tags| {
             [&tags.artist, &tags.album_artist, &tags.album, &tags.title]
                 .into_iter()
                 .flatten()
-                .any(|field| {
-                    contains_ascii_case_insensitive(field.as_bytes(), needle, prefix_table).found
-                })
+                .any(|field| contains_ignoring_ascii_case(field.as_bytes(), needle))
         })
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct SearchMatch {
-    pub(super) found: bool,
-    #[cfg(test)]
-    pub(super) comparisons: usize,
+/// Fields are short (at most a few KiB), so a window scan is fast enough per keystroke.
+pub(super) fn contains_ignoring_ascii_case(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle))
 }
 
-pub(super) fn rebuild_ascii_case_prefix(needle: &[u8], prefix_table: &mut Vec<usize>) {
-    prefix_table.clear();
-    prefix_table.resize(needle.len(), 0);
-    let mut matched = 0;
-    for index in 1..needle.len() {
-        while matched > 0 && !needle[index].eq_ignore_ascii_case(&needle[matched]) {
-            matched = prefix_table[matched - 1];
-        }
-        if needle[index].eq_ignore_ascii_case(&needle[matched]) {
-            matched += 1;
-        }
-        prefix_table[index] = matched;
-    }
-}
-
-pub(super) fn contains_ascii_case_insensitive(
-    haystack: &[u8],
-    needle: &[u8],
-    prefix_table: &[usize],
-) -> SearchMatch {
-    debug_assert_eq!(needle.len(), prefix_table.len());
-    #[cfg(test)]
-    let mut comparisons = 0;
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return SearchMatch {
-            found: false,
-            #[cfg(test)]
-            comparisons,
-        };
-    }
-
-    let mut matched = 0;
-    for &byte in haystack {
-        loop {
-            #[cfg(test)]
-            {
-                comparisons += 1;
-            }
-            if byte.eq_ignore_ascii_case(&needle[matched]) {
-                matched += 1;
-                if matched == needle.len() {
-                    return SearchMatch {
-                        found: true,
-                        #[cfg(test)]
-                        comparisons,
-                    };
-                }
-                break;
-            }
-            if matched == 0 {
-                break;
-            }
-            matched = prefix_table[matched - 1];
-        }
-    }
-
-    SearchMatch {
-        found: false,
-        #[cfg(test)]
-        comparisons,
-    }
-}
-
-fn build_browser_rows(
-    index: &ScanIndex,
-    rows: &mut Vec<BrowserRow>,
-    row_limit: usize,
-) -> AppResult<()> {
-    push_browser_row(rows, BrowserRow::LibraryRoot, row_limit)?;
+fn build_browser_rows(index: &ScanIndex) -> Vec<BrowserRow> {
+    let mut rows = vec![BrowserRow::LibraryRoot];
     let mut previous = None;
     let mut entry_cursor = 0;
     while let Some(entry) = index.entries.get(entry_cursor) {
@@ -399,27 +263,27 @@ fn build_browser_rows(
             &entry.source,
             TrackEntrySource::LibraryFile | TrackEntrySource::LibrarySymlink
         ) {
-            append_tree_entry(index, rows, entry_cursor, 1, 1, &mut previous, row_limit)?;
+            append_tree_entry(index, &mut rows, entry_cursor, 1, 1, &mut previous);
             entry_cursor += 1;
         } else {
             break;
         }
     }
 
-    push_browser_row(rows, BrowserRow::PlaylistsRoot, row_limit)?;
+    rows.push(BrowserRow::PlaylistsRoot);
     for (playlist_index, playlist) in index.playlists.iter().enumerate() {
-        push_browser_row(rows, BrowserRow::Playlist { playlist_index }, row_limit)?;
+        rows.push(BrowserRow::Playlist { playlist_index });
         let mut previous = None;
         while index
             .entries
             .get(entry_cursor)
             .is_some_and(|entry| entry_playlist(entry) == Some(playlist.id))
         {
-            append_tree_entry(index, rows, entry_cursor, 2, 2, &mut previous, row_limit)?;
+            append_tree_entry(index, &mut rows, entry_cursor, 2, 2, &mut previous);
             entry_cursor += 1;
         }
     }
-    Ok(())
+    rows
 }
 
 fn append_tree_entry(
@@ -429,8 +293,7 @@ fn append_tree_entry(
     skipped_components: usize,
     base_indent: usize,
     previous: &mut Option<(usize, usize)>,
-    row_limit: usize,
-) -> AppResult<()> {
+) {
     let path = &index.entries[entry_index].display_path;
     let folder_count = normal_component_count(path).saturating_sub(skipped_components + 1);
     let common = previous.map_or(0, |(previous_index, previous_folders)| {
@@ -443,41 +306,18 @@ fn append_tree_entry(
         )
     });
     for depth in common + 1..=folder_count {
-        push_browser_row(
-            rows,
-            BrowserRow::Folder {
-                entry_index,
-                component_index: skipped_components + depth - 1,
-                indent: base_indent + depth - 1,
-                collapsed: false,
-            },
-            row_limit,
-        )?;
-    }
-    push_browser_row(
-        rows,
-        BrowserRow::Track {
+        rows.push(BrowserRow::Folder {
             entry_index,
-            indent: base_indent + folder_count,
-        },
-        row_limit,
-    )?;
-    *previous = Some((entry_index, folder_count));
-    Ok(())
-}
-
-fn push_browser_row(
-    rows: &mut Vec<BrowserRow>,
-    row: BrowserRow,
-    row_limit: usize,
-) -> AppResult<()> {
-    if rows.len() == row_limit {
-        return Err(AppError::Resource(
-            "library browser exceeded its scanner-derived row bound".into(),
-        ));
+            component_index: skipped_components + depth - 1,
+            indent: base_indent + depth - 1,
+            collapsed: false,
+        });
     }
-    rows.push(row);
-    Ok(())
+    rows.push(BrowserRow::Track {
+        entry_index,
+        indent: base_indent + folder_count,
+    });
+    *previous = Some((entry_index, folder_count));
 }
 
 fn common_folder_count(

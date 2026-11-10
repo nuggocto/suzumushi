@@ -45,7 +45,7 @@ On x86-64 NixOS with Nix installed, add the repository flake to your user profil
 
 ```sh
 nix --extra-experimental-features 'nix-command flakes' \
-  profile add github:nuggocto/suzumushi/v1.2.2
+  profile add github:nuggocto/suzumushi/v1.3.0
 ```
 
 This installs both `suzumushi` and `suzu`. Nix builds from source with pinned
@@ -66,19 +66,19 @@ and local build checks.
 ## Install the release archive by hand
 
 To check each step yourself, download the archive and `SHA256SUMS` from the
-[`v1.2.2` release](https://github.com/nuggocto/suzumushi/releases/tag/v1.2.2):
+[`v1.3.0` release](https://github.com/nuggocto/suzumushi/releases/tag/v1.3.0):
 
 ```sh
 curl -fLO \
-  'https://github.com/nuggocto/suzumushi/releases/download/v1.2.2/{SHA256SUMS,suzumushi-v1.2.2-x86_64-unknown-linux-gnu.tar.xz}'
+  'https://github.com/nuggocto/suzumushi/releases/download/v1.3.0/{SHA256SUMS,suzumushi-v1.3.0-x86_64-unknown-linux-gnu.tar.xz}'
 ```
 
 Then verify and install the downloaded archive:
 
 ```sh
 sha256sum --check --ignore-missing SHA256SUMS
-tar -xf suzumushi-v1.2.2-x86_64-unknown-linux-gnu.tar.xz
-cd suzumushi-v1.2.2-x86_64-unknown-linux-gnu
+tar -xf suzumushi-v1.3.0-x86_64-unknown-linux-gnu.tar.xz
+cd suzumushi-v1.3.0-x86_64-unknown-linux-gnu
 sudo install -Dm755 suzumushi /usr/local/bin/suzumushi
 sudo ln -s suzumushi /usr/local/bin/suzu
 ```
@@ -137,6 +137,9 @@ Unchanged files reuse metadata saved during the previous terminal startup.
 The disposable cache at `state/metadata.jsonl` holds at most 4 MiB and 10,000
 entries. Delete it while the player is closed to force a fresh metadata read.
 `diagnose` can read the cache but never writes it.
+
+A first start on a large library reads every file's tags and shows a running
+track count until the player opens. Later starts use the cache.
 
 Press `Enter` on a Library folder to collapse or expand it. This only changes
 the current terminal view: search still finds tracks inside collapsed folders,
@@ -203,6 +206,28 @@ playerctl --player=suzumushi metadata
 Only bounded text metadata is published. Suzumushi does not publish artwork or
 accept files and URLs through MPRIS.
 
+## Configuration
+
+`suzumushi init` writes `config.toml` in the root, with a comment above each
+setting:
+
+```toml
+theme = "terminal"        # or "mono"
+default_view = "library"  # or "queue"
+
+[scan]
+cross_mounts = false
+follow_file_symlinks = true
+ignore_hidden_audio = true
+```
+
+Every setting is optional. Config files from 1.2 and earlier keep working:
+their capacity limits are compiled in now, so those keys are ignored. Each root
+admits one player at a time; players on different roots can run together.
+
+The session log is `logs/suzumushi.log`, one timestamped line per record. It
+keeps one 1 MiB archive.
+
 ## Terminal colors
 
 Suzumushi inherits the terminal's foreground, background, and named ANSI
@@ -231,7 +256,7 @@ automatic resampling are not current support claims.
 
 ## Status
 
-Version `1.2.2` is the current stable release. Its tag-driven Linux archive is
+Version `1.3.0` is the current stable release. Its tag-driven Linux archive is
 fully verified before GitHub publishes it. Arch users can install the matching
 `suzumushi-bin` package from AUR.
 

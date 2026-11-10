@@ -7,7 +7,7 @@ use std::path::Path;
 use suzumushi::errors::AppError;
 use suzumushi::init::initialize;
 use suzumushi::locks::RootWriterLease;
-use suzumushi::paths::{RootSource, discover_root_from};
+use suzumushi::paths::discover_root_from;
 use suzumushi::{config, scan};
 use tempfile::TempDir;
 
@@ -34,10 +34,9 @@ fn init_creates_the_documented_tree_with_private_storage() {
         assert!(directory.is_dir(), "missing {}", directory.display());
     }
     assert!(paths.playlists.join("demo/README.txt").is_file());
-    assert!(
-        fs::read_to_string(&paths.config)
-            .expect("config readable")
-            .contains("max_index_bytes = 117440512")
+    assert_eq!(
+        fs::read_to_string(&paths.config).expect("config readable"),
+        config::DEFAULT_CONFIG
     );
     for directory in [&paths.state, &paths.logs] {
         assert_eq!(
@@ -141,21 +140,19 @@ fn root_precedence_never_falls_through_an_invalid_higher_source() {
 
     let selected = discover_root_from(Some(&cli.root), Some(&environment.root), temp.path())
         .expect("cli wins");
-    assert_eq!(selected.source, RootSource::CommandLine);
     assert_eq!(selected.path, cli.root);
     let selected =
         discover_root_from(None, Some(&environment.root), temp.path()).expect("environment wins");
-    assert_eq!(selected.source, RootSource::Environment);
+    assert_eq!(selected.path, environment.root);
     let selected = discover_root_from(None, None, temp.path()).expect("working convention wins");
-    assert_eq!(selected.source, RootSource::WorkingDirectory);
     assert_eq!(selected.path, working.root);
 
     let empty = TempDir::new().expect("empty working directory");
     let selected = discover_root_from(Some(&cli.root), None, empty.path()).expect("cli alone");
-    assert_eq!(selected.source, RootSource::CommandLine);
+    assert_eq!(selected.path, cli.root);
     let selected =
         discover_root_from(None, Some(&environment.root), empty.path()).expect("environment alone");
-    assert_eq!(selected.source, RootSource::Environment);
+    assert_eq!(selected.path, environment.root);
     assert!(matches!(
         discover_root_from(None, None, empty.path()),
         Err(AppError::RootMissing)
@@ -184,7 +181,8 @@ fn selected_root_stays_pinned_when_its_path_is_replaced() {
     let root = temp.path().join("root");
     let original = initialize(&root).expect("initialize original root");
     fs::write(original.library.join("original.mp3"), b"").expect("write original media fixture");
-    let original_config = config::DEFAULT_CONFIG.replacen("max_files = 50000", "max_files = 1", 1);
+    let original_config =
+        config::DEFAULT_CONFIG.replacen("theme = \"terminal\"", "theme = \"mono\"", 1);
     fs::write(&original.config, original_config).expect("write distinctive original config");
     let selected =
         discover_root_from(Some(&root), None, temp.path()).expect("select original root");
@@ -196,11 +194,12 @@ fn selected_root_stays_pinned_when_its_path_is_replaced() {
         .expect("write replacement media fixture");
 
     let held_metadata = fs::metadata(&held).expect("inspect held root");
-    assert_eq!(selected.identity.device, held_metadata.dev());
-    assert_eq!(selected.identity.inode, held_metadata.ino());
+    let selected_stat = rustix::fs::fstat(selected.descriptor()).expect("inspect selected root");
+    assert_eq!(selected_stat.st_dev, held_metadata.dev());
+    assert_eq!(selected_stat.st_ino, held_metadata.ino());
     let loaded = config::load_from(selected.descriptor(), &selected.path)
         .expect("load config through selected descriptor");
-    assert_eq!(loaded.scan.max_files, 1);
+    assert_eq!(loaded.theme, config::Theme::Mono);
     let index = scan::scan_from(selected.descriptor(), &selected.path, &loaded, 1)
         .expect("scan through selected descriptor");
     assert_eq!(index.entries.len(), 1);

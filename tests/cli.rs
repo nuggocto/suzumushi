@@ -15,7 +15,6 @@ use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::fd::{AsFd, OwnedFd};
-use rustix::fs::inotify;
 use rustix::fs::{CWD, Mode, OFlags, mkfifoat};
 use rustix::process::{PidfdFlags, pidfd_open};
 use rustix::process::{Signal, kill_process, kill_process_group};
@@ -128,7 +127,7 @@ fn version_succeeds_without_selecting_a_root() {
         String::from_utf8(output.stdout).expect("version output is UTF-8"),
         format!("suzumushi {}\n", env!("CARGO_PKG_VERSION"))
     );
-    assert!(output.stderr.is_empty());
+    assert_eq!(output.stderr, b"");
 }
 
 #[test]
@@ -140,7 +139,7 @@ fn internal_audio_helper_decodes_only_its_inherited_descriptor() {
     );
 
     assert!(output.status.success(), "helper status: {}", output.status);
-    assert!(output.stderr.is_empty());
+    assert_eq!(output.stderr, b"");
     assert!(output.stdout.starts_with(b"SUZPCM02"));
     assert_eq!(&output.stdout[8..12], &48_000_u32.to_le_bytes());
     assert_eq!(&output.stdout[12..14], &2_u16.to_le_bytes());
@@ -203,7 +202,7 @@ fn bare_command_requires_a_selected_root() {
             .env_remove("SUZUMUSHI_ROOT"),
     );
     assert_eq!(output.status.code(), Some(2));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout, b"");
     let stderr = String::from_utf8(output.stderr).expect("UTF-8 error");
     assert!(stderr.contains("suzumushi init ./suzumushi"), "{stderr}");
 }
@@ -242,10 +241,9 @@ fn unresponsive_session_bus_does_not_prevent_terminal_use_or_shutdown() {
 }
 
 #[test]
-fn terminal_session_restores_the_pty_and_holds_both_leases() {
+fn terminal_session_restores_the_pty_and_holds_the_root_lease() {
     let fixture = Fixture::new();
-    let Fixture { root, runtime, .. } = &fixture;
-    tune_terminal_fixture(root);
+    let root = &fixture.root;
     seed_old_log_archives(root);
 
     let (mut master, mut child) = fixture.spawn_terminal();
@@ -264,7 +262,7 @@ fn terminal_session_restores_the_pty_and_holds_both_leases() {
     assert!(!second.status.success());
     let conflict = String::from_utf8(second.stderr).expect("UTF-8 lock error");
     assert!(
-        conflict.contains("active TUI lease is already held"),
+        conflict.contains("root writer lease is already held"),
         "{conflict}"
     );
 
@@ -275,11 +273,17 @@ fn terminal_session_restores_the_pty_and_holds_both_leases() {
     assert!(!byte_contains(&transcript, b"terminal session starting"));
 
     let current = root.join("logs/suzumushi.log");
-    let archive = root.join("logs/suzumushi.log.1");
-    assert!(current.is_file());
+    let log = fs::read_to_string(&current).expect("read current log");
+    let first = log.lines().next().expect("a startup record");
+    // 2026-11-10T04:20:00Z INFO terminal session starting
+    assert_eq!(first.len(), 51, "{first}");
     assert!(
-        archive.is_file(),
-        "small fixture limit should rotate the log"
+        first.ends_with("Z INFO terminal session starting"),
+        "{first}"
+    );
+    assert!(
+        log.contains("INFO terminal session stopped cleanly"),
+        "{log}"
     );
     assert_eq!(
         fs::metadata(&current)
@@ -289,33 +293,14 @@ fn terminal_session_restores_the_pty_and_holds_both_leases() {
             & 0o777,
         0o600
     );
-    assert!(
-        byte_contains(
-            &fs::read(&current).expect("read current log"),
-            b"[truncated]"
-        ) || byte_contains(
-            &fs::read(&archive).expect("read archived log"),
-            b"[truncated]"
-        ),
-        "the installed logging pipeline should mark truncated records"
-    );
+    assert!(root.join("logs/suzumushi.log.1").is_file());
     for index in 2..=4 {
         assert!(
             !root.join(format!("logs/suzumushi.log.{index}")).exists(),
-            "lower retention should prune archive {index}"
+            "archive {index} from an older release is removed"
         );
     }
-    assert_eq!(
-        fs::metadata(&archive)
-            .expect("archive log metadata")
-            .permissions()
-            .mode()
-            & 0o777,
-        0o600
-    );
 
-    suzumushi::locks::ActiveTuiLease::acquire_in(Some(runtime))
-        .expect("active lease is released after quit");
     suzumushi::locks::RootWriterLease::acquire(root).expect("root lease is released after quit");
     suzumushi::init::initialize(root)
         .expect("the persistent root lock remains an owned initialization entry");
@@ -346,12 +331,11 @@ fn terminal_user_can_search_and_build_a_queue_without_audio() {
     assert!(byte_contains(&transcript, b"JDR"));
     assert!(byte_contains(&transcript, b"Campaign"));
     assert!(byte_contains(&transcript, b"\x1b[?1049l"));
-    let state: serde_json::Value = serde_json::from_slice(
-        &fs::read(fixture.root.join("state/now-playing.json")).expect("read final playback state"),
-    )
-    .expect("playback state is valid JSON");
-    assert_eq!(state["version"], 1);
-    assert_eq!(state["status"], "stopped");
+    assert!(
+        !fixture.root.join("state/session.json").exists(),
+        "an emptied queue leaves nothing to resume"
+    );
+    assert!(!fixture.root.join("state/now-playing.json").exists());
 }
 
 #[test]
@@ -441,14 +425,11 @@ fn terminal_reopens_the_last_queue_without_autoplay() {
     assert!(byte_contains(&transcript, b"Night"));
     assert!(byte_contains(&transcript, b"Stopped"));
 
-    let state: serde_json::Value = serde_json::from_slice(
-        &fs::read(root.join("state/now-playing.json")).expect("read final now-playing state"),
+    let saved: serde_json::Value = serde_json::from_slice(
+        &fs::read(root.join("state/session.json")).expect("read final session"),
     )
-    .expect("parse final now-playing state");
-    assert_eq!(state["status"], "stopped");
-    assert_eq!(state["title"], "Night Song");
-    assert_eq!(state["queue_position"], 1);
-    assert_eq!(state["queue_length"], 1);
+    .expect("final session is valid JSON");
+    assert_eq!(saved["queue_entry_ids"].as_array().map(Vec::len), Some(1));
 }
 
 #[test]
@@ -482,81 +463,31 @@ fn terminal_user_can_play_a_queued_file_on_the_real_device() {
 }
 
 #[test]
-fn oversized_terminal_resize_is_refused_before_buffer_growth() {
+fn a_very_large_terminal_keeps_the_session_running() {
     let fixture = Fixture::new();
-    let Fixture { root, runtime, .. } = &fixture;
 
     let (mut master, mut child) = fixture.spawn_terminal();
     let mut transcript = read_pty_until(&mut master, &mut child, b"Library");
-    master
-        .write_all(b"\t")
-        .expect("prime terminal event delivery");
+
+    // 1.2.2 exited here: 500x250 needed more than its fixed 8 MiB of buffers.
+    resize_terminal(&master, &child, 500, 250);
+    master.write_all(b"\t").expect("focus the Player");
     transcript.extend(read_pty_until(&mut master, &mut child, FOCUSED_PLAYER));
+    resize_terminal(&master, &child, 80, 24);
+    master.write_all(b"\t").expect("focus the Queue");
+    transcript.extend(read_pty_until(&mut master, &mut child, FOCUSED_QUEUE));
 
-    let pair_bytes = std::mem::size_of::<ratatui::buffer::Cell>() * 2;
-    let width = 512_usize;
-    let height = (8 * 1_048_576 / pair_bytes / width) + 1;
-    let height = u16::try_from(height).expect("fixture dimensions fit the PTY");
-    resize_terminal(
-        &master,
-        &child,
-        u16::try_from(width).expect("fixture width"),
-        height,
-    );
+    master.write_all(b"q").expect("quit");
     let (tail, status) = read_pty_to_status(&mut master, &mut child);
     transcript.extend(tail);
-
-    assert!(!status.success(), "oversized terminal must fail closed");
-    assert!(byte_contains(
-        &transcript,
-        b"above the 8388608-byte UI reservation"
-    ));
+    assert!(status.success(), "{status}");
     assert!(byte_contains(&transcript, b"\x1b[?1049l"));
-    suzumushi::locks::ActiveTuiLease::acquire_in(Some(runtime))
-        .expect("active lease is released after resize refusal");
-    suzumushi::locks::RootWriterLease::acquire(root)
-        .expect("root lease is released after resize refusal");
-}
-
-#[test]
-fn background_log_failure_is_reported_after_terminal_restoration() {
-    let fixture = Fixture::new();
-    let Fixture { root, runtime, .. } = &fixture;
-    tune_terminal_fixture(root);
-
-    let (mut master, mut child) = fixture.spawn_terminal();
-    let mut transcript = read_pty_until(&mut master, &mut child, b"Library");
-
-    let current = root.join("logs/suzumushi.log");
-    wait_for_nonempty_file(&current, &mut child);
-    fs::rename(&current, root.join("logs/suzumushi.log.held"))
-        .expect("replace current log identity");
-    fs::write(&current, b"replacement").expect("create replacement log");
-    fs::set_permissions(&current, fs::Permissions::from_mode(0o600))
-        .expect("make replacement log private");
-
-    master.write_all(b"q").expect("send quit key");
-    let (tail, status) = read_pty_to_status(&mut master, &mut child);
-    transcript.extend(tail);
-    assert!(!status.success(), "writer failure must fail the command");
-    let restore = byte_position(&transcript, b"\x1b[?1049l").expect("alternate-screen exit");
-    let diagnostic = byte_position(&transcript, b"background log writer failed")
-        .expect("visible writer failure");
-    assert!(
-        restore < diagnostic,
-        "diagnostic must follow terminal restoration"
-    );
-
-    suzumushi::locks::ActiveTuiLease::acquire_in(Some(runtime))
-        .expect("active lease is released after writer failure");
-    suzumushi::locks::RootWriterLease::acquire(root)
-        .expect("root lease is released after writer failure");
 }
 
 #[test]
 fn fifo_log_entry_never_blocks_terminal_startup() {
     let fixture = Fixture::new();
-    let Fixture { root, runtime, .. } = &fixture;
+    let root = &fixture.root;
     let fifo = root.join("logs/suzumushi.log");
     mkfifoat(CWD, &fifo, Mode::from_raw_mode(0o600)).expect("create log FIFO");
     let _reader = rustix::fs::open(
@@ -570,35 +501,30 @@ fn fifo_log_entry_never_blocks_terminal_startup() {
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).expect("UTF-8 logging error");
     assert!(stderr.contains("single-link regular file"), "{stderr}");
-    suzumushi::locks::ActiveTuiLease::acquire_in(Some(runtime))
-        .expect("active lease is released after startup failure");
     suzumushi::locks::RootWriterLease::acquire(root)
         .expect("root lease is released after startup failure");
 }
 
 #[test]
-fn terminal_startup_reserves_its_open_file_peak_before_opening() {
+fn diagnose_output_into_a_closed_pipe_is_not_an_error() {
     let fixture = Fixture::new();
-    let Fixture { root, runtime, .. } = &fixture;
-    let config_path = root.join("config.toml");
-    let config = fs::read_to_string(&config_path)
-        .expect("read fixture config")
-        .replacen("max_open_files = 64", "max_open_files = 5", 1);
-    fs::write(&config_path, config).expect("lower open-file limit");
+    fixture.add_tagged_track("night.mp3");
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    // The reader is gone before the first write, as with `diagnose | head -0`.
+    drop(reader);
 
-    let output = output_with_timeout(&mut fixture.command());
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr).expect("UTF-8 resource error");
-    assert!(stderr.contains("runtime.max_open_files"), "{stderr}");
-    assert!(stderr.contains("at least 6"), "{stderr}");
-    assert!(
-        !runtime.join("suzumushi").exists(),
-        "preflight must run before the active lease creates storage"
-    );
-    assert!(
-        !root.join("logs/suzumushi.log").exists(),
-        "preflight must run before logging opens a file"
-    );
+    let output = Command::new(env!("CARGO_BIN_EXE_suzumushi"))
+        .arg("--root")
+        .arg(&fixture.root)
+        .arg("diagnose")
+        .stdin(Stdio::null())
+        .stdout(writer)
+        .output()
+        .expect("run diagnose");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{}: {stderr}", output.status);
+    assert!(stderr.is_empty(), "{stderr}");
 }
 
 #[test]
@@ -606,7 +532,7 @@ fn invalid_arguments_have_one_clean_error_prefix() {
     let output = output_with_timeout(Command::new(env!("CARGO_BIN_EXE_suzumushi")).arg("init"));
 
     assert_eq!(output.status.code(), Some(2));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout, b"");
     let stderr = String::from_utf8(output.stderr).expect("argument error should be valid UTF-8");
     assert!(
         stderr.starts_with("error: one or more required arguments were not provided"),
@@ -906,22 +832,6 @@ fn initialize_root(root: &std::path::Path) {
     );
 }
 
-fn tune_terminal_fixture(root: &std::path::Path) {
-    let path = root.join("config.toml");
-    let mut config = fs::read_to_string(&path).expect("read fixture config");
-    for (old, new) in [
-        ("max_file_bytes = 10485760", "max_file_bytes = 24"),
-        ("max_record_bytes = 16384", "max_record_bytes = 24"),
-        ("queue_capacity = 512", "queue_capacity = 8"),
-        ("queue_max_bytes = 8388608", "queue_max_bytes = 512"),
-        ("\nmax_files = 5\n", "\nmax_files = 2\n"),
-    ] {
-        assert_eq!(config.matches(old).count(), 1, "fixture key {old}");
-        config = config.replacen(old, new, 1);
-    }
-    fs::write(path, config).expect("write fixture config");
-}
-
 fn seed_old_log_archives(root: &std::path::Path) {
     for index in 1..=4 {
         let archive = root.join(format!("logs/suzumushi.log.{index}"));
@@ -1100,31 +1010,6 @@ fn read_pty_to_status(master: &mut File, child: &mut Child) -> (Vec<u8>, ExitSta
     }
 }
 
-fn wait_for_nonempty_file(path: &std::path::Path, child: &mut Child) {
-    let changes = inotify::init(inotify::CreateFlags::NONBLOCK | inotify::CreateFlags::CLOEXEC)
-        .expect("watch startup log");
-    inotify::add_watch(
-        &changes,
-        path.parent().expect("log directory"),
-        inotify::WatchFlags::MODIFY | inotify::WatchFlags::CREATE,
-    )
-    .expect("watch log creation and writes");
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        if fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0) {
-            return;
-        }
-        if let Some(status) = child.try_wait().expect("inspect terminal child") {
-            panic!("terminal exited before writing its startup log: {status}");
-        }
-        wait_readable(&changes, deadline);
-        let _ = rustix::io::read(&changes, &mut [0_u8; 4_096]);
-    }
-    child.kill().expect("kill terminal without startup log");
-    child.wait().expect("reap terminal without startup log");
-    panic!("terminal did not write its startup log");
-}
-
 fn read_available(master: &mut File, output: &mut Vec<u8>) {
     let mut buffer = [0_u8; 4_096];
     loop {
@@ -1145,12 +1030,6 @@ fn byte_contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
         .any(|window| window == needle)
-}
-
-fn byte_position(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
 }
 
 fn output_with_timeout(command: &mut Command) -> Output {

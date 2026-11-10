@@ -9,33 +9,11 @@ use std::path::{Path, PathBuf};
 
 use crate::errors::{AppError, AppResult};
 
-/// The source that selected a root.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RootSource {
-    /// The command-line `--root` option.
-    CommandLine,
-    /// The `SUZUMUSHI_ROOT` environment variable.
-    Environment,
-    /// The existing `./suzumushi/audio` convention.
-    WorkingDirectory,
-}
-
-/// Stable filesystem identity of the selected root descriptor.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RootIdentity {
-    pub device: u64,
-    pub inode: u64,
-}
-
 /// A selected root pinned for the lifetime of one command or terminal session.
 #[derive(Debug)]
 pub struct SelectedRoot {
     /// Canonical filesystem path.
     pub path: PathBuf,
-    /// Winning precedence source.
-    pub source: RootSource,
-    /// Identity captured from the verified descriptor.
-    pub identity: RootIdentity,
     descriptor: File,
 }
 
@@ -109,19 +87,19 @@ pub fn discover_root_from(
     current_dir: &Path,
 ) -> AppResult<SelectedRoot> {
     if let Some(path) = explicit {
-        return validate_selected(path, RootSource::CommandLine);
+        return validate_selected(path);
     }
     if let Some(path) = environment {
-        return validate_selected(path, RootSource::Environment);
+        return validate_selected(path);
     }
     let conventional = current_dir.join("suzumushi");
     if conventional.join("audio").is_dir() {
-        return validate_selected(&conventional, RootSource::WorkingDirectory);
+        return validate_selected(&conventional);
     }
     Err(AppError::RootMissing)
 }
 
-fn validate_selected(path: &Path, source: RootSource) -> AppResult<SelectedRoot> {
+fn validate_selected(path: &Path) -> AppResult<SelectedRoot> {
     let metadata = fs::symlink_metadata(path).map_err(|error| AppError::InvalidRoot {
         path: path.to_path_buf(),
         reason: error.to_string(),
@@ -158,10 +136,6 @@ fn validate_selected(path: &Path, source: RootSource) -> AppResult<SelectedRoot>
         reason: format!("audio must be a real readable directory: {error}"),
     })?;
     drop(audio_fd);
-    let stat = rustix::fs::fstat(&root_fd).map_err(|error| AppError::InvalidRoot {
-        path: path.to_path_buf(),
-        reason: format!("cannot inspect the verified root descriptor: {error}"),
-    })?;
     let canonical =
         fs::read_link(format!("/proc/self/fd/{}", root_fd.as_raw_fd())).map_err(|error| {
             AppError::InvalidRoot {
@@ -171,11 +145,6 @@ fn validate_selected(path: &Path, source: RootSource) -> AppResult<SelectedRoot>
         })?;
     Ok(SelectedRoot {
         path: canonical,
-        source,
-        identity: RootIdentity {
-            device: stat.st_dev,
-            inode: stat.st_ino,
-        },
         descriptor: File::from(root_fd),
     })
 }

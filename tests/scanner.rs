@@ -425,7 +425,6 @@ fn ignored_hidden_directory_beyond_the_depth_limit_does_not_stop_the_scan() {
 
     let mut config = Config::default();
     config.scan.max_depth = 2;
-    config.validate().expect("valid depth limit");
     let mut reader = FakeMetadata::default();
     let index = scan(&root, &config, &mut reader);
 
@@ -455,7 +454,7 @@ fn unrelated_directory_at_audio_root_does_not_consume_descendant_budgets() {
     let index = scan(&root, &config, &mut reader);
 
     assert!(index.complete, "{:?}", index.warnings);
-    assert!(index.entries.is_empty());
+    assert_eq!(index.entries, []);
     assert_eq!(
         index.counters.encountered_entries,
         baseline.counters.encountered_entries + 1
@@ -741,7 +740,7 @@ fn files_directly_below_playlists_are_not_playlist_folders() {
     let mut reader = FakeMetadata::default();
     let index = scan(&root, &Config::default(), &mut reader);
 
-    assert!(index.entries.is_empty());
+    assert_eq!(index.entries, []);
     assert!(
         !index
             .playlists
@@ -800,23 +799,21 @@ fn rejected_paths_still_consume_the_enumeration_budget() {
     config.scan.max_entries = 10;
     config.scan.max_files = 1;
     config.scan.max_path_bytes = 16;
-    config.validate().expect("supported scan limits");
 
     let index = scan(&root, &config, &mut FakeMetadata::default());
 
     assert!(!index.complete);
-    assert!(index.entries.is_empty());
+    assert_eq!(index.entries, []);
     assert_eq!(index.counters.encountered_entries, 10);
     assert!(index.warnings.iter().any(|warning| {
         warning.code == ScanWarningCode::LimitReached
-            && warning.message == "scan.max_entries limit reached"
+            && warning.message == "built-in folder entry limit reached"
     }));
     assert!(index.warnings.len() <= 11);
 
     config.scan.max_warning_bytes = 1;
-    config.validate().expect("bounded warning storage");
     let silent = scan(&root, &config, &mut FakeMetadata::default());
-    assert!(silent.warnings.is_empty());
+    assert_eq!(silent.warnings, []);
     assert_eq!(silent.counters.encountered_entries, 10);
     assert!(!silent.complete);
 }
@@ -974,7 +971,7 @@ fn symlink_parser_metadata_warning_and_mount_counters_are_bounded() {
         index
             .warnings
             .iter()
-            .any(|warning| warning.message.contains("max_symlink_resolutions"))
+            .any(|warning| warning.message == "built-in symlink limit reached")
     );
     config.scan.max_symlink_resolutions = Config::default().scan.max_symlink_resolutions;
     config.scan.max_metadata_field_bytes = 8;

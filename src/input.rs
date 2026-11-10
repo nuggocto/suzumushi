@@ -29,8 +29,6 @@ pub enum AppAction {
     Stop,
     Next,
     Previous,
-    SeekBackward,
-    SeekForward,
     SeekRelative {
         forward: bool,
         distance: Duration,
@@ -50,6 +48,20 @@ pub enum AppAction {
     RepeatOff,
     RepeatAll,
     RepeatOne,
+}
+
+/// How far one arrow key press seeks.
+pub const SEEK_STEP: Duration = Duration::from_secs(5);
+
+impl AppAction {
+    /// One arrow-key seek step.
+    #[must_use]
+    pub const fn seek_step(forward: bool) -> Self {
+        Self::SeekRelative {
+            forward,
+            distance: SEEK_STEP,
+        }
+    }
 }
 
 /// Resolves one normal-mode key without delaying terminal input.
@@ -84,8 +96,8 @@ pub fn resolve(key: KeyEvent) -> Option<AppAction> {
         KeyCode::Char('s') if key.modifiers.is_empty() => Some(AppAction::Stop),
         KeyCode::Char('n') if key.modifiers.is_empty() => Some(AppAction::Next),
         KeyCode::Char('p') if key.modifiers.is_empty() => Some(AppAction::Previous),
-        KeyCode::Left if key.modifiers.is_empty() => Some(AppAction::SeekBackward),
-        KeyCode::Right if key.modifiers.is_empty() => Some(AppAction::SeekForward),
+        KeyCode::Left if key.modifiers.is_empty() => Some(AppAction::seek_step(false)),
+        KeyCode::Right if key.modifiers.is_empty() => Some(AppAction::seek_step(true)),
         KeyCode::Char('-') if key.modifiers.is_empty() => Some(AppAction::VolumeDown),
         KeyCode::Char('+' | '=') if key.modifiers.is_empty() || shifted => {
             Some(AppAction::VolumeUp)
@@ -159,8 +171,8 @@ mod tests {
     #[test]
     fn playback_control_keys_resolve_to_the_documented_steps() {
         let cases = [
-            (key(KeyCode::Left), AppAction::SeekBackward),
-            (key(KeyCode::Right), AppAction::SeekForward),
+            (key(KeyCode::Left), AppAction::seek_step(false)),
+            (key(KeyCode::Right), AppAction::seek_step(true)),
             (key(KeyCode::Char('-')), AppAction::VolumeDown),
             (key(KeyCode::Char('+')), AppAction::VolumeUp),
             (key(KeyCode::Char('m')), AppAction::ToggleMute),

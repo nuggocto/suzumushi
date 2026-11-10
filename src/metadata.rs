@@ -220,6 +220,16 @@ fn terminate_and_reap(
 /// Runs the internal metadata helper, reading only its inherited standard input descriptor.
 #[must_use]
 pub fn helper_main() -> i32 {
+    // Release builds abort on panic. Answer with an ordinary error reply and
+    // exit before that, so a malformed file is a scan warning and never a
+    // crash report. The hook also runs first in unwinding builds.
+    std::panic::set_hook(Box::new(|_| {
+        let _ = emit_reply(&HelperReply {
+            tags: None,
+            error: Some("metadata parser panicked".into()),
+        });
+        std::process::exit(0);
+    }));
     if let Err(error) = apply_helper_limits() {
         let _ = emit_reply(&HelperReply {
             tags: None,
@@ -239,18 +249,14 @@ pub fn helper_main() -> i32 {
         }
     };
     let file = File::from(fd);
-    let reply = match std::panic::catch_unwind(|| parse_reader(file)) {
-        Ok(Ok(tags)) => HelperReply {
+    let reply = match parse_reader(file) {
+        Ok(tags) => HelperReply {
             tags: Some(tags),
             error: None,
         },
-        Ok(Err(error)) => HelperReply {
+        Err(error) => HelperReply {
             tags: None,
             error: Some(error),
-        },
-        Err(_) => HelperReply {
-            tags: None,
-            error: Some("metadata parser panicked".into()),
         },
     };
     i32::from(emit_reply(&reply).is_err())

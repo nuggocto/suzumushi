@@ -1,6 +1,6 @@
 [package]
 name = "suzumushi"
-version = "1.2.2"
+version = "1.3.0"
 edition = "2024"
 rust-version = "1.95.0"
 description = "A calm, fully local terminal audio player for Linux"
@@ -10,29 +10,27 @@ default-run = "suzumushi"
 publish = false
 
 [dependencies]
-async-io = { version = "=2.6.0", default-features = false }
-clap = { version = "=4.6.6", default-features = false, features = ["help", "std", "usage"] }
-cpal = { version = "=0.18.1", default-features = false, features = ["pipewire", "realtime-dbus"] }
-crossterm = { version = "=0.29.0", default-features = false, features = ["events"] }
-futures-lite = { version = "=2.6.1", default-features = false, features = ["std"] }
-lofty = { version = "=0.24.0", default-features = false }
-ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm_0_29"] }
-rtrb = { version = "=0.3.5", default-features = false, features = ["std"] }
-rustix = { version = "=1.1.5", default-features = false, features = ["event", "fs", "process", "std"] }
-serde = { version = "=1.0.229", default-features = false, features = ["derive", "std"] }
-serde_json = { version = "=1.0.151", default-features = false, features = ["std"] }
-symphonia = { version = "=0.6.1", default-features = false, features = ["flac", "mp3", "ogg", "pcm", "vorbis", "wav"] }
-thiserror = { version = "=2.0.20", default-features = false }
-toml = { version = "=1.1.4", default-features = false, features = ["parse", "serde", "std"] }
-tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
-tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "std"] }
-zbus = { version = "=6.0.0", default-features = false, features = ["default-rt", "service"] }
+async-io = { version = "2.6.0", default-features = false }
+clap = { version = "4.6.6", default-features = false, features = ["help", "std", "usage"] }
+cpal = { version = "0.18.1", default-features = false, features = ["pipewire", "realtime-dbus"] }
+crossterm = { version = "0.29.0", default-features = false, features = ["events"] }
+futures-lite = { version = "2.6.1", default-features = false, features = ["std"] }
+lofty = { version = "0.24.0", default-features = false }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }
+rtrb = { version = "0.3.5", default-features = false, features = ["std"] }
+rustix = { version = "1.1.5", default-features = false, features = ["event", "fs", "process", "std"] }
+serde = { version = "1.0.229", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
+symphonia = { version = "0.6.1", default-features = false, features = ["flac", "mp3", "ogg", "pcm", "vorbis", "wav"] }
+thiserror = { version = "2.0.20", default-features = false }
+toml = { version = "1.1.4", default-features = false, features = ["parse", "serde", "std"] }
+zbus = { version = "6.0.0", default-features = false, features = ["default-rt", "service"] }
 
 [dev-dependencies]
-insta = { version = "=1.48.0", default-features = false }
-rustix = { version = "=1.1.5", default-features = false, features = ["pty", "termios"] }
-tempfile = "=3.27.0"
-zbus = { version = "=6.0.0", default-features = false, features = ["p2p"] }
+insta = { version = "1.48.0", default-features = false }
+rustix = { version = "1.1.5", default-features = false, features = ["pty", "termios"] }
+tempfile = "3.27.0"
+zbus = { version = "6.0.0", default-features = false, features = ["p2p"] }
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -42,7 +40,8 @@ pedantic = { level = "warn", priority = -1 }
 
 [profile.release]
 codegen-units = 1
-lto = "thin"
+lto = "fat"
+panic = "abort"
 strip = "symbols"
 
 [workspace]

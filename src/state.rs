@@ -1,94 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Bounded, descriptor-rooted playback projection and resume checkpoint.
+//! The private resume checkpoint, `state/session.json`.
 
 use std::fs::File;
 use std::io::{Read, Write};
-use std::mem::size_of;
 use std::os::fd::BorrowedFd;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustix::fd::AsFd;
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::process::getuid;
 use serde::{Deserialize, Serialize};
 
-use crate::app::{AppState, PlaybackStatus, QueueItem};
 use crate::config::QueueConfig;
 use crate::errors::{AppError, AppResult};
 
 const STATE_VERSION: u32 = 1;
-const STATE_FILE: &str = "now-playing.json";
-const STATE_MAX_BYTES: usize = 16 * 1_024;
 const SESSION_FILE: &str = "session.json";
 const SESSION_MAX_BYTES: usize = 256 * 1_024;
 const SESSION_MAX_POSITION_MS: u64 = 365 * 24 * 60 * 60 * 1_000;
-// JSON control escapes can occupy six bytes, so two fields at this bound still
-// leave room for the fixed document fields inside STATE_MAX_BYTES.
-const STATE_IDENTITY_MAX_BYTES: usize = 1_024;
+/// Releases through 1.2 also wrote this playback summary. It is removed on open.
+const RETIRED_NOW_PLAYING: &str = "now-playing.json";
 // Recover from interrupted writes without letting unexpected directory contents
 // turn temporary-name selection into unlimited work.
 const STATE_TEMPORARY_CREATE_ATTEMPTS: usize = 16;
-
-/// Stable app-owned playback fields written to private local state.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub(crate) struct NowPlayingProjection {
-    pub(crate) position_ms: u64,
-    #[serde(flatten)]
-    state: NowPlayingState,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-struct NowPlayingState {
-    version: u32,
-    playback_generation: u64,
-    status: &'static str,
-    title: String,
-    creator: String,
-    duration_ms: Option<u64>,
-    volume_percent: u8,
-    muted: bool,
-    shuffle: bool,
-    repeat: &'static str,
-    queue_position: Option<usize>,
-    queue_length: usize,
-}
-
-impl NowPlayingProjection {
-    pub(crate) fn same_playback_state(&self, other: &Self) -> bool {
-        self.state == other.state
-    }
-
-    #[must_use]
-    pub(crate) fn from_app(app: &AppState) -> Self {
-        let (title, creator) = app.state_identity(STATE_IDENTITY_MAX_BYTES);
-        Self {
-            position_ms: duration_millis(app.playback_position()),
-            state: NowPlayingState {
-                version: STATE_VERSION,
-                playback_generation: app.playback_generation(),
-                status: playback_status(app.playback_status()),
-                title,
-                creator,
-                duration_ms: app.playback_duration().map(duration_millis),
-                volume_percent: app.volume_percent,
-                muted: app.muted,
-                shuffle: app.shuffle_enabled(),
-                repeat: app.repeat.label(),
-                queue_position: app.queue_position(),
-                queue_length: app.queue().len(),
-            },
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct StateDocument<'a> {
-    #[serde(flatten)]
-    projection: &'a NowPlayingProjection,
-    updated_at_unix_ms: u64,
-}
 
 /// Minimal app-owned state needed to resume a listening session.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -143,12 +78,6 @@ impl StateStore {
         drop(open_verified_state_file(
             &directory,
             &directory_path,
-            STATE_FILE,
-            "playback state",
-        )?);
-        drop(open_verified_state_file(
-            &directory,
-            &directory_path,
             SESSION_FILE,
             "resume state",
         )?);
@@ -170,9 +99,6 @@ impl StateStore {
             return Ok(SessionLoad::Missing);
         };
         let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(SESSION_MAX_BYTES.saturating_add(1))
-            .map_err(|error| AppError::Resource(format!("cannot reserve resume state: {error}")))?;
         file.take((SESSION_MAX_BYTES as u64).saturating_add(1))
             .read_to_end(&mut bytes)
             .map_err(|error| {
@@ -201,29 +127,6 @@ impl StateStore {
         Ok(SessionLoad::Loaded(snapshot))
     }
 
-    pub(crate) fn write_now_playing(&mut self, projection: &NowPlayingProjection) -> AppResult<()> {
-        let updated_at_unix_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| {
-                AppError::Resource(format!("system clock precedes Unix epoch: {error}"))
-            })?
-            .as_millis();
-        let updated_at_unix_ms = u64::try_from(updated_at_unix_ms).unwrap_or(u64::MAX);
-        let mut bytes = serde_json::to_vec(&StateDocument {
-            projection,
-            updated_at_unix_ms,
-        })
-        .map_err(|error| AppError::Resource(format!("cannot encode playback state: {error}")))?;
-        bytes.push(b'\n');
-        if bytes.len() > STATE_MAX_BYTES {
-            return Err(AppError::Resource(format!(
-                "playback state exceeds the {STATE_MAX_BYTES}-byte limit"
-            )));
-        }
-
-        self.write_bytes(STATE_FILE, "now-playing", &bytes)
-    }
-
     pub(crate) fn write_session(&mut self, snapshot: &SessionSnapshot) -> AppResult<()> {
         let mut bytes = serde_json::to_vec(snapshot)
             .map_err(|error| AppError::Resource(format!("cannot encode resume state: {error}")))?;
@@ -237,12 +140,21 @@ impl StateStore {
     }
 
     pub(crate) fn clear_session(&self) -> AppResult<()> {
-        match rustix::fs::unlinkat(&self.directory, SESSION_FILE, AtFlags::empty()) {
+        self.remove(SESSION_FILE, "remove resume state")
+    }
+
+    /// Removes state files that older releases wrote. Only the root's writer calls this.
+    pub(crate) fn remove_retired(&self) -> AppResult<()> {
+        self.remove(RETIRED_NOW_PLAYING, "remove retired playback state")
+    }
+
+    fn remove(&self, file_name: &str, operation: &'static str) -> AppResult<()> {
+        match rustix::fs::unlinkat(&self.directory, file_name, AtFlags::empty()) {
             Ok(()) => Ok(()),
             Err(error) if error == rustix::io::Errno::NOENT => Ok(()),
             Err(error) => Err(AppError::io(
-                "remove resume state",
-                self.directory_path.join(SESSION_FILE),
+                operation,
+                self.directory_path.join(file_name),
                 error.into(),
             )),
         }
@@ -281,7 +193,8 @@ impl StateStore {
 
     fn create_temporary(&mut self, stem: &str) -> AppResult<(String, PathBuf, File)> {
         for _ in 0..STATE_TEMPORARY_CREATE_ATTEMPTS {
-            let temporary = self.temporary_name(stem)?;
+            let temporary = format!(".{stem}.{}.{}.tmp", std::process::id(), self.next_temporary);
+            self.next_temporary += 1;
             let temporary_path = self.directory_path.join(&temporary);
             match rustix::fs::openat(
                 &self.directory,
@@ -303,15 +216,6 @@ impl StateStore {
         Err(AppError::Resource(format!(
             "cannot create temporary state after {STATE_TEMPORARY_CREATE_ATTEMPTS} name collisions"
         )))
-    }
-
-    fn temporary_name(&mut self, stem: &str) -> AppResult<String> {
-        let counter = self.next_temporary;
-        self.next_temporary = self
-            .next_temporary
-            .checked_add(1)
-            .ok_or_else(|| AppError::Resource("state temporary counter exhausted".into()))?;
-        Ok(format!(".{stem}.{}.{}.tmp", std::process::id(), counter))
     }
 }
 
@@ -375,10 +279,6 @@ fn open_verified_state_file(
 }
 
 fn invalid_session_reason(snapshot: &SessionSnapshot, queue: &QueueConfig) -> Option<String> {
-    let queue_bytes = snapshot
-        .queue_entry_ids
-        .len()
-        .checked_mul(size_of::<QueueItem>());
     if snapshot.version != STATE_VERSION {
         Some(format!(
             "saved session version {} is unsupported",
@@ -386,10 +286,8 @@ fn invalid_session_reason(snapshot: &SessionSnapshot, queue: &QueueConfig) -> Op
         ))
     } else if snapshot.queue_entry_ids.is_empty() {
         Some("saved session queue is empty".into())
-    } else if snapshot.queue_entry_ids.len() > queue.max_items
-        || queue_bytes.is_none_or(|bytes| bytes > queue.max_bytes)
-    {
-        Some("saved session queue exceeds the configured limit".into())
+    } else if snapshot.queue_entry_ids.len() > queue.max_items {
+        Some("saved session queue exceeds the queue limit".into())
     } else if snapshot.current_index >= snapshot.queue_entry_ids.len() {
         Some("saved session current track is outside the queue".into())
     } else if snapshot.position_ms > SESSION_MAX_POSITION_MS {
@@ -399,55 +297,15 @@ fn invalid_session_reason(snapshot: &SessionSnapshot, queue: &QueueConfig) -> Op
     }
 }
 
-const fn playback_status(status: PlaybackStatus) -> &'static str {
-    match status {
-        PlaybackStatus::Stopped => "stopped",
-        PlaybackStatus::Loading => "loading",
-        PlaybackStatus::Playing => "playing",
-        PlaybackStatus::Paused => "paused",
-        PlaybackStatus::Error => "error",
-    }
-}
-
-fn duration_millis(duration: std::time::Duration) -> u64 {
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::os::unix::fs::{PermissionsExt, symlink};
-    use std::path::PathBuf;
 
     use rustix::fd::AsFd;
 
-    use super::{
-        NowPlayingProjection, STATE_IDENTITY_MAX_BYTES, STATE_MAX_BYTES,
-        STATE_TEMPORARY_CREATE_ATTEMPTS, SessionLoad, SessionSnapshot, StateStore,
-    };
-    use crate::app::AppState;
+    use super::{STATE_TEMPORARY_CREATE_ATTEMPTS, SessionLoad, SessionSnapshot, StateStore};
     use crate::config::Config;
-    use crate::input::AppAction;
-    use crate::model::{
-        FileIdentity, MediaAsset, ScanCounters, ScanIndex, SearchFields, TrackEntry, TrackEntryId,
-        TrackEntrySource, TrackTags,
-    };
-
-    fn app() -> AppState {
-        AppState::new(
-            &Config::default(),
-            ScanIndex {
-                generation: 1,
-                complete: true,
-                assets: Vec::new(),
-                entries: Vec::new(),
-                playlists: Vec::new(),
-                warnings: Vec::new(),
-                counters: ScanCounters::default(),
-            },
-        )
-        .expect("app state")
-    }
 
     fn root() -> (tempfile::TempDir, std::fs::File) {
         let root = tempfile::tempdir().expect("temporary root");
@@ -458,99 +316,31 @@ mod tests {
         (root, root_file)
     }
 
-    fn app_with_control_metadata() -> AppState {
-        let controls = "\u{1b}".repeat(4_096);
-        let index = ScanIndex {
-            generation: 1,
-            complete: true,
-            assets: vec![MediaAsset {
-                tags: TrackTags {
-                    artist: Some(controls.clone()),
-                    album_artist: None,
-                    album: None,
-                    title: Some(controls),
-                },
-                file_identity: FileIdentity {
-                    device: 1,
-                    inode: 1,
-                    size: 1,
-                    modified_seconds: 1,
-                    modified_nanoseconds: 0,
-                },
-            }],
-            entries: vec![TrackEntry {
-                id: TrackEntryId(1),
-                asset_index: 0,
-                display_path: PathBuf::from("library/fixture.wav"),
-                source: TrackEntrySource::LibraryFile,
-                search: SearchFields {
-                    filename: "fixture".into(),
-                    relative_path: "library/fixture.wav".into(),
-                },
-            }],
-            playlists: Vec::new(),
-            warnings: Vec::new(),
-            counters: ScanCounters {
-                encountered_entries: 1,
-                ..ScanCounters::default()
-            },
-        };
-        let mut app = AppState::new(&Config::default(), index).expect("app state");
-        app.apply(AppAction::Activate)
-            .expect("fixture track starts");
-        app
-    }
-
-    #[test]
-    fn projection_is_atomic_private_and_valid_json() {
-        let (root, root_file) = root();
-        let mut writer = StateStore::open(root_file.as_fd(), root.path()).expect("state writer");
-
-        let mut projection = NowPlayingProjection::from_app(&app());
-        projection.state.title = "quiet\u{1b}[31m".into();
-        writer
-            .write_now_playing(&projection)
-            .expect("write projection");
-
-        let path = root.path().join("state/now-playing.json");
-        let bytes = fs::read(&path).expect("read projection");
-        assert!(!bytes.contains(&0x1b), "JSON must escape raw controls");
-        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON");
-        assert_eq!(value["version"], 1);
-        assert_eq!(value["status"], "stopped");
-        assert_eq!(value["title"], "quiet\u{1b}[31m");
-        assert_eq!(
-            fs::metadata(path)
-                .expect("state metadata")
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-    }
-
     #[test]
     fn abandoned_temporary_state_does_not_block_atomic_replacement() {
         let (root, root_file) = root();
         let abandoned = root
             .path()
-            .join(format!("state/.now-playing.{}.0.tmp", std::process::id()));
+            .join(format!("state/.session.{}.0.tmp", std::process::id()));
         fs::write(&abandoned, b"abandoned").expect("abandoned temporary state");
         fs::set_permissions(&abandoned, fs::Permissions::from_mode(0o600))
             .expect("private temporary state permissions");
         let mut store = StateStore::open(root_file.as_fd(), root.path()).expect("state store");
 
         store
-            .write_now_playing(&NowPlayingProjection::from_app(&app()))
+            .write_session(&SessionSnapshot::new(vec![1], 0, 0))
             .expect("skip abandoned temporary state");
 
         assert_eq!(
             fs::read(&abandoned).expect("abandoned state remains untouched"),
             b"abandoned"
         );
-        let written =
-            fs::read(root.path().join("state/now-playing.json")).expect("replacement state");
-        serde_json::from_slice::<serde_json::Value>(&written).expect("valid replacement state");
+        assert!(matches!(
+            store
+                .read_session(&Config::default().queue)
+                .expect("read replacement"),
+            SessionLoad::Loaded(_)
+        ));
     }
 
     #[test]
@@ -558,7 +348,7 @@ mod tests {
         let (root, root_file) = root();
         for counter in 0..STATE_TEMPORARY_CREATE_ATTEMPTS {
             let collision = root.path().join(format!(
-                "state/.now-playing.{}.{counter}.tmp",
+                "state/.session.{}.{counter}.tmp",
                 std::process::id()
             ));
             fs::write(collision, b"occupied").expect("occupied temporary name");
@@ -566,64 +356,24 @@ mod tests {
         let mut store = StateStore::open(root_file.as_fd(), root.path()).expect("state store");
 
         let error = store
-            .write_now_playing(&NowPlayingProjection::from_app(&app()))
+            .write_session(&SessionSnapshot::new(vec![1], 0, 0))
             .expect_err("bounded collisions must fail");
 
         assert!(error.to_string().contains("after 16 name collisions"));
-        assert!(!root.path().join("state/now-playing.json").exists());
+        assert!(!root.path().join("state/session.json").exists());
     }
 
     #[test]
-    fn unsafe_existing_projection_is_refused() {
+    fn retired_playback_state_is_removed_only_on_request() {
         let (root, root_file) = root();
-        symlink("/dev/null", root.path().join("state/now-playing.json")).expect("state symlink");
+        let retired = root.path().join("state/now-playing.json");
+        fs::write(&retired, b"{}").expect("retired state fixture");
 
-        let error = StateStore::open(root_file.as_fd(), root.path())
-            .err()
-            .expect("symlink must be refused");
+        let store = StateStore::open(root_file.as_fd(), root.path()).expect("state store");
+        assert!(retired.exists(), "opening the store changes nothing");
+        store.remove_retired().expect("remove retired state");
 
-        assert!(error.to_string().contains("existing state"));
-    }
-
-    #[test]
-    fn oversized_projection_does_not_replace_the_last_good_state() {
-        let (root, root_file) = root();
-        let mut writer = StateStore::open(root_file.as_fd(), root.path()).expect("state writer");
-        let valid = NowPlayingProjection::from_app(&app());
-        writer
-            .write_now_playing(&valid)
-            .expect("initial projection");
-        let path = root.path().join("state/now-playing.json");
-        let before = fs::read(&path).expect("initial bytes");
-        let mut oversized = valid;
-        oversized.state.title = "x".repeat(20_000);
-
-        assert!(writer.write_now_playing(&oversized).is_err());
-        assert_eq!(fs::read(path).expect("retained projection"), before);
-    }
-
-    #[test]
-    fn maximally_escaped_identity_fields_fit_the_state_document() {
-        let (root, root_file) = root();
-        let mut writer = StateStore::open(root_file.as_fd(), root.path()).expect("state writer");
-        let projection = NowPlayingProjection::from_app(&app_with_control_metadata());
-
-        writer
-            .write_now_playing(&projection)
-            .expect("worst-case app projection remains encodable");
-
-        let bytes =
-            fs::read(root.path().join("state/now-playing.json")).expect("read bounded projection");
-        assert!(bytes.len() <= STATE_MAX_BYTES, "{} bytes", bytes.len());
-        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON");
-        assert_eq!(
-            value["title"].as_str().map(str::len),
-            Some(STATE_IDENTITY_MAX_BYTES)
-        );
-        assert_eq!(
-            value["creator"].as_str().map(str::len),
-            Some(STATE_IDENTITY_MAX_BYTES)
-        );
+        assert!(!retired.exists());
     }
 
     #[test]

@@ -33,6 +33,9 @@ pub fn fuzz_decode(input: &[u8]) {
 
 const COMMAND_CAPACITY: usize = 32;
 const WORKER_POLL: Duration = Duration::from_millis(5);
+/// A paused track only needs the worker for a seek or a deferred backend pause,
+/// so it checks in at the terminal's frame rate instead of `WORKER_POLL`.
+const PAUSED_POLL: Duration = Duration::from_millis(100);
 const POSITION_INTERVAL: Duration = Duration::from_millis(250);
 /// A seek arriving this soon after a restart waits for the seeks to stop. A held
 /// key then restarts the decoder and output once, at its final position, instead
@@ -1017,10 +1020,7 @@ impl<B: Backend> WorkerCore<B> {
         }
         let output_error = old.output.stop().err();
         let decoder_error = old.decoder.shutdown().err();
-        let timeline_revision = old
-            .timeline_revision
-            .checked_add(1)
-            .ok_or_else(|| "audio timeline revision exhausted".to_owned())?;
+        let timeline_revision = old.timeline_revision + 1;
         let paused = old.paused;
         let file = old.file;
         if let Some(message) = combine_cleanup_errors(output_error, decoder_error) {
@@ -1220,12 +1220,14 @@ fn worker_main<B: Backend>(
         if core.drive(events, positions) {
             continue;
         }
-        let command = if core.active.is_none() {
-            commands
+        let command = match &core.active {
+            None => commands
                 .recv()
-                .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
-        } else {
-            commands.recv_timeout(WORKER_POLL)
+                .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected),
+            Some(active) if active.paused && core.pending_seek.is_none() => {
+                commands.recv_timeout(PAUSED_POLL)
+            }
+            Some(_) => commands.recv_timeout(WORKER_POLL),
         };
         match command {
             Ok(command) => {

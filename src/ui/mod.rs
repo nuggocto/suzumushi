@@ -10,7 +10,6 @@ mod stage;
 pub mod status;
 
 pub use palette::ColorDepth;
-pub(crate) use stage::STAGE_FIELD_BYTES;
 pub use stage::Stage;
 
 use std::os::unix::ffi::OsStrExt;
@@ -297,29 +296,30 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     } else {
         Style::default().add_modifier(Modifier::BOLD)
     };
+    let entry = |key: &str, action: &str| Line::raw(format!("  {key:<22}{action}"));
     let lines = vec![
         Line::styled("Navigation", heading),
-        Line::raw("  Tab or Shift+Tab     focus Library, Player, or Queue"),
-        Line::raw("  Up or Down, j or k   move the selection"),
-        Line::raw("  Home or End, g or G  jump to the first or last item"),
+        entry("Tab or Shift+Tab", "focus Library, Player, or Queue"),
+        entry("Up or Down, j or k", "move the selection"),
+        entry("Home or End, g or G", "jump to the first or last item"),
         Line::default(),
         Line::styled("Library and search", heading),
-        Line::raw("  /                     search artist, title, filename, and path"),
-        Line::raw("  Enter                 toggle folders; add tracks or playlists"),
-        Line::raw("  Esc                   close search"),
+        entry("/", "search artist, title, filename, and path"),
+        entry("Enter", "toggle folders; add tracks or playlists"),
+        entry("Esc", "close search"),
         Line::default(),
         Line::styled("Queue", heading),
-        Line::raw("  J or K                move the selected item down or up"),
-        Line::raw("  d or Delete           remove item    c clear Queue"),
+        entry("J or K", "move the selected item down or up"),
+        entry("d or Delete", "remove item    c clear Queue"),
         Line::default(),
         Line::styled("Playback", heading),
-        Line::raw("  Space or Enter outside Library  play or pause"),
-        Line::raw("  s                     stop    p previous    n next"),
-        Line::raw("  Left or Right          seek back or forward five seconds"),
-        Line::raw("  - or +                 volume down or up    m mute"),
-        Line::raw("  x                     shuffle    r repeat"),
+        entry("Space", "play or pause; Enter too, outside Library"),
+        entry("s", "stop    p previous    n next"),
+        entry("Left or Right", "seek back or forward five seconds"),
+        entry("- or +", "volume down or up    m mute"),
+        entry("x", "shuffle    r repeat"),
         Line::default(),
-        Line::raw("  ? or Esc               close help    q quit    Ctrl+c quit anywhere"),
+        entry("? or Esc", "close help    q quit    Ctrl+c quit anywhere"),
     ];
     frame.render_widget(
         Paragraph::new(lines)
@@ -491,7 +491,7 @@ mod tests {
     }
 
     fn snapshot(width: u16, height: u16) -> String {
-        let app = AppState::new(&Config::default(), empty_index()).expect("app state");
+        let app = AppState::new(&Config::default(), empty_index());
         rendered(&app, width, height, Duration::ZERO)
     }
 
@@ -503,7 +503,7 @@ mod tests {
 
     #[test]
     fn focused_panel_uses_a_title_marker_and_uniform_border_shape() {
-        let mut app = AppState::new(&Config::default(), empty_index()).expect("app state");
+        let mut app = AppState::new(&Config::default(), empty_index());
 
         let library = rendered(&app, 80, 24, Duration::ZERO);
         assert!(library.contains("┌ > Library "), "{library}");
@@ -537,7 +537,7 @@ mod tests {
 
     #[test]
     fn help_is_complete_at_the_minimum_supported_size() {
-        let mut app = AppState::new(&Config::default(), empty_index()).expect("app state");
+        let mut app = AppState::new(&Config::default(), empty_index());
         app.apply(crate::input::AppAction::ToggleHelp);
 
         insta::assert_snapshot!(
@@ -553,7 +553,7 @@ mod tests {
 
     #[test]
     fn player_animation_follows_playback_state() {
-        let mut app = AppState::new(&Config::default(), empty_index()).expect("app state");
+        let mut app = AppState::new(&Config::default(), empty_index());
         let resting = rendered(&app, 80, 24, Duration::from_millis(200));
         assert!(resting.contains("▐▀• •▀▌"), "{resting}");
 
@@ -588,7 +588,7 @@ mod tests {
                 .filter(|position| buffer[*position].symbol() != " ")
                 .count()
         };
-        let mut app = AppState::new(&Config::default(), empty_index()).expect("app state");
+        let mut app = AppState::new(&Config::default(), empty_index());
         app.audio_spectrum(AudioSpectrum::new([230; crate::audio::SPECTRUM_BANDS]));
 
         app.set_playback_status(crate::app::PlaybackStatus::Stopped);
@@ -599,7 +599,7 @@ mod tests {
 
     #[test]
     fn loading_warning_and_error_states_are_named_in_text() {
-        let mut app = AppState::new(&Config::default(), empty_index()).expect("app state");
+        let mut app = AppState::new(&Config::default(), empty_index());
         app.set_playback_status(crate::app::PlaybackStatus::Loading);
         let loading = rendered(&app, 80, 24, Duration::ZERO);
         assert!(loading.contains("State: Loading"), "{loading}");

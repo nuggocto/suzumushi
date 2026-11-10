@@ -74,11 +74,8 @@ impl PlaybackState {
         index: usize,
         position: Duration,
         paused: bool,
-    ) -> Result<u64, &'static str> {
-        let generation = self
-            .generation
-            .checked_add(1)
-            .ok_or("Playback generation exhausted")?;
+    ) -> u64 {
+        let generation = self.generation + 1;
         self.select(item, index, position, generation);
         self.status = PlaybackStatus::Loading;
         self.request = if paused {
@@ -86,23 +83,16 @@ impl PlaybackState {
         } else {
             PlaybackRequest::Play
         };
-        Ok(generation)
+        generation
     }
 
-    pub(super) fn select_stopped(
-        &mut self,
-        item: QueueItem,
-        index: usize,
-    ) -> Result<(), &'static str> {
+    pub(super) fn select_stopped(&mut self, item: QueueItem, index: usize) {
         let generation = if self.current == Some(item) {
             self.generation
         } else {
-            self.generation
-                .checked_add(1)
-                .ok_or("Playback generation exhausted")?
+            self.generation + 1
         };
         self.select(item, index, Duration::ZERO, generation);
-        Ok(())
     }
 
     pub(super) fn restore(&mut self, item: QueueItem, index: usize, position: Duration) {
@@ -288,7 +278,7 @@ impl AppState {
                             *current == index && self.playback.request != PlaybackRequest::Stop
                         })
                         .map_or(Duration::ZERO, |_| self.playback.resume_position());
-                    self.start_new_shuffle_round_at(index, position)
+                    self.start_new_shuffle_round(index, position)
                 }
             }
         }
@@ -372,12 +362,14 @@ impl AppState {
     /// Moves to a queue index while keeping the requested playback mode.
     fn navigate_to(&mut self, index: usize) -> Option<PlaybackIntent> {
         match self.requested_status() {
-            PlaybackStatus::Paused => self.start_queue_index_paused(index),
+            PlaybackStatus::Paused => self.start_queue_index(index, Duration::ZERO, true),
             PlaybackStatus::Stopped | PlaybackStatus::Error => {
                 self.select_stopped_queue_index(index);
                 None
             }
-            PlaybackStatus::Loading | PlaybackStatus::Playing => self.start_queue_index(index),
+            PlaybackStatus::Loading | PlaybackStatus::Playing => {
+                self.start_queue_index(index, Duration::ZERO, false)
+            }
         }
     }
 
@@ -397,11 +389,11 @@ impl AppState {
         if self.repeat == RepeatMode::One
             && let Some(current) = self.current_queue_index()
         {
-            return self.start_queue_index_with_state(current, Duration::ZERO, paused);
+            return self.start_queue_index(current, Duration::ZERO, paused);
         }
         if let Some(next) = self.next_queue_index(self.repeat == RepeatMode::All) {
             self.queue.selection = next;
-            self.start_queue_index_with_state(next, Duration::ZERO, paused)
+            self.start_queue_index(next, Duration::ZERO, paused)
         } else {
             self.playback.status = PlaybackStatus::Stopped;
             self.playback.format = None;
@@ -414,36 +406,14 @@ impl AppState {
         }
     }
 
-    pub(super) fn start_queue_index(&mut self, index: usize) -> Option<PlaybackIntent> {
-        self.start_queue_index_at(index, Duration::ZERO)
-    }
-
-    pub(super) fn start_queue_index_paused(&mut self, index: usize) -> Option<PlaybackIntent> {
-        self.start_queue_index_with_state(index, Duration::ZERO, true)
-    }
-
-    pub(super) fn start_queue_index_at(
-        &mut self,
-        index: usize,
-        position: Duration,
-    ) -> Option<PlaybackIntent> {
-        self.start_queue_index_with_state(index, position, false)
-    }
-
-    pub(super) fn start_queue_index_with_state(
+    pub(super) fn start_queue_index(
         &mut self,
         index: usize,
         position: Duration,
         paused: bool,
     ) -> Option<PlaybackIntent> {
         let item = self.queue.items().get(index).copied()?;
-        let generation = match self.playback.load(item, index, position, paused) {
-            Ok(generation) => generation,
-            Err(message) => {
-                self.set_error(message);
-                return None;
-            }
-        };
+        let generation = self.playback.load(item, index, position, paused);
         self.queue.select_current(item);
         let title = self.queue_item_title(item, self.status_text_max_bytes);
         self.set_persistent_status(&format!("Loading: {title}"));
@@ -460,25 +430,18 @@ impl AppState {
         let Some(item) = self.queue.items().get(index).copied() else {
             return;
         };
-        if let Err(message) = self.playback.select_stopped(item, index) {
-            self.set_error(message);
-            return;
-        }
+        self.playback.select_stopped(item, index);
         self.queue.select_current(item);
         let title = self.queue_item_title(item, self.status_text_max_bytes);
         self.set_status(&format!("Selected: {title}"));
     }
 
-    pub(super) fn start_new_shuffle_round(&mut self, index: usize) -> Option<PlaybackIntent> {
-        self.start_new_shuffle_round_at(index, Duration::ZERO)
-    }
-
-    pub(super) fn start_new_shuffle_round_at(
+    pub(super) fn start_new_shuffle_round(
         &mut self,
         index: usize,
         position: Duration,
     ) -> Option<PlaybackIntent> {
-        let intent = self.start_queue_index_at(index, position);
+        let intent = self.start_queue_index(index, position, false);
         if intent.is_some() {
             self.refresh_shuffle_order();
         }
@@ -548,10 +511,6 @@ impl AppState {
             volume_percent: self.volume_percent,
             muted: self.muted,
         })
-    }
-
-    pub(super) fn seek(&mut self, forward: bool) -> Option<PlaybackIntent> {
-        self.seek_relative(forward, Duration::from_secs(5))
     }
 
     pub(super) fn seek_relative(

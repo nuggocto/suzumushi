@@ -29,6 +29,7 @@ const ERROR_FRAME: u32 = u32::MAX;
 const DECODER_MESSAGES: usize = 2;
 const MAX_PCM_BLOCK_SAMPLES: usize = 32_768;
 const MAX_ERROR_BYTES: usize = 1_024;
+const PANIC_EXIT_CODE: i32 = 101;
 const MAX_CONSECUTIVE_DECODE_ERRORS: usize = 32;
 const MAX_FLAC_METADATA_BLOCKS: usize = 1_024;
 const MAX_WAV_HEADER_CHUNKS: usize = 1_024;
@@ -276,6 +277,10 @@ fn read_error(reader: &mut ChildStdout, timeout: Duration) -> Result<String, Str
 /// Runs the internal decoder helper on its inherited standard input descriptor.
 #[must_use]
 pub fn helper_main(position_micros: u64) -> i32 {
+    // Release builds abort on panic. Exit before that instead, so a malformed
+    // file ends this helper quietly and never produces a crash report. The
+    // parent sees the output end without a final frame and reports it.
+    std::panic::set_hook(Box::new(|_| std::process::exit(PANIC_EXIT_CODE)));
     let mut sink = ProtocolSink::new(std::io::stdout().lock());
     if let Err(error) = apply_helper_limits() {
         let _ = sink.error(&error);
@@ -289,18 +294,15 @@ pub fn helper_main(position_micros: u64) -> i32 {
             return 1;
         }
     };
-    let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        decode_source(
-            File::from(fd),
-            &mut sink,
-            None,
-            Duration::from_micros(position_micros),
-        )
-    }));
+    let decoded = decode_source(
+        File::from(fd),
+        &mut sink,
+        None,
+        Duration::from_micros(position_micros),
+    );
     let result = match decoded {
-        Ok(Ok(())) => sink.finish(),
-        Ok(Err(error)) => sink.error(&error),
-        Err(_) => sink.error("audio decoder panicked"),
+        Ok(()) => sink.finish(),
+        Err(error) => sink.error(&error),
     };
     i32::from(result.is_err())
 }
@@ -978,7 +980,7 @@ mod tests {
         let error = decode_source(Cursor::new(bytes.to_vec()), &mut sink, None, Duration::ZERO)
             .expect_err("unsupported WAV channel count");
         assert!(error.contains("channel count"), "{error}");
-        assert!(sink.samples.is_empty());
+        assert_eq!(sink.samples, Vec::<f32>::new());
     }
 
     #[test]
@@ -1175,7 +1177,7 @@ mod tests {
 
         assert!(error.contains("supported container"), "{error}");
         assert_eq!(sink.format, None);
-        assert!(sink.samples.is_empty());
+        assert_eq!(sink.samples, Vec::<f32>::new());
     }
 
     #[test]
@@ -1195,7 +1197,7 @@ mod tests {
 
         assert!(error.contains("FLAC metadata header"), "{error}");
         assert_eq!(sink.format, None);
-        assert!(sink.samples.is_empty());
+        assert_eq!(sink.samples, Vec::<f32>::new());
     }
 
     #[test]

@@ -5,29 +5,29 @@
 use std::io::{self, Stdout, Write};
 use std::os::fd::BorrowedFd;
 use std::path::Path;
+use std::sync::Once;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crossterm::cursor::{Hide, Show};
 use crossterm::execute;
 use crossterm::terminal::{
-    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
-    enable_raw_mode, size as terminal_size,
+    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::buffer::Cell;
-use ratatui::layout::Rect;
-use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use crate::app::{AppState, PlaybackIntent};
 use crate::audio::{AudioCommand, AudioDiagnostics, AudioRuntime};
-use crate::config::{Config, TERMINAL_BUFFER_BYTES};
+use crate::config::Config;
 use crate::errors::{AppError, AppResult};
 use crate::event::{AppEvent, EventSource};
 use crate::model::ScanIndex;
 use crate::mpris::{MprisProjection, MprisRuntime, REQUEST_CAPACITY};
 
-const STATE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
-const STATE_POSITION_INTERVAL: Duration = Duration::from_secs(1);
+/// While the playback position moves, the resume checkpoint is refreshed at
+/// most this often, so a crash loses at most this much of the position.
+const SESSION_POSITION_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Runs one terminal session and restores terminal modes on every unwind path.
 ///
@@ -40,9 +40,9 @@ pub fn run(
     config: &Config,
     index: ScanIndex,
 ) -> AppResult<()> {
-    let initial_area = current_terminal_area()?;
-    let mut app = AppState::new(config, index)?;
+    let mut app = AppState::new(config, index);
     let mut state_store = crate::state::StateStore::open(root, root_path)?;
+    state_store.remove_retired()?;
     match state_store.read_session(&config.queue)? {
         crate::state::SessionLoad::Missing => {}
         crate::state::SessionLoad::Loaded(snapshot) => app.restore_session(&snapshot)?,
@@ -51,34 +51,31 @@ pub fn run(
     let mut state_sync = StateSynchronizer::default();
     state_sync.sync(&app, &mut state_store, Duration::ZERO)?;
     let audio = AudioRuntime::start()?;
-    let mpris = match MprisRuntime::start(MprisProjection::from_app(&app)) {
+    let mut mpris = match MprisRuntime::start(MprisProjection::from_app(&app)) {
         Ok(runtime) => Some(runtime),
         Err(error) => {
-            tracing::warn!(%error, "desktop controls unavailable");
+            crate::logging::warn(format_args!("desktop controls unavailable: {error}"));
             app.desktop_controls_unavailable(&error.to_string());
             None
         }
     };
     let session_result = run_terminal_session(
         root,
-        initial_area,
         &mut app,
         &audio,
-        mpris.as_ref(),
+        mpris.as_mut(),
         &mut state_store,
         &mut state_sync,
     );
     let audio_result = audio.shutdown();
     app.session_stopped();
-    let mpris_result = mpris.map_or(Ok(()), |runtime| {
-        runtime
-            .publish(MprisProjection::from_app(&app))
-            .and_then(|()| runtime.shutdown())
+    let mpris_result = mpris.map_or(Ok(()), |mut runtime| {
+        runtime.publish(MprisProjection::from_app(&app));
+        runtime.shutdown()
     });
     finish_session(
         &mut app,
         &mut state_store,
-        &mut state_sync,
         session_result,
         combine_results(audio_result, mpris_result),
     )
@@ -87,30 +84,30 @@ pub fn run(
 fn finish_session(
     app: &mut AppState,
     state_store: &mut crate::state::StateStore,
-    state_sync: &mut StateSynchronizer,
     session_result: AppResult<()>,
     audio_result: AppResult<()>,
 ) -> AppResult<()> {
     app.session_stopped();
-    let state_result = state_sync.force(app, state_store);
+    let state_result = write_session(app, state_store);
     combine_results(combine_results(session_result, audio_result), state_result)
 }
 
 fn run_terminal_session(
     root: BorrowedFd<'_>,
-    initial_area: Rect,
     app: &mut AppState,
     audio: &AudioRuntime,
-    mpris: Option<&MprisRuntime>,
+    mut mpris: Option<&mut MprisRuntime>,
     state_store: &mut crate::state::StateStore,
     state_sync: &mut StateSynchronizer,
 ) -> AppResult<()> {
     let stdout = io::stdout();
+    install_panic_restore();
     enable_raw_mode().map_err(|error| AppError::io("enable raw mode", "terminal", error))?;
     let mut guard = TerminalGuard::new(CrosstermControl { stdout });
     guard.enter()?;
 
-    let mut terminal = create_terminal(initial_area)?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))
+        .map_err(|error| AppError::io("create terminal", "terminal", error))?;
 
     let events = EventSource::new();
     let mut stage = crate::ui::Stage::new(crate::ui::ColorDepth::from_environment());
@@ -119,26 +116,23 @@ fn run_terminal_session(
 
     while !app.should_quit {
         drain_audio_events(app, root, audio)?;
-        audio_diagnostics.report(audio.diagnostics(), event_time);
-        drain_mpris_actions(app, root, audio, mpris)?;
-        publish_mpris(app, mpris)?;
+        for line in audio_diagnostics.report(audio.diagnostics(), event_time) {
+            crate::logging::warn(format_args!("{line}"));
+        }
+        drain_mpris_actions(app, root, audio, mpris.as_deref())?;
+        publish_mpris(app, mpris.as_deref_mut());
         state_sync.sync(app, state_store, event_time)?;
+        // A fullscreen viewport follows the terminal size: `draw` resizes and
+        // clears its buffers whenever the size changed since the last frame.
         terminal
             .draw(|frame| crate::ui::render(frame, app, &mut stage, event_time))
             .map_err(|error| AppError::io("draw terminal", "terminal", error))?;
         let event = events.next(stage.frame_interval())?;
         event_time = event_time_for(event);
-        if let AppEvent::Resize(width, height, _) = event {
-            let area = validate_terminal_area(width, height, TERMINAL_BUFFER_BYTES)?;
-            drop(terminal);
-            execute!(guard.output_mut(), Clear(ClearType::All))
-                .map_err(|error| AppError::io("clear resized terminal", "terminal", error))?;
-            terminal = create_terminal(area)?;
-        }
         if let Some(intent) = apply_event(app, event) {
             dispatch_playback(app, root, audio, intent)?;
         }
-        publish_mpris(app, mpris)?;
+        publish_mpris(app, mpris.as_deref_mut());
         state_sync.sync(app, state_store, event_time)?;
     }
 
@@ -169,19 +163,21 @@ fn drain_mpris_actions(
     Ok(())
 }
 
-fn publish_mpris(app: &AppState, mpris: Option<&MprisRuntime>) -> AppResult<()> {
-    mpris.map_or(Ok(()), |runtime| {
-        runtime.publish(MprisProjection::from_app(app))
-    })
+fn publish_mpris(app: &AppState, mpris: Option<&mut MprisRuntime>) {
+    if let Some(runtime) = mpris {
+        runtime.publish(MprisProjection::from_app(app));
+    }
 }
 
+/// Writes the resume checkpoint when it changes.
+///
+/// A different queue or current track is written at once. A moving position is
+/// written at most every [`SESSION_POSITION_INTERVAL`]. A stopped or paused
+/// session writes nothing.
 #[derive(Default)]
 struct StateSynchronizer {
-    previous_now_playing: Option<crate::state::NowPlayingProjection>,
-    last_now_playing_write: Option<Duration>,
-    session_initialized: bool,
-    previous_session: Option<crate::app::SessionIdentity>,
-    last_session_write: Option<Duration>,
+    written: Option<(Option<crate::app::SessionIdentity>, Duration)>,
+    last_write: Duration,
 }
 
 impl StateSynchronizer {
@@ -191,60 +187,26 @@ impl StateSynchronizer {
         store: &mut crate::state::StateStore,
         now: Duration,
     ) -> AppResult<()> {
-        let projection = crate::state::NowPlayingProjection::from_app(app);
-        self.sync_now_playing(projection, store, now)?;
-
-        let identity = app.session_identity();
-        let session_changed = !self.session_initialized || self.previous_session != identity;
-        let checkpoint_due = identity.is_some()
-            && self
-                .last_session_write
-                .is_none_or(|last| now.saturating_sub(last) >= STATE_HEARTBEAT_INTERVAL);
-        if session_changed || checkpoint_due {
+        let checkpoint = (app.session_identity(), app.session_position());
+        let due = match self.written {
+            None => true,
+            Some((identity, _)) if identity != checkpoint.0 => true,
+            Some(written) => {
+                written != checkpoint
+                    && now.saturating_sub(self.last_write) >= SESSION_POSITION_INTERVAL
+            }
+        };
+        if due {
             write_session(app, store)?;
-            self.session_initialized = true;
-            self.previous_session = identity;
-            self.last_session_write = identity.map(|_| now);
+            self.written = Some(checkpoint);
+            self.last_write = now;
         }
         Ok(())
-    }
-
-    fn sync_now_playing(
-        &mut self,
-        projection: crate::state::NowPlayingProjection,
-        store: &mut crate::state::StateStore,
-        now: Duration,
-    ) -> AppResult<()> {
-        let elapsed = self
-            .last_now_playing_write
-            .map_or(Duration::MAX, |last| now.saturating_sub(last));
-        let controls_changed = self
-            .previous_now_playing
-            .as_ref()
-            .is_none_or(|previous| !previous.same_playback_state(&projection));
-        let position_due = elapsed >= STATE_POSITION_INTERVAL
-            && self.previous_now_playing.as_ref() != Some(&projection);
-        if controls_changed || position_due || elapsed >= STATE_HEARTBEAT_INTERVAL {
-            store.write_now_playing(&projection)?;
-            self.previous_now_playing = Some(projection);
-            self.last_now_playing_write = Some(now);
-        }
-        Ok(())
-    }
-
-    fn force(&mut self, app: &AppState, store: &mut crate::state::StateStore) -> AppResult<()> {
-        let projection = crate::state::NowPlayingProjection::from_app(app);
-        let now_playing_result = store.write_now_playing(&projection);
-        if now_playing_result.is_ok() {
-            self.previous_now_playing = Some(projection);
-        }
-        let session_result = write_session(app, store);
-        combine_results(now_playing_result, session_result)
     }
 }
 
 fn write_session(app: &AppState, store: &mut crate::state::StateStore) -> AppResult<()> {
-    match app.session_snapshot()? {
+    match app.session_snapshot() {
         Some(snapshot) => store.write_session(&snapshot),
         None => store.clear_session(),
     }
@@ -265,49 +227,6 @@ const fn event_time_for(event: AppEvent) -> Duration {
     match event {
         AppEvent::Key(_, now) | AppEvent::Resize(_, _, now) | AppEvent::Tick(now) => now,
     }
-}
-
-fn current_terminal_area() -> AppResult<Rect> {
-    let (width, height) = terminal_size()
-        .map_err(|error| AppError::io("read terminal dimensions", "terminal", error))?;
-    validate_terminal_area(width, height, TERMINAL_BUFFER_BYTES)
-}
-
-fn create_terminal(area: Rect) -> AppResult<Terminal<CrosstermBackend<Stdout>>> {
-    Terminal::with_options(
-        CrosstermBackend::new(io::stdout()),
-        TerminalOptions {
-            viewport: Viewport::Fixed(area),
-        },
-    )
-    .map_err(|error| AppError::io("create terminal", "terminal", error))
-}
-
-fn validate_terminal_area(width: u16, height: u16, budget: usize) -> AppResult<Rect> {
-    let bytes = usize::from(width)
-        .checked_mul(usize::from(height))
-        .and_then(|cells| cells.checked_mul(std::mem::size_of::<Cell>()))
-        .and_then(|one_buffer| one_buffer.checked_mul(2))
-        .ok_or_else(|| {
-            AppError::io(
-                "validate terminal dimensions",
-                "terminal",
-                io::Error::new(io::ErrorKind::InvalidInput, "terminal buffer size overflow"),
-            )
-        })?;
-    if bytes > budget {
-        return Err(AppError::io(
-            "validate terminal dimensions",
-            "terminal",
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "{width}x{height} requires {bytes} bytes for terminal buffers, above the {budget}-byte UI reservation"
-                ),
-            ),
-        ));
-    }
-    Ok(Rect::new(0, 0, width, height))
 }
 
 fn apply_event(app: &mut AppState, event: AppEvent) -> Option<PlaybackIntent> {
@@ -338,8 +257,7 @@ fn drain_audio_events(
 }
 
 /// Rate limit for audio diagnostics. The event loop turns every `MAX_POLL`, so an
-/// ongoing dropout would otherwise warn ten times a second and rotate the bounded
-/// log files clean of every other record.
+/// ongoing dropout would otherwise warn ten times a second and fill the log.
 const DIAGNOSTICS_REPORT_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Default)]
@@ -350,55 +268,49 @@ struct AudioDiagnosticsReporter {
 }
 
 impl AudioDiagnosticsReporter {
-    /// Logs the counters that grew since the last report, at most once per
-    /// [`DIAGNOSTICS_REPORT_INTERVAL`]. The interval only advances when something
-    /// was actually logged, so a quiet counter cannot delay a real dropout report.
-    fn report(&mut self, current: AudioDiagnostics, now: Duration) {
+    /// Returns a log line for each counter that grew since the last report, at
+    /// most once per [`DIAGNOSTICS_REPORT_INTERVAL`]. The interval only advances
+    /// when a line is returned, so a quiet counter cannot delay a real dropout.
+    fn report(&mut self, current: AudioDiagnostics, now: Duration) -> Vec<String> {
+        let mut lines = Vec::new();
         if current == self.reported {
-            return;
+            return lines;
         }
         let due = self
             .last_report
             .is_none_or(|last| now.saturating_sub(last) >= DIAGNOSTICS_REPORT_INTERVAL);
         if !due {
-            return;
+            return lines;
         }
-        let mut emitted = false;
 
         let underruns = current
             .underrun_samples
             .saturating_sub(self.reported.underrun_samples);
         if underruns != 0 {
-            tracing::warn!(
-                samples = underruns,
-                total_samples = current.underrun_samples,
-                "audio output ring underrun"
-            );
-            emitted = true;
+            lines.push(format!(
+                "audio output ring underrun: {underruns} samples ({} total)",
+                current.underrun_samples
+            ));
         }
         let xruns = current.xruns.saturating_sub(self.reported.xruns);
         if xruns != 0 {
-            tracing::warn!(
-                count = xruns,
-                total = current.xruns,
-                "audio backend reported an xrun"
-            );
-            emitted = true;
+            lines.push(format!(
+                "audio backend reported {xruns} xruns ({} total)",
+                current.xruns
+            ));
         }
         // The backend reroutes the stream itself, so this is expected, not a fault.
         let device_changes = current
             .device_changes
             .saturating_sub(self.reported.device_changes);
         if device_changes != 0 {
-            tracing::info!(
-                count = device_changes,
-                total = current.device_changes,
-                "audio output was rerouted to a new default device"
-            );
+            lines.push(format!(
+                "audio output was rerouted to a new default device ({} total)",
+                current.device_changes
+            ));
             // A new route can mean a different backend, where a refusal is no longer
             // the harmless redundant one described below. Let it be said again.
             self.realtime_denial_logged = false;
-            emitted = true;
         }
         // Real-time promotion is a property of the audio path rather than an incident:
         // it either succeeds when a stream starts or it does not. PipeWire promotes its
@@ -408,19 +320,19 @@ impl AudioDiagnosticsReporter {
             .realtime_denied
             .saturating_sub(self.reported.realtime_denied);
         if !self.realtime_denial_logged && denials != 0 {
-            tracing::warn!(
-                total = current.realtime_denied,
-                "audio thread real-time promotion was refused; the backend may already \
-                 schedule its own audio thread"
-            );
+            lines.push(format!(
+                "audio thread real-time promotion was refused ({} total); the backend may \
+                 already schedule its own audio thread",
+                current.realtime_denied
+            ));
             self.realtime_denial_logged = true;
-            emitted = true;
         }
 
         self.reported = current;
-        if emitted {
+        if !lines.is_empty() {
             self.last_report = Some(now);
         }
+        lines
     }
 }
 
@@ -482,6 +394,26 @@ fn playback_command(app: &AppState, root: BorrowedFd<'_>, intent: PlaybackIntent
     }
 }
 
+/// Set while the terminal is in raw mode on the alternate screen.
+static TERMINAL_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Release builds abort on panic, so `TerminalGuard` never drops. This hook
+/// restores the terminal first, then lets the default hook print the message
+/// on the normal screen where it stays readable.
+fn install_panic_restore() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        let report = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if TERMINAL_ACTIVE.swap(false, Ordering::AcqRel) {
+                let _ = execute!(io::stdout(), Show, LeaveAlternateScreen);
+                let _ = disable_raw_mode();
+            }
+            report(info);
+        }));
+    });
+}
+
 trait TerminalControl {
     type Output: Write;
 
@@ -520,13 +452,10 @@ impl<C: TerminalControl> TerminalGuard<C> {
         }
     }
 
-    fn output_mut(&mut self) -> &mut C::Output {
-        self.control.output_mut()
-    }
-
     fn enter(&mut self) -> AppResult<()> {
         // A partial escape write still needs the matching best-effort cleanup.
         self.alternate = true;
+        TERMINAL_ACTIVE.store(true, Ordering::Release);
         execute!(
             self.control.output_mut(),
             EnterAlternateScreen,
@@ -538,6 +467,7 @@ impl<C: TerminalControl> TerminalGuard<C> {
     }
 
     fn restore(&mut self) -> AppResult<()> {
+        TERMINAL_ACTIVE.store(false, Ordering::Release);
         let mut first_error = None;
         if self.alternate {
             if let Err(error) = execute!(self.control.output_mut(), Show, LeaveAlternateScreen) {
@@ -564,6 +494,7 @@ impl<C: TerminalControl> TerminalGuard<C> {
 
 impl<C: TerminalControl> Drop for TerminalGuard<C> {
     fn drop(&mut self) {
+        TERMINAL_ACTIVE.store(false, Ordering::Release);
         if self.alternate {
             let _ = execute!(self.control.output_mut(), Show, LeaveAlternateScreen);
         }
@@ -589,13 +520,14 @@ mod tests {
 
     use super::{
         AudioDiagnostics, AudioDiagnosticsReporter, DIAGNOSTICS_REPORT_INTERVAL,
-        STATE_HEARTBEAT_INTERVAL, StateSynchronizer, TerminalControl, TerminalGuard, apply_event,
-        finish_session, validate_terminal_area,
+        SESSION_POSITION_INTERVAL, StateSynchronizer, TerminalControl, TerminalGuard, apply_event,
+        finish_session,
     };
-    use crate::app::{AppState, PlaybackStatus};
+    use crate::app::AppState;
     use crate::config::Config;
     use crate::errors::AppError;
     use crate::event::AppEvent;
+    use crate::input::AppAction;
     use crate::model::{ScanCounters, ScanIndex};
 
     fn empty_index() -> ScanIndex {
@@ -612,7 +544,7 @@ mod tests {
 
     #[test]
     fn stale_queued_media_becomes_a_load_failure_command() {
-        let app = AppState::new(&Config::default(), empty_index()).expect("app state");
+        let app = AppState::new(&Config::default(), empty_index());
         let root = tempfile::tempfile().expect("unused root descriptor");
         let command = super::playback_command(
             &app,
@@ -644,18 +576,24 @@ mod tests {
             ..AudioDiagnostics::default()
         };
 
-        reporter.report(counters, Duration::ZERO);
-        assert!(reporter.realtime_denial_logged, "the first denial is said");
-        assert_eq!(reporter.last_report, Some(Duration::ZERO));
+        let first = reporter.report(counters, Duration::ZERO);
+        assert_eq!(first.len(), 1);
+        assert!(first[0].contains("real-time promotion was refused (50 total)"));
 
         // PipeWire refuses CPAL's redundant promotion on every callback, so the
         // counter keeps climbing. That must stay silent, and it must not consume the
         // report interval, or a real dropout would be left waiting behind it.
         counters.realtime_denied = 5_000;
-        reporter.report(counters, DIAGNOSTICS_REPORT_INTERVAL * 2);
-
-        assert_eq!(reporter.last_report, Some(Duration::ZERO));
-        assert_eq!(reporter.reported.realtime_denied, 5_000);
+        assert_eq!(
+            reporter.report(counters, DIAGNOSTICS_REPORT_INTERVAL * 2),
+            Vec::<String>::new()
+        );
+        counters.underrun_samples = 64;
+        let dropout = reporter.report(counters, DIAGNOSTICS_REPORT_INTERVAL * 2);
+        assert_eq!(
+            dropout,
+            ["audio output ring underrun: 64 samples (64 total)"]
+        );
     }
 
     #[test]
@@ -665,42 +603,42 @@ mod tests {
             realtime_denied: 10,
             ..AudioDiagnostics::default()
         };
-        reporter.report(counters, Duration::ZERO);
-        assert!(reporter.realtime_denial_logged);
+        assert_eq!(reporter.report(counters, Duration::ZERO).len(), 1);
 
         // The route moved, so the next refusal may come from a different backend
         // where it is a real cause of dropouts rather than a redundant attempt.
         counters.device_changes = 1;
-        reporter.report(counters, DIAGNOSTICS_REPORT_INTERVAL);
-        assert!(!reporter.realtime_denial_logged, "the latch is re-armed");
-
         counters.realtime_denied = 11;
-        reporter.report(counters, DIAGNOSTICS_REPORT_INTERVAL * 2);
-        assert!(reporter.realtime_denial_logged, "a new refusal is said");
+        let lines = reporter.report(counters, DIAGNOSTICS_REPORT_INTERVAL);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("rerouted"));
+        assert!(lines[1].contains("real-time promotion was refused (11 total)"));
     }
 
     #[test]
-    fn a_dropout_is_reported_even_after_a_silent_denial_flood() {
+    fn dropouts_inside_the_interval_wait_for_the_next_report() {
         let mut reporter = AudioDiagnosticsReporter::default();
         let mut counters = AudioDiagnostics {
-            realtime_denied: 1,
+            underrun_samples: 128,
             ..AudioDiagnostics::default()
         };
-        reporter.report(counters, Duration::ZERO);
-        counters.realtime_denied = 9_000;
-        reporter.report(counters, DIAGNOSTICS_REPORT_INTERVAL);
+        assert_eq!(reporter.report(counters, Duration::ZERO).len(), 1);
 
-        counters.underrun_samples = 128;
-        reporter.report(counters, DIAGNOSTICS_REPORT_INTERVAL);
-
-        assert_eq!(reporter.reported.underrun_samples, 128);
-        assert_eq!(reporter.last_report, Some(DIAGNOSTICS_REPORT_INTERVAL));
+        counters.underrun_samples = 256;
+        assert_eq!(
+            reporter.report(counters, DIAGNOSTICS_REPORT_INTERVAL / 2),
+            Vec::<String>::new()
+        );
+        counters.underrun_samples = 384;
+        assert_eq!(
+            reporter.report(counters, DIAGNOSTICS_REPORT_INTERVAL),
+            ["audio output ring underrun: 256 samples (384 total)"]
+        );
     }
 
     #[test]
     fn periodic_ticks_clear_expired_information_notices() {
-        let mut app =
-            AppState::new(&Config::default(), empty_index()).expect("app state reservation");
+        let mut app = AppState::new(&Config::default(), empty_index());
         apply_event(
             &mut app,
             AppEvent::Key(
@@ -737,8 +675,7 @@ mod tests {
 
     #[test]
     fn periodic_ticks_preserve_warnings() {
-        let mut app =
-            AppState::new(&Config::default(), empty_index()).expect("app state reservation");
+        let mut app = AppState::new(&Config::default(), empty_index());
         app.desktop_controls_unavailable("fixture unavailable");
 
         apply_event(&mut app, AppEvent::Tick(Duration::from_secs(30)));
@@ -760,89 +697,91 @@ mod tests {
         (root, root_file, writer)
     }
 
-    #[test]
-    fn unchanged_state_is_refreshed_on_the_bounded_heartbeat() {
-        let (_root, _root_file, mut writer) = state_writer();
-        let app = AppState::new(&Config::default(), empty_index()).expect("app state");
-        let mut sync = StateSynchronizer::default();
+    fn one_track_index() -> ScanIndex {
+        use crate::model::{
+            FileIdentity, MediaAsset, SearchFields, TrackEntry, TrackEntryId, TrackEntrySource,
+            TrackTags,
+        };
+        ScanIndex {
+            assets: vec![MediaAsset {
+                tags: TrackTags::default(),
+                file_identity: FileIdentity {
+                    device: 1,
+                    inode: 1,
+                    size: 1,
+                    modified_seconds: 1,
+                    modified_nanoseconds: 0,
+                },
+            }],
+            entries: vec![TrackEntry {
+                id: TrackEntryId(7),
+                asset_index: 0,
+                display_path: std::path::PathBuf::from("library/night.wav"),
+                source: TrackEntrySource::LibraryFile,
+                search: SearchFields {
+                    filename: "night".into(),
+                    relative_path: "library/night.wav".into(),
+                },
+            }],
+            ..empty_index()
+        }
+    }
 
-        sync.sync(&app, &mut writer, Duration::ZERO)
-            .expect("initial state");
-        sync.sync(
-            &app,
-            &mut writer,
-            STATE_HEARTBEAT_INTERVAL.saturating_sub(Duration::from_millis(1)),
-        )
-        .expect("state before heartbeat");
-        assert_eq!(sync.last_now_playing_write, Some(Duration::ZERO));
-
-        sync.sync(&app, &mut writer, STATE_HEARTBEAT_INTERVAL)
-            .expect("heartbeat state");
-        assert_eq!(sync.last_now_playing_write, Some(STATE_HEARTBEAT_INTERVAL));
+    fn modified(path: &std::path::Path) -> Option<std::time::SystemTime> {
+        fs::metadata(path)
+            .ok()
+            .map(|metadata| metadata.modified().expect("modification time"))
     }
 
     #[test]
-    fn position_writes_are_throttled_but_control_changes_are_immediate() {
+    fn the_session_checkpoint_is_written_only_when_it_changes() {
         let (root, _root_file, mut writer) = state_writer();
-        let mut app = AppState::new(&Config::default(), empty_index()).expect("app state");
+        let session = root.path().join("state/session.json");
+        let mut app = AppState::new(&Config::default(), one_track_index());
         let mut sync = StateSynchronizer::default();
-        let mut projection = crate::state::NowPlayingProjection::from_app(&app);
-        sync.sync_now_playing(projection.clone(), &mut writer, Duration::ZERO)
-            .expect("initial state");
-        let path = root.path().join("state/now-playing.json");
-        let initial = fs::read(&path).expect("initial document");
 
-        projection.position_ms = 250;
-        sync.sync_now_playing(projection.clone(), &mut writer, Duration::from_millis(250))
-            .expect("coalesced position");
-        assert_eq!(fs::read(&path).expect("unchanged document"), initial);
-        projection.position_ms = 1_000;
-        sync.sync_now_playing(projection, &mut writer, Duration::from_secs(1))
-            .expect("position checkpoint");
-        let state: serde_json::Value =
-            serde_json::from_slice(&fs::read(&path).expect("checkpoint")).expect("valid JSON");
-        assert_eq!(state["position_ms"], 1_000);
+        sync.sync(&app, &mut writer, Duration::ZERO)
+            .expect("first sync");
+        assert!(!session.exists(), "an empty queue has no checkpoint");
 
-        app.muted = true;
-        sync.sync(&app, &mut writer, Duration::from_millis(1_001))
-            .expect("immediate mute");
-        let state: serde_json::Value =
-            serde_json::from_slice(&fs::read(path).expect("control update")).expect("valid JSON");
-        assert_eq!(state["muted"], true);
+        app.apply(AppAction::Activate)
+            .expect("queue and start the track");
+        sync.sync(&app, &mut writer, Duration::from_millis(100))
+            .expect("queue change");
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(&session).expect("checkpoint")).expect("JSON");
+        assert_eq!(saved["queue_entry_ids"], serde_json::json!([7]));
+
+        // Nothing changed, so a long idle stretch must not touch the file.
+        fs::remove_file(&session).expect("remove checkpoint to observe writes");
+        sync.sync(&app, &mut writer, SESSION_POSITION_INTERVAL * 10)
+            .expect("idle sync");
+        assert!(
+            modified(&session).is_none(),
+            "an unchanged checkpoint is not rewritten"
+        );
     }
 
     #[test]
-    fn event_loop_errors_still_publish_stopped_state() {
+    fn event_loop_errors_still_write_the_final_checkpoint() {
         let (root, _root_file, mut writer) = state_writer();
-        let mut app = AppState::new(&Config::default(), empty_index()).expect("app state");
-        app.set_playback_status(PlaybackStatus::Playing);
-        let mut sync = StateSynchronizer::default();
-        sync.sync(&app, &mut writer, Duration::ZERO)
-            .expect("active state");
-
+        let mut app = AppState::new(&Config::default(), one_track_index());
+        app.apply(AppAction::Activate)
+            .expect("queue and start the track");
         let error = finish_session(
             &mut app,
             &mut writer,
-            &mut sync,
             Err(AppError::Resource("event loop fixture".into())),
             Ok(()),
         )
         .expect_err("original session error remains visible");
 
         assert!(error.to_string().contains("event loop fixture"));
-        let state: serde_json::Value = serde_json::from_slice(
-            &fs::read(root.path().join("state/now-playing.json")).expect("final state"),
+        let saved: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.path().join("state/session.json")).expect("final checkpoint"),
         )
-        .expect("valid final state");
-        assert_eq!(state["status"], "stopped");
-    }
-
-    #[test]
-    fn terminal_buffers_accept_the_exact_budget_and_refuse_one_byte_less() {
-        let two_cells = std::mem::size_of::<ratatui::buffer::Cell>() * 2;
-        assert!(validate_terminal_area(1, 1, two_cells).is_ok());
-        assert!(validate_terminal_area(1, 1, two_cells - 1).is_err());
-        assert!(validate_terminal_area(u16::MAX, u16::MAX, two_cells).is_err());
+        .expect("valid final checkpoint");
+        assert_eq!(saved["current_index"], 0);
     }
 
     #[test]
