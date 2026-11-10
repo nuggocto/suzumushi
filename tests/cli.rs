@@ -471,12 +471,19 @@ fn a_very_large_terminal_keeps_the_session_running() {
 
     // 1.2.2 exited here: 500x250 needed more than its fixed 8 MiB of buffers.
     resize_terminal(&master, &child, 500, 250);
+    // Wait for a frame that reaches row 250. A key pressed before it lands in
+    // the redraw after the resize, which skips blank cells and splits the
+    // focus marker from its title.
+    transcript.extend(read_pty_until(&mut master, &mut child, b"\x1b[250;"));
     master.write_all(b"\t").expect("focus the Player");
     transcript.extend(read_pty_until(&mut master, &mut child, FOCUSED_PLAYER));
-    resize_terminal(&master, &child, 80, 24);
-    master.write_all(b"\t").expect("focus the Queue");
-    transcript.extend(read_pty_until(&mut master, &mut child, FOCUSED_QUEUE));
 
+    resize_terminal(&master, &child, 80, 24);
+    // Wait for the clear that starts the 80x24 redraw, then one more frame.
+    // crossterm 0.29 can hold back a key that arrives in the same wakeup as
+    // the resize signal until the next keypress.
+    transcript.extend(read_pty_until(&mut master, &mut child, b"\x1b[2J"));
+    transcript.extend(read_pty_until(&mut master, &mut child, b"\x1b[?25l"));
     master.write_all(b"q").expect("quit");
     let (tail, status) = read_pty_to_status(&mut master, &mut child);
     transcript.extend(tail);
