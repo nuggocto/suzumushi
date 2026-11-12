@@ -17,9 +17,9 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use crate::app::{AppState, PlaybackIntent};
+use crate::app::{AppState, ColorMode, PlaybackIntent};
 use crate::audio::{AudioCommand, AudioDiagnostics, AudioRuntime};
-use crate::config::Config;
+use crate::config::{Background, Config};
 use crate::errors::{AppError, AppResult};
 use crate::event::{AppEvent, EventSource};
 use crate::model::ScanIndex;
@@ -61,6 +61,7 @@ pub fn run(
     };
     let session_result = run_terminal_session(
         root,
+        config.background,
         &mut app,
         &audio,
         mpris.as_mut(),
@@ -94,6 +95,7 @@ fn finish_session(
 
 fn run_terminal_session(
     root: BorrowedFd<'_>,
+    background: Background,
     app: &mut AppState,
     audio: &AudioRuntime,
     mut mpris: Option<&mut MprisRuntime>,
@@ -106,11 +108,18 @@ fn run_terminal_session(
     let mut guard = TerminalGuard::new(CrosstermControl { stdout });
     guard.enter()?;
 
+    // Asked in raw mode and before the first key is read, so the terminal's
+    // reply never reaches the key handler.
+    let palette = player_palette(app.color_mode, background);
+    // A terminal that misreads the question may print part of it. Not
+    // `Terminal::clear`, which waits for a cursor position report.
+    execute!(io::stdout(), Clear(ClearType::All))
+        .map_err(|error| AppError::io("clear terminal", "terminal", error))?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))
         .map_err(|error| AppError::io("create terminal", "terminal", error))?;
 
     let events = EventSource::new();
-    let mut stage = crate::ui::Stage::new(crate::ui::ColorDepth::from_environment());
+    let mut stage = crate::ui::Stage::new(palette);
     let mut event_time = Duration::ZERO;
     let mut audio_diagnostics = AudioDiagnosticsReporter::default();
 
@@ -141,6 +150,26 @@ fn run_terminal_session(
         .map_err(|error| AppError::io("show terminal cursor", "terminal", error))?;
     drop(terminal);
     guard.restore()
+}
+
+/// The Player's colors for this terminal. Monochrome output asks nothing.
+fn player_palette(color_mode: ColorMode, background: Background) -> crate::ui::Palette {
+    let depth = crate::ui::ColorDepth::from_environment();
+    if color_mode == ColorMode::Mono {
+        return crate::ui::Palette::new(depth, None);
+    }
+    let color = crate::background::resolve(background);
+    let palette = crate::ui::Palette::new(depth, color);
+    let shade = if palette.is_day() { "light" } else { "dark" };
+    match color {
+        Some([red, green, blue]) => crate::logging::info(format_args!(
+            "player colors for a {shade} background (#{red:02x}{green:02x}{blue:02x})"
+        )),
+        None => crate::logging::info(format_args!(
+            "player colors for a {shade} background (not reported)"
+        )),
+    }
+    palette
 }
 
 fn drain_mpris_actions(

@@ -25,6 +25,12 @@ use tempfile::TempDir;
 const FOCUSED_PLAYER: &[u8] = b"> Player";
 const FOCUSED_QUEUE: &[u8] = b"> Queue";
 const FIRST_QUEUE_ITEM: &[u8] = b"1. Night";
+/// The unplayed dew on an idle progress rail, as drawn for a dark and for a
+/// light background in 24-bit color. ratatui sets the foreground together
+/// with the default background.
+const NIGHT_DEW: &[u8] = b"38;2;69;72;75;49m";
+const DAY_DEW: &[u8] = b"38;2;181;183;185;49m";
+const BACKGROUND_QUERY: &[u8] = b"\x1b]11;?";
 
 // Assertions must not leave a terminal process or its leases alive.
 struct Child {
@@ -489,6 +495,102 @@ fn a_very_large_terminal_keeps_the_session_running() {
     transcript.extend(tail);
     assert!(status.success(), "{status}");
     assert!(byte_contains(&transcript, b"\x1b[?1049l"));
+}
+
+#[test]
+fn the_player_takes_light_colors_from_the_terminal_reply() {
+    let fixture = Fixture::new();
+    let mut command = fixture.command();
+    command
+        .env("COLORTERM", "truecolor")
+        .env_remove("COLORFGBG");
+    let (mut master, mut child) = spawn_in_pty(&mut command, 80, 24);
+    read_pty_until(&mut master, &mut child, BACKGROUND_QUERY);
+
+    // Read as keys, this reply would open search (/), type into it, and
+    // toggle repeat (r).
+    master
+        .write_all(b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\\x1b[?62;22c")
+        .expect("answer as a light terminal");
+    let mut transcript = read_pty_until(&mut master, &mut child, DAY_DEW);
+    master.write_all(b"\t").expect("focus the Player");
+    transcript.extend(read_pty_until(&mut master, &mut child, FOCUSED_PLAYER));
+    master.write_all(b"q").expect("quit");
+    transcript.extend(read_pty_to_exit(&mut master, &mut child));
+
+    assert!(!byte_contains(&transcript, NIGHT_DEW));
+    assert!(
+        !byte_contains(&transcript, b"Type to search"),
+        "the reply opened search"
+    );
+    assert!(
+        !byte_contains(&transcript, b"Repeat queue"),
+        "the reply toggled repeat"
+    );
+    let log = fs::read_to_string(fixture.root.join("logs/suzumushi.log")).expect("read log");
+    assert!(
+        log.contains("player colors for a light background (#ffffff)"),
+        "{log}"
+    );
+}
+
+#[test]
+fn without_a_color_reply_colorfgbg_then_dark_decide() {
+    for (colorfgbg, expected, unexpected) in [
+        (Some("0;15"), DAY_DEW, NIGHT_DEW),
+        (None, NIGHT_DEW, DAY_DEW),
+    ] {
+        let fixture = Fixture::new();
+        let mut command = fixture.command();
+        command
+            .env("COLORTERM", "truecolor")
+            .env_remove("COLORFGBG");
+        if let Some(value) = colorfgbg {
+            command.env("COLORFGBG", value);
+        }
+        let (mut master, mut child) = spawn_in_pty(&mut command, 80, 24);
+        read_pty_until(&mut master, &mut child, BACKGROUND_QUERY);
+        // Like GNU screen: device attributes, but no background color.
+        let asked = Instant::now();
+        master
+            .write_all(b"\x1b[?62;22c")
+            .expect("answer only the device attributes");
+        let mut transcript = read_pty_until(&mut master, &mut child, expected);
+        assert!(
+            asked.elapsed() < Duration::from_millis(250),
+            "the end marker, not the timeout, ended the exchange"
+        );
+        master.write_all(b"q").expect("quit");
+        transcript.extend(read_pty_to_exit(&mut master, &mut child));
+        assert!(!byte_contains(&transcript, unexpected), "{colorfgbg:?}");
+    }
+}
+
+#[test]
+fn a_chosen_background_or_mono_theme_asks_the_terminal_nothing() {
+    for (config, expected) in [
+        ("background = \"light\"\n", Some(DAY_DEW)),
+        ("background = \"dark\"\n", Some(NIGHT_DEW)),
+        ("theme = \"mono\"\n", None),
+    ] {
+        let fixture = Fixture::new();
+        fs::write(fixture.root.join("config.toml"), config).expect("write config");
+        let mut command = fixture.command();
+        command
+            .env("COLORTERM", "truecolor")
+            .env_remove("COLORFGBG");
+        let (mut master, mut child) = spawn_in_pty(&mut command, 80, 24);
+        let mut transcript = read_pty_until(&mut master, &mut child, b"Library");
+        if let Some(dew) = expected {
+            transcript.extend(read_pty_until(&mut master, &mut child, dew));
+        }
+        master.write_all(b"q").expect("quit");
+        transcript.extend(read_pty_to_exit(&mut master, &mut child));
+        assert!(!byte_contains(&transcript, BACKGROUND_QUERY), "{config}");
+        if expected.is_none() {
+            assert!(!byte_contains(&transcript, b"38;2;"), "mono draws no color");
+        }
+    }
 }
 
 #[test]

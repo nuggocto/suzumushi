@@ -4,14 +4,14 @@ Suzumushi is a small, fully local audio player for Linux terminals. It reads
 audio from folders, searches it, builds a queue, and plays it. There is no
 account, database, streaming service, or network access.
 
-The interface has three panels: Library, Player, and Queue. It follows the
-terminal's own colors and stays out of the way. In the Player, Suzu, the small
-bell-cricket mascot, dances in a night meadow: each frequency band is a grass
-stalk tipped with light that rides the music. When playback pauses, the lights
-lift off as fireflies and drift around Suzu until you resume. When it stops,
-the meadow settles into quiet, dewy grass. In a tall Player, a night sky opens
-above the title: faint stars twinkle, and a crescent moon crosses the sky as the
-track plays.
+The interface has three panels: Library, Player, and Queue. They use the
+terminal's own colors and never paint a background. In the Player, Suzu, the
+small bell-cricket mascot, dances in a night meadow: each frequency band is a
+grass stalk tipped with light that rides the music. When playback pauses, the
+lights lift off as fireflies and drift around Suzu until you resume. When it
+stops, the meadow settles into quiet, dewy grass. In a tall Player, a night sky
+opens above the title: faint stars twinkle, and a crescent moon crosses the sky
+as the track plays.
 
 ## Install on x86-64 Linux
 
@@ -45,7 +45,7 @@ On x86-64 NixOS with Nix installed, add the repository flake to your user profil
 
 ```sh
 nix --extra-experimental-features 'nix-command flakes' \
-  profile add github:nuggocto/suzumushi/v1.3.0
+  profile add github:nuggocto/suzumushi/v1.4.0
 ```
 
 This installs both `suzumushi` and `suzu`. Nix builds from source with pinned
@@ -66,19 +66,19 @@ and local build checks.
 ## Install the release archive by hand
 
 To check each step yourself, download the archive and `SHA256SUMS` from the
-[`v1.3.0` release](https://github.com/nuggocto/suzumushi/releases/tag/v1.3.0):
+[`v1.4.0` release](https://github.com/nuggocto/suzumushi/releases/tag/v1.4.0):
 
 ```sh
 curl -fLO \
-  'https://github.com/nuggocto/suzumushi/releases/download/v1.3.0/{SHA256SUMS,suzumushi-v1.3.0-x86_64-unknown-linux-gnu.tar.xz}'
+  'https://github.com/nuggocto/suzumushi/releases/download/v1.4.0/{SHA256SUMS,suzumushi-v1.4.0-x86_64-unknown-linux-gnu.tar.xz}'
 ```
 
 Then verify and install the downloaded archive:
 
 ```sh
 sha256sum --check --ignore-missing SHA256SUMS
-tar -xf suzumushi-v1.3.0-x86_64-unknown-linux-gnu.tar.xz
-cd suzumushi-v1.3.0-x86_64-unknown-linux-gnu
+tar -xf suzumushi-v1.4.0-x86_64-unknown-linux-gnu.tar.xz
+cd suzumushi-v1.4.0-x86_64-unknown-linux-gnu
 sudo install -Dm755 suzumushi /usr/local/bin/suzumushi
 sudo ln -s suzumushi /usr/local/bin/suzu
 ```
@@ -213,6 +213,7 @@ setting:
 
 ```toml
 theme = "terminal"        # or "mono"
+background = "auto"       # or "dark" or "light"
 default_view = "library"  # or "queue"
 
 [scan]
@@ -221,25 +222,35 @@ follow_file_symlinks = true
 ignore_hidden_audio = true
 ```
 
-Every setting is optional. Config files from 1.2 and earlier keep working:
-their capacity limits are compiled in now, so those keys are ignored. Each root
-admits one player at a time; players on different roots can run together.
+Every setting is optional. Config files from 1.2 and earlier keep working.
+Their capacity limits are compiled in now, so Suzumushi ignores those keys. Each
+root admits one player at a time; players on different roots can run together.
 
 The session log is `logs/suzumushi.log`, one timestamped line per record. It
 keeps one 1 MiB archive.
 
 ## Terminal colors
 
-Suzumushi inherits the terminal's foreground, background, and named ANSI
-palette. Changing the terminal theme changes the player with it. The Player's
-meadow is the one exception: it draws its own pastel gradient, from peach for
-bass through rose and lilac to mint for treble, shared by the progress line, in
-24-bit color when the terminal advertises
-`COLORTERM=truecolor` and in the nearest 256 colors otherwise. It never paints
-a background. Set `NO_COLOR`, or use `theme = "mono"`, for a monochrome
-interface. The focused
-panel is marked with `>` and a bold single-line border, so focus never depends
-on color alone.
+Suzumushi uses the terminal's foreground, background, and named ANSI colors, so
+changing the terminal theme changes the player too. It never paints a
+background.
+
+The Player's meadow, its sky, and the progress line are the exception. They draw
+their own colors, with a gradient from peach for bass through rose and lilac to
+mint for treble. They use 24-bit color when the terminal sets
+`COLORTERM=truecolor`, and the nearest of 256 colors otherwise.
+
+Those colors come in two sets. A dark terminal gets pastels. A light terminal
+gets deeper shades of the same hues, because pastels disappear on a light
+background. At startup Suzumushi asks the terminal for its background color. If
+the terminal doesn't answer, Suzumushi reads `COLORFGBG`, and if that isn't set
+either, it uses the dark set. To skip the question, set `background = "light"`
+or `background = "dark"` in `config.toml`. The log names the choice, for
+example `player colors for a light background (#fdf6e3)`.
+
+Set `NO_COLOR`, or use `theme = "mono"`, for a monochrome interface. The focused
+panel shows `>` before its title and a bold border, so focus never depends on
+color.
 
 ## Audio support
 
@@ -256,9 +267,9 @@ automatic resampling are not current support claims.
 
 ## Status
 
-Version `1.3.0` is the current stable release. Its tag-driven Linux archive is
-fully verified before GitHub publishes it. Arch users can install the matching
-`suzumushi-bin` package from AUR.
+Version `1.4.0` is the current stable release. The release workflow builds and
+verifies its Linux archive from the tag before GitHub publishes it. Arch users
+can install the matching `suzumushi-bin` package from AUR.
 
 Release and AUR maintenance details live in
 [docs/release.md](docs/release.md).

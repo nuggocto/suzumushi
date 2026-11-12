@@ -10,7 +10,7 @@
 use ratatui::style::Style;
 use ratatui::text::Span;
 
-use super::palette::{self, ColorDepth, FIREFLY, TRACK};
+use super::palette::{ColorDepth, Palette};
 use crate::app::PlaybackStatus;
 
 /// The widest rail; a timeline centers anything narrower.
@@ -30,8 +30,6 @@ const SPARKLE_LIGHT: f32 = 0.55;
 /// The playing light breathes slowly; a paused one blinks like a firefly.
 const BREATH_HZ: f32 = 0.6;
 const BLINK_HZ: f32 = 0.35;
-const HEAD_WHITENING: f32 = 0.35;
-const WHITE: [u8; 3] = [255, 255, 245];
 
 #[derive(Clone, Copy, Default)]
 struct Dot {
@@ -54,8 +52,10 @@ pub(super) fn spans(
     progress: Option<f32>,
     status: PlaybackStatus,
     seconds: f32,
-    colors: Option<ColorDepth>,
+    colors: Option<Palette>,
 ) -> Vec<Span<'static>> {
+    // Mono output draws the same dots; night hues only decide which dot wins.
+    let palette = colors.unwrap_or_else(|| Palette::new(ColorDepth::TrueColor, None));
     let cells = cells.min(MAX_RAIL_CELLS);
     let width = cells * 2;
     let mut dots = [[Dot::default(); DOT_ROWS]; DOT_COLUMNS];
@@ -65,16 +65,16 @@ pub(super) fn spans(
         let center = dots_f32(x) + 0.5;
         if head.is_some_and(|head| center <= head) {
             let place = center / dots_f32(width);
-            column[PATH_ROW].light_up(TRAIL_LIGHT, palette::pastel(place));
+            column[PATH_ROW].light_up(TRAIL_LIGHT, palette.gradient(place));
         } else if x % 2 == 0 {
-            column[PATH_ROW].light_up(DEW_LIGHT, TRACK);
+            column[PATH_ROW].light_up(DEW_LIGHT, palette.dew());
         }
     }
 
     if let Some(head) =
         head.filter(|_| matches!(status, PlaybackStatus::Playing | PlaybackStatus::Paused))
     {
-        let (color, glow) = light_mood(status, head / dots_f32(width.max(1)), seconds);
+        let (color, glow) = light_mood(&palette, status, head / dots_f32(width.max(1)), seconds);
         let nearest = (0..width).min_by(|left, right| {
             let distance = |x: &usize| (dots_f32(*x) + 0.5 - head).abs();
             distance(left).total_cmp(&distance(right))
@@ -112,8 +112,8 @@ pub(super) fn spans(
                 }
             }
             let glyph = char::from_u32(0x2800 + u32::from(bits)).unwrap_or(' ');
-            let style = colors.map_or_else(Style::default, |depth| {
-                Style::default().fg(depth.color(palette::shade(brightest.color, brightest.light)))
+            let style = colors.map_or_else(Style::default, |palette| {
+                Style::default().fg(palette.color(palette.shade(brightest.color, brightest.light)))
             });
             Span::styled(glyph.to_string(), style)
         })
@@ -121,15 +121,20 @@ pub(super) fn spans(
 }
 
 /// The light's color and brightness: its place on the gradient while playing,
-/// breathing gently; firefly yellow while paused, with a slow blink. Either
+/// breathing gently; the firefly color while paused, with a slow blink. Either
 /// way it stays brighter than the trail behind it.
-fn light_mood(status: PlaybackStatus, place: f32, seconds: f32) -> ([u8; 3], f32) {
+fn light_mood(
+    palette: &Palette,
+    status: PlaybackStatus,
+    place: f32,
+    seconds: f32,
+) -> ([u8; 3], f32) {
     let wave = |hertz: f32| 0.5 + 0.5 * (std::f32::consts::TAU * hertz * seconds).sin();
     if status == PlaybackStatus::Paused {
         let blink = wave(BLINK_HZ);
-        (FIREFLY, (0.3 * blink * blink).mul_add(blink, 0.7))
+        (palette.firefly(), (0.3 * blink * blink).mul_add(blink, 0.7))
     } else {
-        let color = palette::mix(palette::pastel(place), WHITE, HEAD_WHITENING);
+        let color = palette.head(palette.gradient(place));
         (color, 0.15f32.mul_add(wave(BREATH_HZ), 0.85))
     }
 }
@@ -155,9 +160,26 @@ mod tests {
     use ratatui::style::Color;
     use ratatui::text::Span;
 
-    use super::{MAX_RAIL_CELLS, spans};
+    use super::{DEW_LIGHT, MAX_RAIL_CELLS, spans};
     use crate::app::PlaybackStatus;
-    use crate::ui::ColorDepth;
+    use crate::ui::palette::{ColorDepth, Palette, contrast};
+
+    const WHITE: [u8; 3] = [0xFF, 0xFF, 0xFF];
+
+    fn night() -> Palette {
+        Palette::new(ColorDepth::TrueColor, None)
+    }
+
+    fn day() -> Palette {
+        Palette::new(ColorDepth::TrueColor, Some(WHITE))
+    }
+
+    fn rgb(span: &Span<'_>) -> [u8; 3] {
+        let Some(Color::Rgb(red, green, blue)) = span.style.fg else {
+            panic!("{span:?} is colored in 24-bit");
+        };
+        [red, green, blue]
+    }
 
     fn glyphs(rail: &[Span<'_>]) -> String {
         rail.iter().map(|span| span.content.as_ref()).collect()
@@ -184,13 +206,7 @@ mod tests {
 
     #[test]
     fn the_played_trail_is_pastel_beads_and_the_light_leads_it() {
-        let rail = spans(
-            20,
-            Some(0.5),
-            PlaybackStatus::Playing,
-            0.0,
-            Some(ColorDepth::TrueColor),
-        );
+        let rail = spans(20, Some(0.5), PlaybackStatus::Playing, 0.0, Some(night()));
         let light = light_cell(&rail);
 
         assert!((9..=10).contains(&light), "{}", glyphs(&rail));
@@ -216,7 +232,7 @@ mod tests {
                 Some(progress),
                 PlaybackStatus::Playing,
                 0.0,
-                Some(ColorDepth::TrueColor),
+                Some(night()),
             )
         };
         // 20.6 and 20.85 dots along a 40-dot rail: inside one dot column.
@@ -233,13 +249,7 @@ mod tests {
 
     #[test]
     fn a_paused_light_turns_into_a_firefly_and_a_stopped_rail_has_none() {
-        let paused = spans(
-            20,
-            Some(0.3),
-            PlaybackStatus::Paused,
-            0.0,
-            Some(ColorDepth::TrueColor),
-        );
+        let paused = spans(20, Some(0.3), PlaybackStatus::Paused, 0.0, Some(night()));
         let Some(Color::Rgb(red, green, blue)) = paused[light_cell(&paused)].style.fg else {
             panic!("the paused light is colored");
         };
@@ -251,6 +261,39 @@ mod tests {
                 .chars()
                 .all(|glyph| matches!(glyph, '⠤' | '⠄'))
         );
+    }
+
+    #[test]
+    fn by_day_the_light_outshines_the_trail_and_the_dew_stays_faint() {
+        for status in [PlaybackStatus::Playing, PlaybackStatus::Paused] {
+            let rail = spans(20, Some(0.5), status, 0.0, Some(day()));
+            let light = light_cell(&rail);
+            let head = contrast(rgb(&rail[light]), WHITE);
+            let trail = contrast(rgb(&rail[2]), WHITE);
+            let dew = contrast(rgb(&rail[19]), WHITE);
+            assert!(
+                head > trail && trail > dew,
+                "{status:?}: {head} {trail} {dew}"
+            );
+            assert!(
+                head >= 3.0,
+                "{status:?}: the light reads on white at {head}"
+            );
+        }
+    }
+
+    #[test]
+    fn unplayed_dew_is_faint_but_visible_on_dark_and_light_terminals() {
+        for (background, page) in [
+            (None, [0x1E, 0x1E, 0x2E]),
+            (None, [0, 0, 0]),
+            (Some(WHITE), WHITE),
+            (Some([0xFD, 0xF6, 0xE3]), [0xFD, 0xF6, 0xE3]),
+        ] {
+            let palette = Palette::new(ColorDepth::TrueColor, background);
+            let ratio = contrast(palette.shade(palette.dew(), DEW_LIGHT), page);
+            assert!((1.6..=2.5).contains(&ratio), "dew on {page:?}: {ratio}");
+        }
     }
 
     #[test]

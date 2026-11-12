@@ -24,8 +24,8 @@ predictable until another track is selected.
 The scan index is immutable during a session. Queue membership uses one flag
 per canonical asset, and the queue holds at most 10,000 items.
 
-`src/config.rs` parses `config.toml`, which holds only the theme, the first
-focused view, and three scan behaviors. Capacity limits are compiled into
+`src/config.rs` parses `config.toml`, which holds only the theme, the terminal
+background, the first focused view, and three scan behaviors. Capacity limits are compiled into
 `Config::default()`; tests lower them through its public fields.
 
 `src/state.rs` writes `state/session.json`, the resume checkpoint. The event loop
@@ -46,10 +46,17 @@ solid shapes stay solid, glow becomes an ordered stipple, and bare stalk columns
 become hairlines. When the Player has room, the stage extends above the title
 into a sky of fixed-share stars and a moon placed by track progress. The title
 and Suzu are drawn last with silhouette masks. `src/ui/palette.rs` holds the
-pastel gradient and glow shading that the meadow and the progress rail share;
-`src/ui/rail.rs` draws the rail's trail, dew, and light in the same braille dots. The stage asks the
-event loop for about 30 frames per second while it moves, 20 while fireflies
-drift, and the ordinary tick once still.
+night and day color sets and the glow shading that the meadow and the progress
+rail share. A light's brightness is its distance from the background: by night
+it fades toward black, by day into the terminal's own background color.
+`src/background.rs` finds that color once, in raw mode before the first key is
+read: it sends an OSC 11 query followed by a DA1 query, and the DA1 reply ends
+the wait, so a terminal that ignores OSC 11 costs one round trip rather than
+the 300 ms timeout. `src/ui/rail.rs` draws the rail's trail, dew, and light in
+the same braille dots. The stage asks the
+event loop for about 60 frames per second while lights lift off or fly home,
+so they move about a dot per frame, 30 while the meadow moves, 20 while
+fireflies drift, and the ordinary tick once still.
 
 The audio callback analyzes 32 bands from 50 Hz to 16 kHz and normalizes them
 against a slowly relaxing loudness reference, so loud masters and quiet

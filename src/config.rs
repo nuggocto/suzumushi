@@ -2,8 +2,9 @@
 
 //! User configuration and the compiled limits the rest of the app runs under.
 //!
-//! `config.toml` holds only choices a listener makes: the color theme, the first
-//! focused view, and three scan behaviors. Every capacity limit is a compiled
+//! `config.toml` holds only choices a listener makes: the color theme, the
+//! terminal background the colors suit, the first focused view, and three scan
+//! behaviors. Every capacity limit is a compiled
 //! constant. Tests lower them through the public [`Config`] fields.
 
 use serde::Deserialize;
@@ -30,6 +31,9 @@ pub(crate) const MEADOW_MAX_ROWS: usize = 16;
 /// The default configuration written by `init`.
 pub const DEFAULT_CONFIG: &str = r#"# "terminal" uses the terminal's colors; "mono" draws without color.
 theme = "terminal"
+# The Player's colors suit a dark or a light terminal. "auto" asks the terminal
+# which it is; "dark" or "light" decides without asking.
+background = "auto"
 # The pane focused at startup: "library" or "queue".
 default_view = "library"
 
@@ -50,6 +54,17 @@ pub enum Theme {
     Mono,
 }
 
+/// The terminal background the Player's colors are chosen for.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum Background {
+    /// Ask the terminal for its background color at startup.
+    #[default]
+    Auto,
+    Dark,
+    Light,
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum DefaultView {
@@ -61,6 +76,7 @@ pub enum DefaultView {
 #[derive(Clone, Debug, Default)]
 pub struct Config {
     pub theme: Theme,
+    pub background: Background,
     pub default_view: DefaultView,
     pub scan: ScanConfig,
     pub search: SearchConfig,
@@ -172,6 +188,8 @@ struct ParsedConfig {
     #[serde(default)]
     theme: Theme,
     #[serde(default)]
+    background: Background,
+    #[serde(default)]
     default_view: DefaultView,
     #[serde(default)]
     scan: ParsedScanConfig,
@@ -270,6 +288,7 @@ pub fn parse(input: &[u8]) -> AppResult<Config> {
         .map_err(|error| AppError::InvalidConfig(error.to_string()))?;
     Ok(Config {
         theme: parsed.theme,
+        background: parsed.background,
         default_view: parsed.default_view,
         scan: ScanConfig {
             cross_mounts: parsed.scan.cross_mounts,
@@ -360,7 +379,9 @@ pub fn load_from<Fd: AsFd>(root_file: Fd, root: &Path) -> AppResult<Config> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_CONFIG, DefaultView, MAX_CONFIG_BYTES, SymlinkPolicy, Theme, parse};
+    use super::{
+        Background, DEFAULT_CONFIG, DefaultView, MAX_CONFIG_BYTES, SymlinkPolicy, Theme, parse,
+    };
 
     /// The file `init` wrote through release 1.2.2.
     const VERSION_ONE_CONFIG: &str = r#"config_version = 1
@@ -412,12 +433,14 @@ queue_full_policy = "drop_and_count"
     fn default_config_matches_the_compiled_defaults() {
         let config = parse(DEFAULT_CONFIG.as_bytes()).expect("default config parses");
         assert_eq!(config.theme, Theme::Terminal);
+        assert_eq!(config.background, Background::Auto);
         assert_eq!(config.default_view, DefaultView::Library);
         assert!(!config.scan.cross_mounts);
         assert_eq!(config.scan.symlink_policy, SymlinkPolicy::FollowFiles);
         assert!(config.scan.ignore_hidden_audio);
         let empty = parse(b"").expect("an empty file uses the defaults");
         assert_eq!(empty.theme, Theme::Terminal);
+        assert_eq!(empty.background, Background::Auto);
         assert_eq!(empty.scan.symlink_policy, SymlinkPolicy::FollowFiles);
     }
 
@@ -427,11 +450,24 @@ queue_full_policy = "drop_and_count"
             format!("{DEFAULT_CONFIG}\nunknown_limit = 1\n"),
             DEFAULT_CONFIG.replace("[scan]\n", "[scan]\nchord = true\n"),
             DEFAULT_CONFIG.replace("theme = \"terminal\"", "theme = \"neon\""),
+            DEFAULT_CONFIG.replace("background = \"auto\"", "background = \"sepia\""),
             DEFAULT_CONFIG.replace("default_view = \"library\"", "default_view = \"player\""),
         ] {
             assert!(parse(text.as_bytes()).is_err(), "accepted {text}");
         }
         assert!(parse(&vec![b'#'; MAX_CONFIG_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn the_background_can_be_chosen_by_hand() {
+        for (value, expected) in [("dark", Background::Dark), ("light", Background::Light)] {
+            let text = DEFAULT_CONFIG.replace(
+                "background = \"auto\"",
+                &format!("background = \"{value}\""),
+            );
+            let config = parse(text.as_bytes()).expect("a chosen background parses");
+            assert_eq!(config.background, expected);
+        }
     }
 
     #[test]

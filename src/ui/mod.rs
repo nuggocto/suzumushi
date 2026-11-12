@@ -9,7 +9,7 @@ mod rail;
 mod stage;
 pub mod status;
 
-pub use palette::ColorDepth;
+pub use palette::{ColorDepth, Palette};
 pub use stage::Stage;
 
 use std::os::unix::ffi::OsStrExt;
@@ -110,7 +110,12 @@ fn render_player(
     if !creator.is_empty() {
         title.push(Line::from(creator));
     }
-    let footer = player_footer(app, stage.depth(), usize::from(inner.width), animation_time);
+    let footer = player_footer(
+        app,
+        stage.palette(),
+        usize::from(inner.width),
+        animation_time,
+    );
 
     // The stage fills the Player above the details: the meadow and title at
     // its foot, and any room above them as night sky. Only a Player taller
@@ -156,7 +161,7 @@ fn track_progress(position: Duration, duration: Option<Duration>) -> Option<f32>
 
 fn player_footer(
     app: &AppState,
-    depth: ColorDepth,
+    palette: Palette,
     width: usize,
     animation_time: Duration,
 ) -> Vec<Line<'static>> {
@@ -177,7 +182,7 @@ fn player_footer(
             app.playback_position(),
             app.playback_duration(),
             width,
-            (app.color_mode == ColorMode::Terminal).then_some(depth),
+            (app.color_mode == ColorMode::Terminal).then_some(palette),
             app.playback_status(),
             animation_time,
         ),
@@ -213,7 +218,7 @@ fn player_timeline(
     position: Duration,
     duration: Option<Duration>,
     width: usize,
-    colors: Option<ColorDepth>,
+    colors: Option<Palette>,
     status: PlaybackStatus,
     animation_time: Duration,
 ) -> Line<'static> {
@@ -233,10 +238,10 @@ fn player_timeline(
     );
     spans.push(Span::raw("  "));
     match (colors, progress) {
-        (Some(depth), Some(progress)) => {
+        (Some(palette), Some(progress)) => {
             spans.push(Span::styled(
                 elapsed,
-                Style::default().fg(depth.color(palette::pastel(progress))),
+                Style::default().fg(palette.color(palette.gradient(progress))),
             ));
             spans.push(Span::styled(" / ", Style::default().fg(Color::DarkGray)));
         }
@@ -469,7 +474,8 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
             .draw(|frame| {
-                let mut stage = super::Stage::new(super::ColorDepth::TrueColor);
+                let mut stage =
+                    super::Stage::new(super::Palette::new(super::ColorDepth::TrueColor, None));
                 super::render(frame, app, &mut stage, animation_time);
             })
             .expect("draw UI");
@@ -514,7 +520,8 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
             .draw(|frame| {
-                let mut stage = super::Stage::new(super::ColorDepth::TrueColor);
+                let mut stage =
+                    super::Stage::new(super::Palette::new(super::ColorDepth::TrueColor, None));
                 super::render(frame, &app, &mut stage, Duration::ZERO);
             })
             .expect("draw UI");
@@ -574,7 +581,8 @@ mod tests {
         let sky = |app: &AppState| -> usize {
             let backend = TestBackend::new(80, 24);
             let mut terminal = Terminal::new(backend).expect("test terminal");
-            let mut stage = super::Stage::new(super::ColorDepth::TrueColor);
+            let mut stage =
+                super::Stage::new(super::Palette::new(super::ColorDepth::TrueColor, None));
             for step in 0..30 {
                 terminal
                     .draw(|frame| {

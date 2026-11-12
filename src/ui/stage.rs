@@ -17,7 +17,7 @@ use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
-use super::palette::{self, ColorDepth, FIREFLY, MOON, STAR};
+use super::palette::{self, Palette};
 use crate::app::{ColorMode, PlaybackStatus};
 use crate::audio::SPECTRUM_BANDS;
 use crate::config::{MEADOW_MAX_ROWS, STAGE_MAX_COLUMNS, STAGE_MAX_ROWS};
@@ -27,6 +27,10 @@ const DOTS_PER_ROW: usize = 4;
 const FIELD_DOTS: usize = STAGE_MAX_COLUMNS * DOTS_PER_COLUMN * STAGE_MAX_ROWS * DOTS_PER_ROW;
 
 const FAST_FRAME: Duration = Duration::from_millis(33);
+/// Lifting off and flying home, lights cross the stage in about a second;
+/// at 60 frames per second they move about a dot per frame instead of
+/// skipping several.
+const FLIGHT_FRAME: Duration = Duration::from_millis(16);
 const DRIFT_FRAME: Duration = Duration::from_millis(50);
 const IDLE_FRAME: Duration = Duration::from_millis(100);
 /// Frames further apart than this (a hidden Player, a stalled terminal) resume
@@ -41,12 +45,13 @@ const MAX_KICK: f32 = 2.0;
 const MAX_BALL: f32 = 1.06;
 const SETTLED: f32 = 0.002;
 
-const LIFT_SECONDS: f32 = 1.6;
+const LIFT_SECONDS: f32 = 1.2;
 const COLOR_TURN_SECONDS: f32 = 0.9;
 /// Each light takes this long to settle home, and each band starts a little
 /// after the one below it, so the meadow refills in a wave from bass to treble.
-const RETURN_SECONDS: f32 = 1.1;
-const RETURN_STAGGER_SECONDS: f32 = 0.02;
+/// As long as the lift-off, so neither flight moves faster than the other.
+const RETURN_SECONDS: f32 = LIFT_SECONDS;
+const RETURN_STAGGER_SECONDS: f32 = 0.012;
 /// Sideways swing of a homecoming light, as a share of the stage width.
 const RETURN_ARC: f32 = 0.05;
 
@@ -105,7 +110,7 @@ pub struct Stage {
     stalks_from: [f32; SPECTRUM_BANDS],
     last_seconds: Option<f32>,
     last_status: PlaybackStatus,
-    depth: ColorDepth,
+    palette: Palette,
     field: Box<[Dot]>,
 }
 
@@ -164,7 +169,7 @@ impl Field {
 
 impl Stage {
     #[must_use]
-    pub fn new(depth: ColorDepth) -> Self {
+    pub fn new(palette: Palette) -> Self {
         Self {
             bands: [BandMotion::default(); SPECTRUM_BANDS],
             flight: Flight::Attached,
@@ -172,18 +177,26 @@ impl Stage {
             stalks_from: [0.0; SPECTRUM_BANDS],
             last_seconds: None,
             last_status: PlaybackStatus::Stopped,
-            depth,
+            palette,
             field: vec![Dot::default(); FIELD_DOTS].into_boxed_slice(),
         }
     }
 
-    /// How soon the next frame is worth drawing: smooth while the meadow moves,
-    /// relaxed while fireflies drift, and the ordinary tick once it is still.
+    /// How soon the next frame is worth drawing: smoothest while lights fly
+    /// off or home, smooth while the meadow moves, relaxed while fireflies
+    /// drift, and the ordinary tick once it is still.
     #[must_use]
     pub fn frame_interval(&self) -> Duration {
         match self.flight {
+            Flight::Drifting { since }
+                if self
+                    .last_seconds
+                    .is_some_and(|now| now - since < LIFT_SECONDS) =>
+            {
+                FLIGHT_FRAME
+            }
             Flight::Drifting { .. } => DRIFT_FRAME,
-            Flight::Returning { .. } => FAST_FRAME,
+            Flight::Returning { .. } => FLIGHT_FRAME,
             Flight::Attached
                 if self.last_status == PlaybackStatus::Playing
                     || self
@@ -249,8 +262,8 @@ impl Stage {
     }
 
     /// The colors this stage draws with, for the rest of the Player to match.
-    pub(super) const fn depth(&self) -> ColorDepth {
-        self.depth
+    pub(super) const fn palette(&self) -> Palette {
+        self.palette
     }
 
     fn advance(
@@ -309,7 +322,7 @@ impl Stage {
     /// Where a band's light is now, and its color and brightness.
     fn light_at(&self, band: usize, field: Field, seconds: f32) -> (Point, [u8; 3], f32) {
         let attached = self.attached_point(band, field);
-        let hue = meadow_color(band);
+        let hue = self.meadow_color(band);
         match self.flight {
             Flight::Attached => (attached, hue, 1.0),
             Flight::Drifting { since } => self.drift(band, seconds, since),
@@ -337,12 +350,14 @@ impl Stage {
         let elapsed = seconds - since;
         let firefly = Firefly::for_band(band);
         let home = firefly.home(self.flight_from[band], elapsed);
-        let lift = ease_out_cubic(elapsed / LIFT_SECONDS);
+        // Eased at both ends, like the flight home: a light rises off its
+        // stalk instead of leaving at full speed.
+        let lift = smoothstep(elapsed / LIFT_SECONDS);
         (
             lerp_point(self.flight_from[band], home, lift),
             palette::mix(
-                meadow_color(band),
-                FIREFLY,
+                self.meadow_color(band),
+                self.palette.firefly(),
                 smoothstep(elapsed / COLOR_TURN_SECONDS),
             ),
             firefly.glow(elapsed),
@@ -356,9 +371,15 @@ impl Stage {
             Flight::Drifting { .. } => 0.0,
             Flight::Returning { since, .. } => {
                 let delay = RETURN_STAGGER_SECONDS * dots_f32(band);
-                smootherstep((seconds - since - delay) / RETURN_SECONDS)
+                smoothstep((seconds - since - delay) / RETURN_SECONDS)
             }
         }
+    }
+
+    /// A band's place on the gradient, bass to treble.
+    fn meadow_color(&self, band: usize) -> [u8; 3] {
+        self.palette
+            .gradient(dots_f32(band) / dots_f32(SPECTRUM_BANDS - 1))
     }
 
     fn attached_point(&self, band: usize, field: Field) -> Point {
@@ -375,7 +396,7 @@ impl Stage {
         }
         for band in 0..SPECTRUM_BANDS {
             let motion = self.bands[band];
-            let color = meadow_color(band);
+            let color = self.meadow_color(band);
             let x = field.band_x(band);
             let (point, light_color, glow) = self.light_at(band, field, seconds);
             let (light_x, light_y) = field.to_dots(point);
@@ -432,7 +453,14 @@ impl Stage {
                 0.34
             };
             if let (Some(x), Some(y)) = (index_checked(x, field.width), index_checked(y, height)) {
-                self.merge(field, x, y, 1.0, (peak * pulse).mul_add(pulse, 0.1), STAR);
+                self.merge(
+                    field,
+                    x,
+                    y,
+                    1.0,
+                    (peak * pulse).mul_add(pulse, 0.1),
+                    self.palette.star(),
+                );
             }
         }
     }
@@ -466,7 +494,7 @@ impl Stage {
                         index_checked(row, field.sky),
                     )
                 {
-                    self.merge(field, dot_x, dot_y, cover, light, MOON);
+                    self.merge(field, dot_x, dot_y, cover, light, self.palette.moon());
                 }
                 column += 1.0;
             }
@@ -575,8 +603,8 @@ impl Stage {
                 let style = match color_mode {
                     ColorMode::Mono => Style::default(),
                     ColorMode::Terminal => Style::default().fg(self
-                        .depth
-                        .color(palette::shade(brightest.color, brightest.light))),
+                        .palette
+                        .color(self.palette.shade(brightest.color, brightest.light))),
                 };
                 let x = area.x + u16::try_from(column).unwrap_or(u16::MAX);
                 let y = area.y + u16::try_from(row).unwrap_or(u16::MAX);
@@ -776,10 +804,6 @@ fn draw_overlay(buffer: &mut Buffer, area: Rect, lines: &[Line<'static>], margin
     }
 }
 
-fn meadow_color(band: usize) -> [u8; 3] {
-    palette::pastel(dots_f32(band) / dots_f32(SPECTRUM_BANDS - 1))
-}
-
 fn lerp_point(from: Point, to: Point, amount: f32) -> Point {
     let amount = amount.clamp(0.0, 1.0);
     Point {
@@ -788,21 +812,12 @@ fn lerp_point(from: Point, to: Point, amount: f32) -> Point {
     }
 }
 
+/// Starts and ends at rest. Its top speed is 1.5 times the average, the
+/// lowest of the usual eases, so a flight can be short without a light
+/// skipping dots between frames.
 fn smoothstep(value: f32) -> f32 {
     let value = value.clamp(0.0, 1.0);
     value * value * 2.0f32.mul_add(-value, 3.0)
-}
-
-fn ease_out_cubic(value: f32) -> f32 {
-    let rest = 1.0 - value.clamp(0.0, 1.0);
-    1.0 - rest * rest * rest
-}
-
-/// Starts and ends with zero speed and zero acceleration, so a light eases
-/// out of its drift and settles without a visible jolt.
-fn smootherstep(value: f32) -> f32 {
-    let value = value.clamp(0.0, 1.0);
-    value * value * value * value.mul_add(6.0f32.mul_add(value, -15.0), 10.0)
 }
 
 fn splitmix(state: &mut u64) -> u64 {
@@ -859,11 +874,17 @@ mod tests {
     use ratatui::text::{Line, Span};
 
     use super::{
-        BandMotion, ColorDepth, DRIFT_FRAME, FAST_FRAME, Field, Flight, IDLE_FRAME, MAX_BALL,
-        Stage, StageFrame, cell_glyph, moon_center,
+        BandMotion, DRIFT_FRAME, FAST_FRAME, FLIGHT_FRAME, Field, Flight, IDLE_FRAME, MAX_BALL,
+        Stage, StageFrame, cell_glyph, moon_center, to_u16,
     };
     use crate::app::{ColorMode, PlaybackStatus};
     use crate::audio::SPECTRUM_BANDS;
+    use crate::config::{MEADOW_MAX_ROWS, STAGE_MAX_COLUMNS, STAGE_MAX_ROWS};
+    use crate::ui::palette::{ColorDepth, Palette, contrast};
+
+    fn night() -> Palette {
+        Palette::new(ColorDepth::TrueColor, None)
+    }
 
     const AREA: Rect = Rect::new(2, 1, 40, 12);
 
@@ -933,7 +954,7 @@ mod tests {
 
     #[test]
     fn pausing_releases_fireflies_that_stay_on_stage_and_resuming_brings_them_home() {
-        let mut stage = Stage::new(ColorDepth::TrueColor);
+        let mut stage = Stage::new(night());
         let mut buffer = Buffer::empty(Rect::new(0, 0, 44, 14));
         let playing = frame(PlaybackStatus::Playing, 200, ColorMode::Terminal, &[]);
         let paused = frame(PlaybackStatus::Paused, 0, ColorMode::Terminal, &[]);
@@ -955,13 +976,13 @@ mod tests {
 
         let now = play(&mut stage, &mut buffer, &playing, now, 1.0);
         assert!(matches!(stage.flight, Flight::Returning { .. }));
-        play(&mut stage, &mut buffer, &playing, now, 1.0);
+        play(&mut stage, &mut buffer, &playing, now, 1.5);
         assert_eq!(stage.flight, Flight::Attached, "every light is home");
     }
 
     #[test]
     fn resuming_glides_every_light_home_without_a_jump() {
-        let mut stage = Stage::new(ColorDepth::TrueColor);
+        let mut stage = Stage::new(night());
         let mut buffer = Buffer::empty(Rect::new(0, 0, 44, 14));
         let playing = frame(PlaybackStatus::Playing, 170, ColorMode::Terminal, &[]);
         let paused = frame(PlaybackStatus::Paused, 0, ColorMode::Terminal, &[]);
@@ -1014,7 +1035,7 @@ mod tests {
     #[test]
     fn identical_inputs_draw_identical_frames() {
         let draw = || {
-            let mut stage = Stage::new(ColorDepth::TrueColor);
+            let mut stage = Stage::new(night());
             let mut buffer = Buffer::empty(Rect::new(0, 0, 44, 14));
             let playing = frame(PlaybackStatus::Playing, 180, ColorMode::Terminal, &[]);
             let paused = frame(PlaybackStatus::Paused, 0, ColorMode::Terminal, &[]);
@@ -1032,7 +1053,7 @@ mod tests {
             let outer = Rect::new(0, 0, width + 4, height + 4);
             let mut buffer = Buffer::filled(outer, ratatui::buffer::Cell::new("x"));
             let area = Rect::new(2, 2, width, height);
-            let mut stage = Stage::new(ColorDepth::TrueColor);
+            let mut stage = Stage::new(night());
             let playing = frame(PlaybackStatus::Playing, 255, ColorMode::Terminal, &[]);
             for step in 0..20 {
                 stage.render(
@@ -1055,7 +1076,7 @@ mod tests {
     #[test]
     fn suzu_stays_readable_in_front_of_the_meadow() {
         let suzu = [Line::raw("  ▐▀^ ^▀▌  "), Line::raw("▄▄█  ▴  █▄▄")];
-        let mut stage = Stage::new(ColorDepth::TrueColor);
+        let mut stage = Stage::new(night());
         let mut buffer = Buffer::empty(Rect::new(0, 0, 44, 14));
         let loud = frame(PlaybackStatus::Playing, 255, ColorMode::Terminal, &suzu);
         play(&mut stage, &mut buffer, &loud, 0.0, 1.0);
@@ -1082,7 +1103,7 @@ mod tests {
             (ColorDepth::TrueColor, ColorMode::Mono),
         ];
         for (depth, color_mode) in cases {
-            let mut stage = Stage::new(depth);
+            let mut stage = Stage::new(Palette::new(depth, None));
             let mut buffer = Buffer::empty(Rect::new(0, 0, 44, 14));
             let playing = frame(PlaybackStatus::Playing, 220, color_mode, &[]);
             play(&mut stage, &mut buffer, &playing, 0.0, 0.5);
@@ -1107,7 +1128,7 @@ mod tests {
 
     #[test]
     fn frames_are_smooth_while_moving_and_relaxed_once_still() {
-        let mut stage = Stage::new(ColorDepth::TrueColor);
+        let mut stage = Stage::new(night());
         let mut buffer = Buffer::empty(Rect::new(0, 0, 44, 14));
         assert_eq!(stage.frame_interval(), IDLE_FRAME);
 
@@ -1117,11 +1138,67 @@ mod tests {
 
         let paused = frame(PlaybackStatus::Paused, 0, ColorMode::Terminal, &[]);
         let now = play(&mut stage, &mut buffer, &paused, now, 0.5);
-        assert_eq!(stage.frame_interval(), DRIFT_FRAME);
+        assert_eq!(stage.frame_interval(), FLIGHT_FRAME, "lights lifting off");
+        let now = play(&mut stage, &mut buffer, &paused, now, 1.5);
+        assert_eq!(stage.frame_interval(), DRIFT_FRAME, "fireflies drifting");
+        let now = play(&mut stage, &mut buffer, &playing, now, 0.5);
+        assert_eq!(stage.frame_interval(), FLIGHT_FRAME, "lights flying home");
 
         let stopped = frame(PlaybackStatus::Stopped, 0, ColorMode::Terminal, &[]);
         play(&mut stage, &mut buffer, &stopped, now, 3.0);
         assert_eq!(stage.frame_interval(), IDLE_FRAME, "a settled meadow idles");
+    }
+
+    #[test]
+    fn lights_move_about_a_dot_per_frame_lifting_off_and_flying_home() {
+        // The largest stage has the longest flights.
+        let (columns, rows) = (STAGE_MAX_COLUMNS, STAGE_MAX_ROWS);
+        let area = Rect::new(0, 0, to_u16(columns), to_u16(rows));
+        let title = [Line::raw("Night Song")];
+        let field = Field {
+            width: columns * 2,
+            height: rows * 4,
+            sky: (rows - 1 - MEADOW_MAX_ROWS) * 4,
+            meadow: MEADOW_MAX_ROWS * 4,
+        };
+        let mut stage = Stage::new(night());
+        let mut buffer = Buffer::empty(area);
+        let mut stage_frame = frame(PlaybackStatus::Playing, 200, ColorMode::Terminal, &[]);
+        stage_frame.title = &title;
+        let mut now = 0.0_f32;
+        // Plays at the pace the stage asks the event loop for, and returns the
+        // largest distance any light covers between two frames, in dots.
+        let mut largest_jump = |stage_frame: &StageFrame<'_>, seconds: f32| -> f32 {
+            let end = now + seconds;
+            let mut previous: Option<Vec<(f32, f32)>> = None;
+            let mut largest = 0.0_f32;
+            while now < end {
+                stage.render(&mut buffer, area, stage_frame, Duration::from_secs_f32(now));
+                let lights: Vec<(f32, f32)> = (0..SPECTRUM_BANDS)
+                    .map(|band| field.to_dots(stage.light_at(band, field, now).0))
+                    .collect();
+                if let Some(previous) = &previous {
+                    for (before, after) in previous.iter().zip(&lights) {
+                        largest = largest.max((after.0 - before.0).hypot(after.1 - before.1));
+                    }
+                }
+                previous = Some(lights);
+                now += stage.frame_interval().as_secs_f32();
+            }
+            largest
+        };
+
+        largest_jump(&stage_frame, 1.0);
+        stage_frame.status = PlaybackStatus::Paused;
+        let lift_off = largest_jump(&stage_frame, 3.0);
+        stage_frame.status = PlaybackStatus::Playing;
+        let homecoming = largest_jump(&stage_frame, 2.5);
+
+        // A braille cell is four dots tall. At 60 frames per second, 1.2 s
+        // flights across the largest stage peak at about two dots a frame;
+        // three or more reads as stutter.
+        assert!(lift_off <= 2.25, "lift-off jumps {lift_off} dots");
+        assert!(homecoming <= 2.25, "homecoming jumps {homecoming} dots");
     }
 
     #[test]
@@ -1151,9 +1228,13 @@ mod tests {
 
     /// Renders two seconds of a paused track into a tall stage with a title.
     fn tall_paused_stage(rows: u16) -> (Stage, Buffer, Rect) {
+        tall_paused_stage_in(night(), rows)
+    }
+
+    fn tall_paused_stage_in(palette: Palette, rows: u16) -> (Stage, Buffer, Rect) {
         let area = Rect::new(0, 0, 44, rows);
         let title = [Line::raw("Night Song")];
-        let mut stage = Stage::new(ColorDepth::TrueColor);
+        let mut stage = Stage::new(palette);
         let mut buffer = Buffer::empty(area);
         let mut stage_frame = frame(PlaybackStatus::Playing, 160, ColorMode::Terminal, &[]);
         stage_frame.title = &title;
@@ -1205,6 +1286,30 @@ mod tests {
     }
 
     #[test]
+    fn the_moon_and_firefly_cores_stand_out_on_dark_and_light_terminals() {
+        for page in [[0, 0, 0], [0xFF, 0xFF, 0xFF], [0xFD, 0xF6, 0xE3]] {
+            let palette = Palette::new(ColorDepth::TrueColor, Some(page));
+            let (_, buffer, area) = tall_paused_stage_in(palette, 30);
+            let sky = area.height - 16 - 1;
+            // Only the moon's body and firefly cores fill a whole cell up there.
+            let solid: Vec<f32> = (0..sky)
+                .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+                .filter(|position| buffer[*position].symbol() == "⣿")
+                .map(|position| {
+                    let Color::Rgb(red, green, blue) = buffer[position].fg else {
+                        panic!("the sky is drawn in 24-bit color");
+                    };
+                    contrast([red, green, blue], page)
+                })
+                .collect();
+            assert!(!solid.is_empty(), "the moon shows on {page:?}");
+            for ratio in solid {
+                assert!(ratio >= 3.0, "a solid light on {page:?} at {ratio}:1");
+            }
+        }
+    }
+
+    #[test]
     fn paused_fireflies_rise_into_the_sky() {
         let (stage, _, area) = tall_paused_stage(30);
         let field = Field {
@@ -1225,7 +1330,7 @@ mod tests {
         for title in ["東京夜", "Cafe\u{301} au lait", "🦗 night"] {
             let line = [Line::raw(title)];
             let area = Rect::new(0, 0, 44, 30);
-            let mut stage = Stage::new(ColorDepth::TrueColor);
+            let mut stage = Stage::new(night());
             let mut buffer = Buffer::empty(area);
             let mut stage_frame = frame(PlaybackStatus::Playing, 180, ColorMode::Terminal, &[]);
             stage_frame.title = &line;

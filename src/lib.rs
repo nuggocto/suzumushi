@@ -4,6 +4,7 @@
 
 pub mod app;
 pub mod audio;
+mod background;
 pub mod cli;
 pub mod config;
 pub mod display;

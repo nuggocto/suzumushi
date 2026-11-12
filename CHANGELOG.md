@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-11-12
+
+### Fixed
+
+- On a light terminal, the moon, the fireflies, the stalk lights, and the
+  progress rail's light no longer vanish into the background, and the elapsed
+  time is readable. The Player asks the terminal for its background color and
+  draws deeper versions of its colors on a light one. The faintest glow fades
+  into the background instead of turning into dark specks.
+- The unplayed dots of the progress rail show on a dark terminal. Their color
+  almost matched the background.
+- Fireflies no longer stutter when they lift off at a pause or fly home at a
+  resume, and both flights are shorter. The Player draws them at about 60
+  frames per second instead of 20 and 30, and each flight eases in and out over
+  1.2 seconds. A light moves one or two braille dots per frame instead of up to
+  six, and the meadow is whole again 1.6 seconds after resuming instead of 1.7.
+
+### Added
+
+- `background = "auto"`, `"dark"`, or `"light"` in `config.toml`. `auto` asks
+  the terminal and falls back to `COLORFGBG`, then to dark.
+
+### Security
+
+- Updated `rustix` to 1.1.6 for RUSTSEC-2026-0486, an unsound xattr call.
+  Suzumushi's own code doesn't call the affected functions.
+
 ## [1.3.0] - 2026-11-10
 
 ### Fixed
