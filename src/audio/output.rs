@@ -52,7 +52,10 @@ pub(super) struct CpalOutput {
 struct OutputProgress {
     playing: AtomicBool,
     /// Silences output without changing the pause state, while a seek settles.
-    muted: AtomicBool,
+    /// Unrelated to the user's mute, which is a gain of zero. Nothing clears
+    /// it: the worker discards a silenced output once the seek settles or
+    /// playback stops.
+    seek_silenced: AtomicBool,
     /// Set by a callback that renders only silence after any fade-out, so the
     /// faded buffer before it has already been handed to the backend.
     silent: AtomicBool,
@@ -175,9 +178,11 @@ impl CpalOutput {
     /// Starts per-stream progress afresh, keeping a settling seek's silence
     /// so a replacement prepared mid-seek cannot become audible.
     fn renew_progress(&mut self) {
-        let silenced = self.progress.muted.load(Ordering::Acquire);
+        let silenced = self.progress.seek_silenced.load(Ordering::Acquire);
         self.progress = Arc::new(OutputProgress::new());
-        self.progress.muted.store(silenced, Ordering::Release);
+        self.progress
+            .seek_silenced
+            .store(silenced, Ordering::Release);
     }
 
     fn pause_backend(&mut self) -> Result<(), String> {
@@ -369,7 +374,7 @@ impl OutputStream for CpalOutput {
 
     fn silence(&mut self) {
         self.spectrum.clear();
-        self.progress.muted.store(true, Ordering::Release);
+        self.progress.seek_silenced.store(true, Ordering::Release);
     }
 
     fn service(&mut self) -> Result<(), String> {
@@ -536,7 +541,7 @@ where
         spectrum,
     } = context;
     let audible =
-        progress.playing.load(Ordering::Acquire) && !progress.muted.load(Ordering::Acquire);
+        progress.playing.load(Ordering::Acquire) && !progress.seek_silenced.load(Ordering::Acquire);
     if !audible && fade.is_silent() {
         output.fill(T::EQUILIBRIUM);
         progress.silent.store(true, Ordering::Release);
@@ -587,7 +592,7 @@ where
     }
     // A backend's partial trailing frame cannot consume source PCM.
     output_frames.into_remainder().fill(T::EQUILIBRIUM);
-    // A paused or muted fade-out tail must not repaint the cleared spectrum.
+    // A paused or seek-silenced fade-out tail must not repaint the cleared spectrum.
     if let Some(levels) = published.filter(|_| audible) {
         spectrum.publish(levels);
     }
@@ -1217,11 +1222,11 @@ mod tests {
     }
 
     #[test]
-    fn muting_fades_out_without_changing_the_pause_state() {
+    fn seek_silence_fades_out_without_changing_the_pause_state() {
         let mut consumer = constant_ring(4_096);
         let progress = playing_progress();
         let mut fade = super::Fade::instant();
-        progress.muted.store(true, Ordering::Release);
+        progress.seek_silenced.store(true, Ordering::Release);
 
         let output = render_constant(&mut consumer, &mut fade, &progress, 8);
 
@@ -1300,14 +1305,14 @@ mod tests {
         );
         device.silence();
         device.renew_progress();
-        assert!(device.progress.muted.load(Ordering::Acquire));
+        assert!(device.progress.seek_silenced.load(Ordering::Acquire));
 
         let mut fresh = CpalOutput::with_metrics(
             Arc::new(SpectrumLane::default()),
             Arc::new(AudioMetrics::default()),
         );
         fresh.renew_progress();
-        assert!(!fresh.progress.muted.load(Ordering::Acquire));
+        assert!(!fresh.progress.seek_silenced.load(Ordering::Acquire));
     }
 
     #[test]

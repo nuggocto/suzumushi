@@ -474,22 +474,64 @@ enum StartNotice {
     Seeked,
 }
 
+/// A decoded block the output has not taken in full, and how much it has taken.
+struct PendingPcm {
+    samples: Vec<f32>,
+    offset: usize,
+}
+
+/// How far one decoder's timeline has come.
+///
+/// The phase decides whether the worker may poll the decoder, write to the
+/// output, start it, or finish the track. Pause is not a phase: a track can be
+/// paused in any of them, including before its first sample reaches the output.
+enum Phase {
+    /// The decoder has not sent its format header yet.
+    AwaitingFormat,
+    /// The output is prepared for `info`, but no sample has reached it yet.
+    Priming {
+        info: DecodedInfo,
+        pending: Option<PendingPcm>,
+    },
+    /// Samples have reached the output and `Started` or `Seeked` was sent.
+    /// The decoder is polled only once `pending` is empty.
+    Streaming {
+        info: DecodedInfo,
+        pending: Option<PendingPcm>,
+    },
+    /// The decoder has ended and the output holds every sample. The track
+    /// finishes once the device has played them, not when the ring empties.
+    Draining { info: DecodedInfo },
+}
+
+impl Phase {
+    const fn info(&self) -> Option<DecodedInfo> {
+        match self {
+            Self::AwaitingFormat => None,
+            Self::Priming { info, .. } | Self::Streaming { info, .. } | Self::Draining { info } => {
+                Some(*info)
+            }
+        }
+    }
+
+    const fn started(&self) -> bool {
+        matches!(self, Self::Streaming { .. } | Self::Draining { .. })
+    }
+}
+
 struct ActivePlayback {
     generation: u64,
     timeline_revision: u64,
     file: File,
     decoder: Box<dyn DecoderStream>,
     output: Box<dyn OutputStream>,
-    info: Option<DecodedInfo>,
-    /// The track's length once any decoder has reported it. Unlike `info`, it
+    phase: Phase,
+    /// The track's length once any decoder has reported it. Unlike `phase`, it
     /// survives seek restarts, so a seek that arrives before the replacement
     /// decoder's header still recognizes the end of the track.
     duration: Option<Duration>,
     settings: PlaybackSettings,
-    pending: Option<(Vec<f32>, usize)>,
-    started: bool,
     paused: bool,
-    ended: bool,
     base_position: Duration,
     last_reported_position: Duration,
     start_notice: StartNotice,
@@ -608,13 +650,10 @@ impl<B: Backend> WorkerCore<B> {
                     file,
                     decoder,
                     output,
-                    info: None,
+                    phase: Phase::AwaitingFormat,
                     duration: None,
                     settings,
-                    pending: None,
-                    started: false,
                     paused,
-                    ended: false,
                     base_position: position,
                     last_reported_position: position,
                     start_notice: StartNotice::Started,
@@ -634,7 +673,7 @@ impl<B: Backend> WorkerCore<B> {
         if let Some(active) = self.matching_active(generation)
             && !active.paused
         {
-            let result = if active.started {
+            let result = if active.phase.started() {
                 active.output.pause()
             } else {
                 Ok(())
@@ -654,7 +693,7 @@ impl<B: Backend> WorkerCore<B> {
         if let Some(active) = self.matching_active(generation)
             && active.paused
         {
-            let result = if active.started {
+            let result = if active.phase.started() {
                 active.output.resume()
             } else {
                 Ok(())
@@ -739,9 +778,7 @@ impl<B: Backend> WorkerCore<B> {
             .filter(|active| active.generation == generation)
             .and_then(|active| {
                 active
-                    .info
-                    .and_then(|info| info.duration)
-                    .or(active.duration)
+                    .duration
                     .map(|duration| (duration, active.timeline_revision))
             })
         else {
@@ -758,16 +795,7 @@ impl<B: Backend> WorkerCore<B> {
             duration,
             Some(duration),
         );
-        match self.stop_active() {
-            Ok(()) => emit(events, AudioEvent::Finished { generation }),
-            Err(message) => emit(
-                events,
-                AudioEvent::Failed {
-                    generation,
-                    message,
-                },
-            ),
-        }
+        self.finish(events, generation);
         true
     }
 
@@ -837,37 +865,45 @@ impl<B: Backend> WorkerCore<B> {
         if self.write_pending(events, generation) {
             return true;
         }
-        if self.poll_decoder(events, generation) {
+        if self.poll_decoder(events, positions, generation) {
             return true;
         }
         self.finish_drained(events, positions, generation)
     }
 
+    /// Offers the pending block to the output. The first sample it accepts
+    /// starts the timeline: output plays unless paused, and `Started` or
+    /// `Seeked` is sent.
     fn write_pending(&mut self, events: &Sender<AudioEvent>, generation: u64) -> bool {
         let active = self.active.as_mut().expect("active playback is retained");
-        let Some((samples, mut offset)) = active.pending.take() else {
+        let priming = matches!(active.phase, Phase::Priming { .. });
+        let (info, pending) = match &mut active.phase {
+            Phase::Priming { info, pending } | Phase::Streaming { info, pending } => {
+                (*info, pending)
+            }
+            Phase::AwaitingFormat | Phase::Draining { .. } => return false,
+        };
+        let Some(mut block) = pending.take() else {
             return false;
         };
-        match active.output.write(&samples[offset..]) {
+        match active.output.write(&block.samples[block.offset..]) {
             Ok(0) => {
-                active.pending = Some((samples, offset));
+                *pending = Some(block);
                 false
             }
             Ok(written) => {
-                offset += written;
-                if !active.started {
+                block.offset += written;
+                let pending = (block.offset < block.samples.len()).then_some(block);
+                if priming {
                     if !active.paused
                         && let Err(message) = active.output.play()
                     {
                         self.fail(events, generation, &message);
                         return true;
                     }
-                    active.started = true;
-                    emit_started(active, events);
+                    emit_started(active, info, events);
                 }
-                if offset < samples.len() {
-                    active.pending = Some((samples, offset));
-                }
+                active.phase = Phase::Streaming { info, pending };
                 true
             }
             Err(message) => {
@@ -877,9 +913,19 @@ impl<B: Backend> WorkerCore<B> {
         }
     }
 
-    fn poll_decoder(&mut self, events: &Sender<AudioEvent>, generation: u64) -> bool {
+    fn poll_decoder(
+        &mut self,
+        events: &Sender<AudioEvent>,
+        positions: &PositionLane,
+        generation: u64,
+    ) -> bool {
         let active = self.active.as_mut().expect("active playback is retained");
-        if active.pending.is_some() || active.ended {
+        let wants_input = match &active.phase {
+            Phase::AwaitingFormat => true,
+            Phase::Priming { pending, .. } | Phase::Streaming { pending, .. } => pending.is_none(),
+            Phase::Draining { .. } => false,
+        };
+        if !wants_input {
             return false;
         }
         match active.decoder.poll() {
@@ -893,8 +939,7 @@ impl<B: Backend> WorkerCore<B> {
                 true
             }
             DecoderPoll::End => {
-                active.output.finish_input();
-                active.ended = true;
+                self.decoder_end(events, positions, generation);
                 true
             }
             DecoderPoll::Failed(message) => {
@@ -906,7 +951,7 @@ impl<B: Backend> WorkerCore<B> {
 
     fn decoder_ready(&mut self, events: &Sender<AudioEvent>, generation: u64, info: DecodedInfo) {
         let active = self.active.as_mut().expect("active playback is retained");
-        if active.info.is_some() {
+        if !matches!(active.phase, Phase::AwaitingFormat) {
             self.fail(events, generation, "decoder sent two format headers");
         } else if let Err(message) = active.output.prepare(info.format) {
             self.fail(events, generation, &message);
@@ -917,15 +962,27 @@ impl<B: Backend> WorkerCore<B> {
             active.base_position = info.position;
             active.last_reported_position = info.position;
             active.duration = info.duration.or(active.duration);
-            active.info = Some(info);
+            active.phase = Phase::Priming {
+                info,
+                pending: None,
+            };
         }
     }
 
     fn decoder_samples(&mut self, events: &Sender<AudioEvent>, generation: u64, samples: Vec<f32>) {
         let active = self.active.as_mut().expect("active playback is retained");
-        let invalid = if active.info.is_none() {
-            Some("decoder sent samples before its format")
-        } else if samples.is_empty() {
+        let pending = match &mut active.phase {
+            Phase::Priming { pending, .. } | Phase::Streaming { pending, .. } => pending,
+            Phase::AwaitingFormat => {
+                self.fail(events, generation, "decoder sent samples before its format");
+                return;
+            }
+            Phase::Draining { .. } => {
+                self.fail(events, generation, "decoder sent samples after its end");
+                return;
+            }
+        };
+        let invalid = if samples.is_empty() {
             Some("decoder sent an empty PCM block")
         } else if samples.iter().any(|sample| !sample.is_finite()) {
             Some("decoder sent a non-finite PCM sample")
@@ -935,7 +992,38 @@ impl<B: Backend> WorkerCore<B> {
         if let Some(message) = invalid {
             self.fail(events, generation, message);
         } else {
-            active.pending = Some((samples, 0));
+            *pending = Some(PendingPcm { samples, offset: 0 });
+        }
+    }
+
+    fn decoder_end(
+        &mut self,
+        events: &Sender<AudioEvent>,
+        positions: &PositionLane,
+        generation: u64,
+    ) {
+        let active = self.active.as_mut().expect("active playback is retained");
+        if let Phase::Streaming { info, .. } = active.phase {
+            active.output.finish_input();
+            active.phase = Phase::Draining { info };
+        } else if matches!(active.start_notice, StartNotice::Seeked) {
+            // A restart that decodes nothing was a seek to the very end, which
+            // completes the track.
+            let duration = active.duration;
+            Self::publish_specific_position(
+                positions,
+                generation,
+                active.timeline_revision,
+                duration.unwrap_or(active.base_position),
+                duration,
+            );
+            self.finish(events, generation);
+        } else {
+            self.fail(
+                events,
+                generation,
+                "track contained no decodable audio samples",
+            );
         }
     }
 
@@ -946,67 +1034,21 @@ impl<B: Backend> WorkerCore<B> {
         generation: u64,
     ) -> bool {
         let active = self.active.as_mut().expect("active playback is retained");
-        if !active.ended || active.pending.is_some() {
+        let Phase::Draining { info } = active.phase else {
             return false;
-        }
-        if !active.started {
-            // A restart that decodes nothing was a seek to the very end, which
-            // completes the track; a fresh track with no audio is broken.
-            if matches!(active.start_notice, StartNotice::Seeked) {
-                let duration = active.duration;
-                let position = duration.unwrap_or(active.base_position);
-                let timeline_revision = active.timeline_revision;
-                Self::publish_specific_position(
-                    positions,
-                    generation,
-                    timeline_revision,
-                    position,
-                    duration,
-                );
-                match self.stop_active() {
-                    Ok(()) => emit(events, AudioEvent::Finished { generation }),
-                    Err(message) => emit(
-                        events,
-                        AudioEvent::Failed {
-                            generation,
-                            message,
-                        },
-                    ),
-                }
-            } else {
-                self.fail(
-                    events,
-                    generation,
-                    "track contained no decodable audio samples",
-                );
-            }
-            return true;
-        }
+        };
         if !active.output.drained() {
             return false;
         }
-        let final_position = active
-            .info
-            .and_then(|info| info.duration)
-            .unwrap_or_else(|| position_for(active));
-        let duration = active.info.and_then(|info| info.duration);
+        let final_position = info.duration.unwrap_or_else(|| position_for(active));
         Self::publish_specific_position(
             positions,
             generation,
             active.timeline_revision,
             final_position,
-            duration,
+            info.duration,
         );
-        match self.stop_active() {
-            Ok(()) => emit(events, AudioEvent::Finished { generation }),
-            Err(message) => emit(
-                events,
-                AudioEvent::Failed {
-                    generation,
-                    message,
-                },
-            ),
-        }
+        self.finish(events, generation);
         true
     }
 
@@ -1034,13 +1076,10 @@ impl<B: Backend> WorkerCore<B> {
             file,
             decoder,
             output,
-            info: None,
+            phase: Phase::AwaitingFormat,
             duration: old.duration,
             settings: old.settings,
-            pending: None,
-            started: false,
             paused,
-            ended: false,
             base_position: position,
             last_reported_position: position,
             start_notice: StartNotice::Seeked,
@@ -1064,7 +1103,7 @@ impl<B: Backend> WorkerCore<B> {
             generation: active.generation,
             timeline_revision: active.timeline_revision,
             position,
-            duration: active.info.and_then(|info| info.duration),
+            duration: active.phase.info().and_then(|info| info.duration),
         };
         positions.replace(update);
         active.last_reported_position = position;
@@ -1119,6 +1158,18 @@ impl<B: Backend> WorkerCore<B> {
         );
     }
 
+    /// Ends the track as complete, or as failed if its cleanup fails.
+    fn finish(&mut self, events: &Sender<AudioEvent>, generation: u64) {
+        let event = match self.stop_active() {
+            Ok(()) => AudioEvent::Finished { generation },
+            Err(message) => AudioEvent::Failed {
+                generation,
+                message,
+            },
+        };
+        emit(events, event);
+    }
+
     fn stop_active(&mut self) -> Result<(), String> {
         self.pending_seek = None;
         let Some(mut active) = self.active.take() else {
@@ -1130,10 +1181,7 @@ impl<B: Backend> WorkerCore<B> {
     }
 }
 
-fn emit_started(active: &mut ActivePlayback, events: &Sender<AudioEvent>) {
-    let info = active
-        .info
-        .expect("samples require prepared decoder information");
+fn emit_started(active: &ActivePlayback, info: DecodedInfo, events: &Sender<AudioEvent>) {
     let generation = active.generation;
     let timeline_revision = active.timeline_revision;
     let event = match active.start_notice {
@@ -1162,7 +1210,7 @@ fn combine_cleanup_errors(left: Option<String>, right: Option<String>) -> Option
 }
 
 fn position_for(active: &ActivePlayback) -> Duration {
-    let Some(info) = active.info else {
+    let Some(info) = active.phase.info() else {
         return active.base_position;
     };
     let frames = u128::from(active.output.consumed_frames());
@@ -1255,7 +1303,7 @@ fn emit(events: &Sender<AudioEvent>, event: AudioEvent) {
 mod tests {
     use std::collections::VecDeque;
     use std::fs::File;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::mpsc::TryRecvError;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
@@ -1285,6 +1333,8 @@ mod tests {
 
     struct FakeOutput {
         calls: Arc<Mutex<Vec<&'static str>>>,
+        /// The most samples one write accepts, so a test can fill the ring.
+        accepts: Arc<AtomicUsize>,
         drained: Arc<AtomicBool>,
         consumed_frames: Arc<AtomicU64>,
         gains: Arc<Mutex<Vec<(u8, bool)>>>,
@@ -1306,7 +1356,7 @@ mod tests {
 
         fn write(&mut self, samples: &[f32]) -> Result<usize, String> {
             self.calls.lock().expect("fake output log").push("write");
-            Ok(samples.len())
+            Ok(samples.len().min(self.accepts.load(Ordering::Acquire)))
         }
 
         fn finish_input(&mut self) {
@@ -1361,6 +1411,7 @@ mod tests {
         scripts: VecDeque<VecDeque<DecoderPoll>>,
         decoder_stopped: Arc<AtomicBool>,
         calls: Arc<Mutex<Vec<&'static str>>>,
+        accepts: Arc<AtomicUsize>,
         drained: Arc<AtomicBool>,
         consumed_frames: Arc<AtomicU64>,
         gains: Arc<Mutex<Vec<(u8, bool)>>>,
@@ -1380,6 +1431,7 @@ mod tests {
                 }),
                 Box::new(FakeOutput {
                     calls: Arc::clone(&self.calls),
+                    accepts: Arc::clone(&self.accepts),
                     drained: Arc::clone(&self.drained),
                     consumed_frames: Arc::clone(&self.consumed_frames),
                     gains: Arc::clone(&self.gains),
@@ -1392,6 +1444,7 @@ mod tests {
         let fixture = FakeFixture {
             decoder_stopped: Arc::new(AtomicBool::new(false)),
             calls: Arc::new(Mutex::new(Vec::new())),
+            accepts: Arc::new(AtomicUsize::new(usize::MAX)),
             drained: Arc::new(AtomicBool::new(false)),
             consumed_frames: Arc::new(AtomicU64::new(0)),
             gains: Arc::new(Mutex::new(Vec::new())),
@@ -1402,6 +1455,7 @@ mod tests {
                 scripts: VecDeque::from([script]),
                 decoder_stopped: Arc::clone(&fixture.decoder_stopped),
                 calls: Arc::clone(&fixture.calls),
+                accepts: Arc::clone(&fixture.accepts),
                 drained: Arc::clone(&fixture.drained),
                 consumed_frames: Arc::clone(&fixture.consumed_frames),
                 gains: Arc::clone(&fixture.gains),
@@ -1414,6 +1468,7 @@ mod tests {
     struct FakeFixture {
         decoder_stopped: Arc<AtomicBool>,
         calls: Arc<Mutex<Vec<&'static str>>>,
+        accepts: Arc<AtomicUsize>,
         drained: Arc<AtomicBool>,
         consumed_frames: Arc<AtomicU64>,
         gains: Arc<Mutex<Vec<(u8, bool)>>>,
@@ -2170,6 +2225,142 @@ mod tests {
                 .expect("open log")
                 .as_slice(),
             [Duration::ZERO, Duration::from_millis(750)]
+        );
+    }
+
+    fn play_fresh<B: Backend>(
+        core: &mut WorkerCore<B>,
+        events: &std::sync::mpsc::Sender<AudioEvent>,
+        positions: &PositionLane,
+        generation: u64,
+    ) {
+        core.command(
+            AudioCommand::Play {
+                generation,
+                file: harmless_file(),
+                position: Duration::ZERO,
+                settings: PlaybackSettings::default(),
+                paused: false,
+            },
+            events,
+            positions,
+        )
+        .expect("start fake playback");
+    }
+
+    #[test]
+    fn a_fresh_track_fails_when_its_decoder_breaks_the_stream_contract() {
+        let format = AudioFormat {
+            sample_rate: 48_000,
+            channels: 1,
+        };
+        let no_audio = "track contained no decodable audio samples";
+        let cases = [
+            (no_audio, vec![DecoderPoll::End]),
+            (
+                no_audio,
+                vec![DecoderPoll::Ready(decoded(format)), DecoderPoll::End],
+            ),
+            (
+                "decoder sent two format headers",
+                vec![
+                    DecoderPoll::Ready(decoded(format)),
+                    DecoderPoll::Ready(decoded(format)),
+                ],
+            ),
+            (
+                "decoder sent samples before its format",
+                vec![DecoderPoll::Samples(vec![0.1])],
+            ),
+            (
+                "decoder sent an empty PCM block",
+                vec![
+                    DecoderPoll::Ready(decoded(format)),
+                    DecoderPoll::Samples(Vec::new()),
+                ],
+            ),
+            (
+                "decoder sent a non-finite PCM sample",
+                vec![
+                    DecoderPoll::Ready(decoded(format)),
+                    DecoderPoll::Samples(vec![f32::NAN]),
+                ],
+            ),
+        ];
+        for (expected, script) in cases {
+            let (backend, fixture) = fixture_backend(VecDeque::from(script));
+            let mut core = WorkerCore::new(backend);
+            let (events, received) = channel();
+            let positions = PositionLane::default();
+            play_fresh(&mut core, &events, &positions, 12);
+            drive_steps(&mut core, &events, &positions, 4);
+
+            assert_eq!(
+                received.try_iter().collect::<Vec<_>>(),
+                [AudioEvent::Failed {
+                    generation: 12,
+                    message: expected.into(),
+                }],
+                "{expected}"
+            );
+            assert!(core.active.is_none(), "{expected}");
+            assert!(
+                fixture.decoder_stopped.load(Ordering::Acquire),
+                "{expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_full_output_holds_the_decoder_until_its_block_is_written() {
+        let format = AudioFormat {
+            sample_rate: 48_000,
+            channels: 1,
+        };
+        let (backend, fixture) = fixture_backend(VecDeque::from([
+            DecoderPoll::Ready(decoded(format)),
+            DecoderPoll::Samples(vec![0.1; 4]),
+            DecoderPoll::End,
+        ]));
+        let mut core = WorkerCore::new(backend);
+        let (events, received) = channel();
+        let positions = PositionLane::default();
+        fixture.accepts.store(0, Ordering::Release);
+        play_fresh(&mut core, &events, &positions, 13);
+        drive_steps(&mut core, &events, &positions, 4);
+
+        assert!(
+            received.try_recv().is_err(),
+            "nothing starts before a sample reaches the output"
+        );
+        assert!(
+            !fixture
+                .calls
+                .lock()
+                .expect("fake output calls")
+                .contains(&"play")
+        );
+
+        // One sample per write: three writes leave the block's last sample.
+        fixture.accepts.store(1, Ordering::Release);
+        drive_steps(&mut core, &events, &positions, 3);
+        assert!(matches!(
+            received.try_recv(),
+            Ok(AudioEvent::Started { generation: 13, .. })
+        ));
+        assert!(
+            !fixture
+                .calls
+                .lock()
+                .expect("fake output calls")
+                .contains(&"finish_input"),
+            "the decoder is not polled while part of its block is unwritten"
+        );
+
+        drive_steps(&mut core, &events, &positions, 2);
+        assert_eq!(
+            fixture.calls.lock().expect("fake output calls").last(),
+            Some(&"finish_input")
         );
     }
 }
