@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.1] - 2026-11-21
+
+### Fixed
+
+- Resizing the terminal during playback no longer aborts the track when
+  `SIGWINCH` interrupts the decoder output poller.
+- An interrupted poll while asking the terminal for its background color at
+  startup now retries polling instead of falling through into a blocking read
+  past the 300 ms deadline.
+- Terminal integration tests detach from an inherited controlling `/dev/tty`
+  when run from an interactive terminal, and avoid a redraw race on static
+  startup cells.
+
+### Changed
+
+- Removed the leftover `async-io` and `futures-lite` dependencies and their
+  extra reactor thread; the D-Bus startup timeout now uses `zruntime`, already
+  provided by `zbus` 6.
+- Release builds optimize for size (`opt-level = "s"`), reducing the stripped
+  Linux binary by about 1 MiB (~23%).
+- Metadata cache saves estimate their buffer size from entry count instead of
+  reserving the full 4 MiB ceiling unconditionally.
+- Bound the metadata helper process lifetime to its parent with
+  `PR_SET_PDEATHSIG`, matching the audio decoder helper.
+
 ## [1.4.0] - 2026-11-12
 
 ### Fixed

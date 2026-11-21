@@ -8,9 +8,10 @@ use std::os::fd::AsFd;
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
+use rustix::io::Errno;
 use rustix::process::{Pid, Resource, Rlimit, Signal, setrlimit};
 use symphonia::core::audio::GenericAudioBufferRef;
 use symphonia::core::codecs::audio::AudioDecoderOptions;
@@ -239,18 +240,26 @@ fn read_exact_with_progress(
     mut buffer: &mut [u8],
     timeout: Duration,
 ) -> Result<(), String> {
-    let seconds = i64::try_from(timeout.as_secs()).unwrap_or(i64::MAX);
-    let nanoseconds = i64::from(timeout.subsec_nanos());
-    let timeout = Timespec {
-        tv_sec: seconds,
-        tv_nsec: nanoseconds,
-    };
+    let deadline = Instant::now() + timeout;
     while !buffer.is_empty() {
-        let mut descriptor = [PollFd::new(reader, PollFlags::IN)];
-        let ready = poll(&mut descriptor, Some(&timeout))
-            .map_err(|error| format!("cannot poll decoder helper output: {error}"))?;
-        if ready == 0 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             return Err("decoder helper made no output progress and was stopped".into());
+        }
+        let poll_timeout = Timespec {
+            tv_sec: i64::try_from(remaining.as_secs()).unwrap_or(i64::MAX),
+            tv_nsec: i64::from(remaining.subsec_nanos()),
+        };
+        let mut descriptor = [PollFd::new(reader, PollFlags::IN)];
+        match poll(&mut descriptor, Some(&poll_timeout)) {
+            Ok(0) => {
+                return Err("decoder helper made no output progress and was stopped".into());
+            }
+            Ok(_) => {}
+            Err(Errno::INTR) => continue,
+            Err(error) => {
+                return Err(format!("cannot poll decoder helper output: {error}"));
+            }
         }
         match reader.read(buffer) {
             Ok(0) => return Err("decoder helper output ended early".into()),

@@ -45,7 +45,7 @@ On x86-64 NixOS with Nix installed, add the repository flake to your user profil
 
 ```sh
 nix --extra-experimental-features 'nix-command flakes' \
-  profile add github:nuggocto/suzumushi/v1.4.0
+  profile add github:nuggocto/suzumushi/v1.4.1
 ```
 
 This installs both `suzumushi` and `suzu`. Nix builds from source with pinned
@@ -66,19 +66,19 @@ and local build checks.
 ## Install the release archive by hand
 
 To check each step yourself, download the archive and `SHA256SUMS` from the
-[`v1.4.0` release](https://github.com/nuggocto/suzumushi/releases/tag/v1.4.0):
+[`v1.4.1` release](https://github.com/nuggocto/suzumushi/releases/tag/v1.4.1):
 
 ```sh
 curl -fLO \
-  'https://github.com/nuggocto/suzumushi/releases/download/v1.4.0/{SHA256SUMS,suzumushi-v1.4.0-x86_64-unknown-linux-gnu.tar.xz}'
+  'https://github.com/nuggocto/suzumushi/releases/download/v1.4.1/{SHA256SUMS,suzumushi-v1.4.1-x86_64-unknown-linux-gnu.tar.xz}'
 ```
 
 Then verify and install the downloaded archive:
 
 ```sh
 sha256sum --check --ignore-missing SHA256SUMS
-tar -xf suzumushi-v1.4.0-x86_64-unknown-linux-gnu.tar.xz
-cd suzumushi-v1.4.0-x86_64-unknown-linux-gnu
+tar -xf suzumushi-v1.4.1-x86_64-unknown-linux-gnu.tar.xz
+cd suzumushi-v1.4.1-x86_64-unknown-linux-gnu
 sudo install -Dm755 suzumushi /usr/local/bin/suzumushi
 sudo ln -s suzumushi /usr/local/bin/suzu
 ```
@@ -267,7 +267,7 @@ automatic resampling are not current support claims.
 
 ## Status
 
-Version `1.4.0` is the current stable release. The release workflow builds and
+Version `1.4.1` is the current stable release. The release workflow builds and
 verifies its Linux archive from the tag before GitHub publishes it. Arch users
 can install the matching `suzumushi-bin` package from AUR.
 

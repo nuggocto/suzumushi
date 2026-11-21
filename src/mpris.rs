@@ -261,21 +261,16 @@ async fn connect_with_timeout(
     builder: connection::Builder<'_>,
     timeout: Duration,
 ) -> Result<zbus::Connection, String> {
+    let runtime = zruntime::SharedRuntime::current()
+        .map_err(|error| format!("cannot start session bus timer: {error}"))?;
     // Dropping the losing build future closes its socket and cancels setup.
     // The worker then returns its startup error and can be joined normally.
-    futures_lite::future::or(
-        async {
-            builder.build().await.map_err(|error| match error {
-                zbus::Error::NameTaken => NAME_TAKEN.to_owned(),
-                other => other.to_string(),
-            })
-        },
-        async {
-            async_io::Timer::after(timeout).await;
-            Err("session bus connection timed out".into())
-        },
-    )
-    .await
+    match runtime.timeout(timeout, builder.build()).await {
+        Ok(Ok(connection)) => Ok(connection),
+        Ok(Err(zbus::Error::NameTaken)) => Err(NAME_TAKEN.to_owned()),
+        Ok(Err(other)) => Err(other.to_string()),
+        Err(_) => Err("session bus connection timed out".into()),
+    }
 }
 
 struct RootInterface {
@@ -825,8 +820,10 @@ mod tests {
 
     async fn exercise_desktop_connection(client: UnixStream) {
         use std::collections::HashMap;
+        use std::future::poll_fn;
+        use std::pin::Pin;
 
-        use futures_lite::StreamExt;
+        use futures_core::Stream;
         use zbus::{MessageStream, OwnedVariant};
 
         let connection = zbus::connection::Builder::unix_stream(client)
@@ -876,8 +873,7 @@ mod tests {
         let mut changed = false;
         let mut seeked = false;
         while !changed || !seeked {
-            let message = messages
-                .next()
+            let message = poll_fn(|context| Pin::new(&mut messages).poll_next(context))
                 .await
                 .expect("signal stream")
                 .expect("message");
@@ -906,13 +902,12 @@ mod tests {
     fn live_connection_serves_idle_requests_and_publishes_state_changes() {
         let (server, client) = UnixStream::pair().expect("isolated desktop connection");
         let client = std::thread::spawn(move || {
-            zbus::block_on(futures_lite::future::or(
-                exercise_desktop_connection(client),
-                async {
-                    async_io::Timer::after(Duration::from_secs(5)).await;
-                    panic!("desktop connection stopped making progress");
-                },
-            ));
+            let runtime = zruntime::SharedRuntime::current().expect("shared runtime");
+            runtime
+                .block_on(
+                    runtime.timeout(Duration::from_secs(5), exercise_desktop_connection(client)),
+                )
+                .expect("desktop connection stopped making progress");
         });
         let builder = zbus::connection::Builder::unix_stream(server)
             .server(zbus::Guid::generate())

@@ -15,7 +15,7 @@ use lofty::file::TaggedFileExt;
 use lofty::probe::Probe;
 use lofty::tag::{Accessor, ItemKey};
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
-use rustix::process::{Pid, PidfdFlags, Resource, Rlimit, pidfd_open, setrlimit};
+use rustix::process::{Pid, PidfdFlags, Resource, Rlimit, Signal, pidfd_open, setrlimit};
 use serde::{Deserialize, Serialize};
 
 use crate::errors::{AppError, AppResult};
@@ -300,6 +300,11 @@ fn emit_reply(reply: &HelperReply) -> Result<(), String> {
 }
 
 fn apply_helper_limits() -> Result<(), String> {
+    rustix::process::set_parent_process_death_signal(Some(Signal::KILL))
+        .map_err(|error| format!("cannot bind helper lifetime to its parent: {error}"))?;
+    if rustix::process::getppid().is_none_or(Pid::is_init) {
+        return Err("metadata parent exited during helper startup".into());
+    }
     for (resource, value) in [
         (Resource::Cpu, 2),
         (Resource::As, 256 * 1_048_576),

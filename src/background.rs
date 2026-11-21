@@ -72,7 +72,8 @@ fn read_reply(input: BorrowedFd<'_>, deadline: Instant) -> Vec<u8> {
         }
         match poll(&mut [PollFd::new(&input, PollFlags::IN)], Some(&timeout)) {
             Ok(0) => break,
-            Ok(_) | Err(Errno::INTR) => {}
+            Ok(_) => {}
+            Err(Errno::INTR) => continue,
             Err(_) => break,
         }
         match rustix::io::read(input, &mut buffer) {

@@ -581,7 +581,9 @@ fn a_chosen_background_or_mono_theme_asks_the_terminal_nothing() {
             .env_remove("COLORFGBG");
         let (mut master, mut child) = spawn_in_pty(&mut command, 80, 24);
         let mut transcript = read_pty_until(&mut master, &mut child, b"Library");
-        if let Some(dew) = expected {
+        if let Some(dew) = expected
+            && !byte_contains(&transcript, dew)
+        {
             transcript.extend(read_pty_until(&mut master, &mut child, dew));
         }
         master.write_all(b"q").expect("quit");
@@ -1002,7 +1004,28 @@ impl Fixture {
 /// Starts `command` on a fresh pseudoterminal and returns its master side.
 fn spawn_in_pty(command: &mut Command, width: u16, height: u16) -> (File, Child) {
     let (master, slave) = open_test_pty(width, height);
-    let child = command
+    let mut detached;
+    // crossterm queries `/dev/tty` before `stdout` for terminal size, so an
+    // inherited controlling terminal hides test PTY resizes. Start the child in
+    // a new session when the test runner itself has `/dev/tty`.
+    let launch = if File::open("/dev/tty").is_ok() {
+        detached = Command::new("setsid");
+        detached.arg("--").arg(command.get_program());
+        detached.args(command.get_args());
+        if let Some(dir) = command.get_current_dir() {
+            detached.current_dir(dir);
+        }
+        for (key, value) in command.get_envs() {
+            match value {
+                Some(value) => detached.env(key, value),
+                None => detached.env_remove(key),
+            };
+        }
+        &mut detached
+    } else {
+        command
+    };
+    let child = launch
         .stdin(Stdio::from(duplicate_file(&slave)))
         .stdout(Stdio::from(duplicate_file(&slave)))
         .stderr(Stdio::from(slave))

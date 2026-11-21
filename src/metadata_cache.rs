@@ -179,7 +179,11 @@ impl CachedMetadataReader {
         let mut store = StateStore::open(root, path)?;
         drop(store.open_file(CACHE_FILE, "metadata cache")?);
         let mut bytes = Vec::new();
-        bytes.try_reserve_exact(MAX_CACHE_BYTES).map_err(|error| {
+        let estimated = HEADER
+            .len()
+            .saturating_add(self.entries.len().saturating_mul(256))
+            .min(MAX_CACHE_BYTES);
+        bytes.try_reserve_exact(estimated).map_err(|error| {
             crate::errors::AppError::Resource(format!("cannot reserve metadata cache: {error}"))
         })?;
         bytes.extend_from_slice(HEADER.as_bytes());
