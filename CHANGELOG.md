@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.2] - 2026-11-22
+
+### Fixed
+
+- `SIGTERM`, `SIGHUP`, and `SIGINT` now trigger an orderly shutdown that
+  restores terminal modes and saves the resume checkpoint instead of leaving
+  the terminal in raw mode and alternate screen.
+- Failed launches, unsupported session schema versions, missing tracks, and
+  partial session restores leave the saved `state/session.json` file untouched
+  until you edit the Queue.
+- CBR MP3 duration estimation and seeking now subtract leading ID3v2 tag bytes
+  before probing and seeking, fixing inflated durations and seek offsets on
+  MP3 files with large embedded tags or cover art.
+- Helper processes now clamp their `RLIMIT_CPU` and `RLIMIT_AS` caps against
+  inherited soft and hard limits instead of failing with `EPERM` under stricter
+  container, systemd, or shell `ulimit` environments.
+- Hardened `install.sh` against partial-download truncation on the final line
+  by wrapping the entrypoint call in `{ main "$@"; }`, and expanded installer
+  verification to test every byte offset of the final line.
+
+### Changed
+
+- Shuffle playback now advances in O(1) via a tracked cursor instead of
+  scanning the shuffle order on each track change.
+- Removed a redundant full library sort at the end of scanning (entries are
+  already emitted in natural traversal order) and avoided extra per-read work
+  in the decoder when no hidden FLAC headers are active.
+- Documented the one-minute per-startup metadata budget, preserved session
+  checkpoint behavior, and signal-triggered shutdown in the README and
+  architecture guide.
+
 ## [1.4.1] - 2026-11-21
 
 ### Fixed

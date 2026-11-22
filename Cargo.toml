@@ -1,6 +1,6 @@
 [package]
 name = "suzumushi"
-version = "1.4.1"
+version = "1.4.2"
 edition = "2024"
 rust-version = "1.95.0"
 description = "A calm, fully local terminal audio player for Linux"
@@ -19,6 +19,7 @@ rtrb = { version = "0.3.5", default-features = false, features = ["std"] }
 rustix = { version = "1.1.6", default-features = false, features = ["event", "fs", "process", "std"] }
 serde = { version = "1.0.229", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
+signal-hook = { version = "0.3.18", default-features = false }
 symphonia = { version = "0.6.1", default-features = false, features = ["flac", "mp3", "ogg", "pcm", "vorbis", "wav"] }
 thiserror = { version = "2.0.20", default-features = false }
 toml = { version = "1.1.4", default-features = false, features = ["parse", "serde", "std"] }

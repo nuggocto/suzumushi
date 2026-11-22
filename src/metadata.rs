@@ -15,7 +15,7 @@ use lofty::file::TaggedFileExt;
 use lofty::probe::Probe;
 use lofty::tag::{Accessor, ItemKey};
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
-use rustix::process::{Pid, PidfdFlags, Resource, Rlimit, Signal, pidfd_open, setrlimit};
+use rustix::process::{Pid, PidfdFlags, Resource, pidfd_open};
 use serde::{Deserialize, Serialize};
 
 use crate::errors::{AppError, AppResult};
@@ -300,28 +300,16 @@ fn emit_reply(reply: &HelperReply) -> Result<(), String> {
 }
 
 fn apply_helper_limits() -> Result<(), String> {
-    rustix::process::set_parent_process_death_signal(Some(Signal::KILL))
-        .map_err(|error| format!("cannot bind helper lifetime to its parent: {error}"))?;
-    if rustix::process::getppid().is_none_or(Pid::is_init) {
-        return Err("metadata parent exited during helper startup".into());
-    }
-    for (resource, value) in [
-        (Resource::Cpu, 2),
-        (Resource::As, 256 * 1_048_576),
-        (Resource::Nofile, 16),
-        (Resource::Core, 0),
-        (Resource::Fsize, 1_048_576),
-    ] {
-        setrlimit(
-            resource,
-            Rlimit {
-                current: Some(value),
-                maximum: Some(value),
-            },
-        )
-        .map_err(|error| format!("cannot apply helper resource limit: {error}"))?;
-    }
-    Ok(())
+    crate::apply_helper_limits(
+        "metadata",
+        &[
+            (Resource::Cpu, 2),
+            (Resource::As, 256 * 1_048_576),
+            (Resource::Nofile, 16),
+            (Resource::Core, 0),
+            (Resource::Fsize, 1_048_576),
+        ],
+    )
 }
 
 fn parse_reader<R: Read + Seek>(reader: R) -> Result<TrackTags, String> {

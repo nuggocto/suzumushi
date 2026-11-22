@@ -45,7 +45,7 @@ On x86-64 NixOS with Nix installed, add the repository flake to your user profil
 
 ```sh
 nix --extra-experimental-features 'nix-command flakes' \
-  profile add github:nuggocto/suzumushi/v1.4.1
+  profile add github:nuggocto/suzumushi/v1.4.2
 ```
 
 This installs both `suzumushi` and `suzu`. Nix builds from source with pinned
@@ -66,19 +66,19 @@ and local build checks.
 ## Install the release archive by hand
 
 To check each step yourself, download the archive and `SHA256SUMS` from the
-[`v1.4.1` release](https://github.com/nuggocto/suzumushi/releases/tag/v1.4.1):
+[`v1.4.2` release](https://github.com/nuggocto/suzumushi/releases/tag/v1.4.2):
 
 ```sh
 curl -fLO \
-  'https://github.com/nuggocto/suzumushi/releases/download/v1.4.1/{SHA256SUMS,suzumushi-v1.4.1-x86_64-unknown-linux-gnu.tar.xz}'
+  'https://github.com/nuggocto/suzumushi/releases/download/v1.4.2/{SHA256SUMS,suzumushi-v1.4.2-x86_64-unknown-linux-gnu.tar.xz}'
 ```
 
 Then verify and install the downloaded archive:
 
 ```sh
 sha256sum --check --ignore-missing SHA256SUMS
-tar -xf suzumushi-v1.4.1-x86_64-unknown-linux-gnu.tar.xz
-cd suzumushi-v1.4.1-x86_64-unknown-linux-gnu
+tar -xf suzumushi-v1.4.2-x86_64-unknown-linux-gnu.tar.xz
+cd suzumushi-v1.4.2-x86_64-unknown-linux-gnu
 sudo install -Dm755 suzumushi /usr/local/bin/suzumushi
 sudo ln -s suzumushi /usr/local/bin/suzu
 ```
@@ -138,8 +138,10 @@ The disposable cache at `state/metadata.jsonl` holds at most 4 MiB and 10,000
 entries. Delete it while the player is closed to force a fresh metadata read.
 `diagnose` can read the cache but never writes it.
 
-A first start on a large library reads every file's tags and shows a running
-track count until the player opens. Later starts use the cache.
+A first start on a large library reads uncached tags for up to one minute per
+startup while showing a running track count, then uses filenames for any
+remaining tracks with a warning. Later starts reuse the cache and pick up
+remaining uncached files.
 
 Press `Enter` on a Library folder to collapse or expand it. This only changes
 the current terminal view: search still finds tracks inside collapsed folders,
@@ -147,9 +149,12 @@ and the Queue and playback are untouched. Folder visibility resets when
 Suzumushi closes.
 
 The Queue, current track, and playback position are restored when the player
-reopens. Clearing the Queue also forgets the saved session. Playback remains
-paused until you press `Space`, or press `Enter` while Player or Queue is
-focused.
+reopens. Clearing the Queue also forgets the saved session. If a saved session
+cannot be restored cleanly (for example because some tracks are missing from
+the current scan or the file version is unsupported), Suzumushi preserves the
+original `state/session.json` untouched until you edit the Queue. Playback
+remains paused until you press `Space`, or press `Enter` while Player or Queue
+is focused.
 
 ## Keys
 
@@ -176,6 +181,9 @@ focused.
 | `?` | Open or close the built-in key guide |
 | `q` | Quit outside search |
 | `Ctrl+c` | Quit from anywhere |
+
+`SIGTERM`, `SIGHUP`, and `SIGINT` also restore the terminal and save the
+session cleanly before exiting.
 
 Search checks metadata, filenames, and paths. Pressing `Enter` queues the
 selected result. Pressing `Enter` on a playlist adds all of its tracks as one
@@ -267,7 +275,7 @@ automatic resampling are not current support claims.
 
 ## Status
 
-Version `1.4.1` is the current stable release. The release workflow builds and
+Version `1.4.2` is the current stable release. The release workflow builds and
 verifies its Linux archive from the tag before GitHub publishes it. Arch users
 can install the matching `suzumushi-bin` package from AUR.
 

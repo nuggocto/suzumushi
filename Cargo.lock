@@ -1658,7 +1658,7 @@ dependencies = [
 
 [[package]]
 name = "suzumushi"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "clap",
  "cpal",
@@ -1671,6 +1671,7 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "signal-hook",
  "symphonia",
  "tempfile",
  "thiserror 2.0.20",

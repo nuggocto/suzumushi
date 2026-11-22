@@ -30,8 +30,11 @@ background, the first focused view, and three scan behaviors. Capacity limits ar
 
 `src/state.rs` writes `state/session.json`, the resume checkpoint. The event loop
 writes it when the queue or current track changes, every five seconds at most
-while the position moves, and once at exit. A stopped or paused session writes
-nothing.
+while the position moves, and at exit if the checkpoint changed since the last
+write. A stopped or paused session writes nothing. When startup restore is
+inconclusive (an unsupported or malformed file, no matching tracks, or skipped
+entries), the existing `session.json` is preserved untouched across startup,
+playback, and shutdown until the user deliberately edits the queue.
 
 ## Player stage
 
@@ -89,7 +92,9 @@ At 1 MiB the file becomes `suzumushi.log.1`, replacing the previous archive.
 Release builds abort on panic. The terminal session installs a panic hook that
 restores the terminal before the message prints, and each helper process
 installs one that exits quietly, so a malformed file never produces a crash
-report.
+report. `SIGTERM`, `SIGHUP`, and `SIGINT` route through the event loop to
+restore the terminal and flush the final checkpoint; once teardown starts (or
+if a second signal arrives), signals fall back to their default handler.
 
 ## Verification
 

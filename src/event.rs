@@ -37,13 +37,23 @@ impl EventSource {
     ///
     /// Returns an error when the terminal event stream cannot be polled or read.
     pub fn next(&self, frame: Duration) -> AppResult<AppEvent> {
-        if !event::poll(frame.min(MAX_POLL))
-            .map_err(|error| AppError::io("poll terminal input", "terminal", error))?
-        {
+        let ready = match event::poll(frame.min(MAX_POLL)) {
+            Ok(ready) => ready,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                return Ok(AppEvent::Tick(self.elapsed()));
+            }
+            Err(error) => return Err(AppError::io("poll terminal input", "terminal", error)),
+        };
+        if !ready {
             return Ok(AppEvent::Tick(self.elapsed()));
         }
-        let event = event::read()
-            .map_err(|error| AppError::io("read terminal input", "terminal", error))?;
+        let event = match event::read() {
+            Ok(event) => event,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                return Ok(AppEvent::Tick(self.elapsed()));
+            }
+            Err(error) => return Err(AppError::io("read terminal input", "terminal", error)),
+        };
         let now = self.elapsed();
         Ok(match event {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {

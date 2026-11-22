@@ -19,7 +19,7 @@ use rustix::fs::{CWD, Mode, OFlags, mkfifoat};
 use rustix::process::{PidfdFlags, pidfd_open};
 use rustix::process::{Signal, kill_process, kill_process_group};
 use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
-use rustix::termios::{Pid, Winsize, tcsetwinsize};
+use rustix::termios::{LocalModes, Pid, Winsize, tcgetattr, tcsetwinsize};
 use tempfile::TempDir;
 
 const FOCUSED_PLAYER: &[u8] = b"> Player";
@@ -581,10 +581,8 @@ fn a_chosen_background_or_mono_theme_asks_the_terminal_nothing() {
             .env_remove("COLORFGBG");
         let (mut master, mut child) = spawn_in_pty(&mut command, 80, 24);
         let mut transcript = read_pty_until(&mut master, &mut child, b"Library");
-        if let Some(dew) = expected
-            && !byte_contains(&transcript, dew)
-        {
-            transcript.extend(read_pty_until(&mut master, &mut child, dew));
+        if let Some(dew) = expected {
+            read_pty_into_until(&mut master, &mut child, &mut transcript, dew);
         }
         master.write_all(b"q").expect("quit");
         transcript.extend(read_pty_to_exit(&mut master, &mut child));
@@ -636,6 +634,161 @@ fn diagnose_output_into_a_closed_pipe_is_not_an_error() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{}: {stderr}", output.status);
     assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn sigterm_restores_terminal_modes_and_saves_session() {
+    let fixture = Fixture::new();
+    fixture.add_tagged_track("night.mp3");
+
+    let (mut master, mut child) = fixture.spawn_terminal();
+    let mut transcript = read_pty_until(&mut master, &mut child, b"Night Song");
+    master.write_all(b"\r").expect("queue the track");
+    read_pty_into_until(&mut master, &mut child, &mut transcript, FIRST_QUEUE_ITEM);
+
+    let during = tcgetattr(&master).expect("termios during raw mode");
+    assert!(
+        !during.local_modes.contains(LocalModes::ICANON),
+        "raw mode disables canonical input while running"
+    );
+
+    let raw_pid = i32::try_from(child.id()).expect("child PID fits i32");
+    let pid = Pid::from_raw(raw_pid).expect("child PID is positive");
+    kill_process(pid, Signal::TERM).expect("send SIGTERM");
+
+    transcript.extend(read_pty_to_exit(&mut master, &mut child));
+    let after = tcgetattr(&master).expect("termios after SIGTERM");
+    assert!(
+        after.local_modes.contains(LocalModes::ICANON)
+            && after.local_modes.contains(LocalModes::ECHO),
+        "SIGTERM must restore terminal canonical and echo modes: {:?}",
+        after.local_modes
+    );
+    assert!(
+        byte_contains(&transcript, b"\x1b[?1049l"),
+        "SIGTERM must leave alternate screen"
+    );
+    let saved: serde_json::Value = serde_json::from_slice(
+        &fs::read(fixture.root.join("state/session.json")).expect("saved session after SIGTERM"),
+    )
+    .expect("valid session JSON");
+    assert_eq!(saved["queue_entry_ids"].as_array().map(Vec::len), Some(1));
+}
+
+#[test]
+fn failed_launch_and_inconclusive_restore_preserve_saved_session() {
+    let fixture = Fixture::new();
+    let track = fixture.root.join("audio/library/night.mp3");
+    fixture.add_tagged_track("night.mp3");
+
+    // Save a session with one track.
+    let (mut master, mut child) = fixture.spawn_terminal();
+    let mut transcript = read_pty_until(&mut master, &mut child, b"Night Song");
+    master.write_all(b"\r").expect("queue the track");
+    read_pty_into_until(&mut master, &mut child, &mut transcript, FIRST_QUEUE_ITEM);
+    master.write_all(b"q").expect("quit");
+    read_pty_to_exit(&mut master, &mut child);
+
+    let session_path = fixture.root.join("state/session.json");
+    let saved_bytes = fs::read(&session_path).expect("saved session");
+
+    // Temporarily move the track away and launch without a TTY (fails entering raw mode).
+    // Mirror `spawn_in_pty`: only wrap in `setsid` when this test process has `/dev/tty`,
+    // so sandboxes without `setsid` or `/dev/tty` run the binary directly.
+    let moved = fixture.root.join("night.mp3.bak");
+    fs::rename(&track, &moved).expect("temporarily move track");
+    let run_without_tty = || {
+        if File::open("/dev/tty").is_ok() {
+            let mut command = Command::new("setsid");
+            command
+                .arg("--wait")
+                .arg("--")
+                .arg(env!("CARGO_BIN_EXE_suzumushi"))
+                .arg("--root")
+                .arg(&fixture.root)
+                .env("XDG_RUNTIME_DIR", &fixture.runtime)
+                .env("TERM", "xterm-256color")
+                .env_remove("DBUS_SESSION_BUS_ADDRESS")
+                .env_remove("NO_COLOR");
+            output_with_timeout(&mut command)
+        } else {
+            let mut command = fixture.command();
+            output_with_timeout(&mut command)
+        }
+    };
+    let failed = run_without_tty();
+    assert!(!failed.status.success(), "non-TTY launch should fail");
+    assert_eq!(
+        fs::read(&session_path).expect("session must survive failed launch"),
+        saved_bytes
+    );
+
+    // Put the track back and verify the saved queue restores cleanly.
+    fs::rename(&moved, &track).expect("restore track");
+    let (mut master, mut child) = fixture.spawn_terminal();
+    let mut transcript = read_pty_until(&mut master, &mut child, b"Stopped");
+    master.write_all(b"q").expect("quit");
+    transcript.extend(read_pty_to_exit(&mut master, &mut child));
+    assert!(byte_contains(&transcript, b"1."));
+    assert!(byte_contains(&transcript, b"Night"));
+    assert!(!byte_contains(&transcript, b"Queue is empty"));
+
+    // An unsupported session version must also survive a failed launch untouched.
+    let future_session =
+        br#"{"version":2,"queue_entry_ids":[1],"current_index":0,"position_ms":0}"#;
+    fs::write(&session_path, future_session).expect("write future version session");
+    fs::set_permissions(&session_path, fs::Permissions::from_mode(0o600))
+        .expect("private session permissions");
+    let failed = run_without_tty();
+    assert!(!failed.status.success());
+    assert_eq!(
+        fs::read(&session_path).expect("unsupported version session must survive"),
+        future_session
+    );
+}
+
+#[test]
+fn helpers_succeed_under_stricter_inherited_cpu_limit() {
+    let fixture = Fixture::new();
+    let mp3 = fixture.root.join("audio/library/tone.mp3");
+    fs::copy("tests/fixtures/audio/tone.mp3", &mp3).expect("copy audio fixture");
+    let exe = env!("CARGO_BIN_EXE_suzumushi");
+
+    let mut diagnose = Command::new("sh");
+    diagnose.args([
+        "-c",
+        r#"ulimit -S -t 10 && ulimit -H -t 10 && exec "$1" --root "$2" diagnose"#,
+        "sh",
+        exe,
+    ]);
+    diagnose.arg(&fixture.root);
+    let output = output_with_timeout(&mut diagnose);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "diagnose failed under strict CPU limit: {stderr}"
+    );
+    assert!(stdout.contains("warnings: 0"), "{stdout}");
+
+    let mut decode = Command::new("sh");
+    decode.args([
+        "-c",
+        r#"ulimit -S -t 10 && ulimit -H -t 10 && exec "$1" __audio-decode-helper 0 < "$2""#,
+        "sh",
+        exe,
+    ]);
+    decode.arg(&mp3);
+    let output = output_with_timeout(&mut decode);
+    assert!(
+        output.status.success(),
+        "decoder helper failed under strict CPU limit: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout.starts_with(b"SUZPCM02"),
+        "decoder helper must emit PCM header under strict CPU limit"
+    );
 }
 
 #[test]
@@ -1085,23 +1238,38 @@ fn read_pty_until(master: &mut File, child: &mut Child, needle: &[u8]) -> Vec<u8
     read_pty_until_with_timeout(master, child, needle, Duration::from_secs(2))
 }
 
+fn read_pty_into_until(master: &mut File, child: &mut Child, bytes: &mut Vec<u8>, needle: &[u8]) {
+    read_pty_into_until_with_timeout(master, child, bytes, needle, Duration::from_secs(2));
+}
+
 fn read_pty_until_with_timeout(
     master: &mut File,
     child: &mut Child,
     needle: &[u8],
     timeout: Duration,
 ) -> Vec<u8> {
-    let deadline = Instant::now() + timeout;
     let mut bytes = Vec::new();
+    read_pty_into_until_with_timeout(master, child, &mut bytes, needle, timeout);
+    bytes
+}
+
+fn read_pty_into_until_with_timeout(
+    master: &mut File,
+    child: &mut Child,
+    bytes: &mut Vec<u8>,
+    needle: &[u8],
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        read_available(master, &mut bytes);
-        if byte_contains(&bytes, needle) {
-            return bytes;
+        read_available(master, bytes);
+        if byte_contains(bytes, needle) {
+            return;
         }
         if let Some(status) = child.try_wait().expect("inspect terminal child") {
             panic!(
                 "terminal exited before UI with {status}: {}",
-                String::from_utf8_lossy(&bytes)
+                String::from_utf8_lossy(bytes)
             );
         }
         wait_readable(&*master, deadline);
@@ -1111,7 +1279,7 @@ fn read_pty_until_with_timeout(
     panic!(
         "terminal did not render {:?}: {}",
         String::from_utf8_lossy(needle),
-        String::from_utf8_lossy(&bytes)
+        String::from_utf8_lossy(bytes)
     );
 }
 

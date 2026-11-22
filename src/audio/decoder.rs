@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::io::Errno;
-use rustix::process::{Pid, Resource, Rlimit, Signal, setrlimit};
+use rustix::process::Resource;
 use symphonia::core::audio::GenericAudioBufferRef;
 use symphonia::core::codecs::audio::AudioDecoderOptions;
 use symphonia::core::errors::Error as SymphoniaError;
@@ -317,27 +317,15 @@ pub fn helper_main(position_micros: u64) -> i32 {
 }
 
 fn apply_helper_limits() -> Result<(), String> {
-    rustix::process::set_parent_process_death_signal(Some(Signal::KILL))
-        .map_err(|error| format!("cannot bind decoder lifetime to its parent: {error}"))?;
-    if rustix::process::getppid().is_none_or(Pid::is_init) {
-        return Err("decoder parent exited during helper startup".into());
-    }
-    for (resource, value) in [
-        (Resource::Cpu, 600),
-        (Resource::As, 256 * 1_048_576),
-        (Resource::Nofile, 16),
-        (Resource::Core, 0),
-    ] {
-        setrlimit(
-            resource,
-            Rlimit {
-                current: Some(value),
-                maximum: Some(value),
-            },
-        )
-        .map_err(|error| format!("cannot apply decoder resource limit: {error}"))?;
-    }
-    Ok(())
+    crate::apply_helper_limits(
+        "decoder",
+        &[
+            (Resource::Cpu, 600),
+            (Resource::As, 256 * 1_048_576),
+            (Resource::Nofile, 16),
+            (Resource::Core, 0),
+        ],
+    )
 }
 
 trait PcmSink {
@@ -348,6 +336,8 @@ trait PcmSink {
 struct PlaybackSource<S> {
     inner: S,
     container: AudioContainer,
+    /// Byte offset where the exposed audio stream begins (past any leading `ID3v2` tag).
+    data_offset: u64,
     hidden_flac_headers: Vec<u64>,
 }
 
@@ -446,6 +436,7 @@ impl<S: MediaSource> PlaybackSource<S> {
         Ok(Self {
             inner,
             container,
+            data_offset,
             hidden_flac_headers,
         })
     }
@@ -538,6 +529,10 @@ fn looks_like_mp3_header(prefix: &[u8]) -> bool {
 
 impl<S: MediaSource> Read for PlaybackSource<S> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if self.hidden_flac_headers.is_empty() {
+            return self.inner.read(buffer);
+        }
+        debug_assert_eq!(self.data_offset, 0);
         let start = self.inner.stream_position()?;
         let read = self.inner.read(buffer)?;
         let end = start.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
@@ -557,7 +552,38 @@ impl<S: MediaSource> Read for PlaybackSource<S> {
 
 impl<S: MediaSource> Seek for PlaybackSource<S> {
     fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
-        self.inner.seek(position)
+        if self.data_offset == 0 {
+            return self.inner.seek(position);
+        }
+        let target = match position {
+            SeekFrom::Start(offset) => self.data_offset.checked_add(offset),
+            SeekFrom::Current(delta) => self.inner.stream_position()?.checked_add_signed(delta),
+            SeekFrom::End(delta) => {
+                let end = if let Some(length) = self.inner.byte_len() {
+                    length
+                } else {
+                    let saved = self.inner.stream_position()?;
+                    let length = self.inner.seek(SeekFrom::End(0))?;
+                    self.inner.seek(SeekFrom::Start(saved))?;
+                    length
+                };
+                end.checked_add_signed(delta)
+            }
+        }
+        .filter(|target| *target >= self.data_offset)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "audio seek outside exposed media range",
+            )
+        })?;
+        let actual = self.inner.seek(SeekFrom::Start(target))?;
+        actual.checked_sub(self.data_offset).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "audio seek landed before exposed media range",
+            )
+        })
     }
 }
 
@@ -567,7 +593,9 @@ impl<S: MediaSource> MediaSource for PlaybackSource<S> {
     }
 
     fn byte_len(&self) -> Option<u64> {
-        self.inner.byte_len()
+        self.inner
+            .byte_len()
+            .map(|length| length.saturating_sub(self.data_offset))
     }
 }
 
@@ -1228,5 +1256,109 @@ mod tests {
             DecoderPoll::Failed(message) if message.contains("made no output progress")
         ));
         decoder.shutdown().expect("kill and reap helper");
+    }
+
+    fn cbr_mp3_without_xing_header() -> Vec<u8> {
+        let fixture = include_bytes!("../../tests/fixtures/audio/tone.mp3");
+        // tone.mp3 starts with a 45-byte ID3v2.4 tag followed by one 384-byte LAME Info frame.
+        // Stripping both leaves pure CBR MPEG-1 Layer III audio frames so the demuxer derives
+        // duration and seek positions from byte length.
+        let id3_len = super::id3v2_prefix_len(&fixture[..12], Some(fixture.len() as u64))
+            .expect("valid ID3 header")
+            .expect("fixture has ID3 prefix");
+        let audio_start = usize::try_from(id3_len).expect("small fixture") + 384;
+        assert!(super::looks_like_mp3_header(&fixture[audio_start..]));
+        fixture[audio_start..].to_vec()
+    }
+
+    fn prepend_id3v2_padding(audio: &[u8], body_len: usize) -> Vec<u8> {
+        let body_u32 = u32::try_from(body_len).expect("bounded padding");
+        let syncsafe = [
+            ((body_u32 >> 21) & 0x7f) as u8,
+            ((body_u32 >> 14) & 0x7f) as u8,
+            ((body_u32 >> 7) & 0x7f) as u8,
+            (body_u32 & 0x7f) as u8,
+        ];
+        let mut tagged = Vec::with_capacity(10 + body_len + audio.len());
+        tagged.extend_from_slice(b"ID3\x04\x00\x00");
+        tagged.extend_from_slice(&syncsafe);
+        tagged.resize(10 + body_len, 0);
+        tagged.extend_from_slice(audio);
+        tagged
+    }
+
+    #[test]
+    fn id3_prefix_does_not_inflate_cbr_mp3_duration_or_break_seeking() {
+        let untagged = cbr_mp3_without_xing_header();
+        let tagged = prepend_id3v2_padding(&untagged, 65_536);
+
+        let mut untagged_full = CollectSink::default();
+        decode_source(
+            Cursor::new(untagged.clone()),
+            &mut untagged_full,
+            None,
+            Duration::ZERO,
+        )
+        .expect("decode untagged CBR MP3");
+
+        let mut tagged_full = CollectSink::default();
+        decode_source(
+            Cursor::new(tagged.clone()),
+            &mut tagged_full,
+            None,
+            Duration::ZERO,
+        )
+        .expect("decode tagged CBR MP3");
+
+        assert_eq!(tagged_full.format, untagged_full.format);
+        assert_eq!(tagged_full.duration, untagged_full.duration);
+        assert_eq!(tagged_full.samples, untagged_full.samples);
+
+        let target = Duration::from_millis(100);
+        let mut untagged_sought = CollectSink::default();
+        decode_source(Cursor::new(untagged), &mut untagged_sought, None, target)
+            .expect("seek untagged CBR MP3");
+
+        let mut tagged_sought = CollectSink::default();
+        decode_source(Cursor::new(tagged), &mut tagged_sought, None, target)
+            .expect("seek tagged CBR MP3");
+
+        assert_eq!(tagged_sought.duration, untagged_sought.duration);
+        assert_eq!(tagged_sought.position, target);
+        assert_eq!(tagged_sought.samples, untagged_sought.samples);
+    }
+
+    #[test]
+    fn playback_source_exposes_audio_relative_length_and_seek_coordinates() {
+        use std::io::{Read, Seek, SeekFrom};
+        use symphonia::core::io::MediaSource;
+
+        let untagged = cbr_mp3_without_xing_header();
+        let tagged = prepend_id3v2_padding(&untagged, 4_096);
+        let mut source = super::PlaybackSource::new(Cursor::new(tagged)).expect("open tagged MP3");
+
+        assert_eq!(source.byte_len(), Some(untagged.len() as u64));
+        assert_eq!(source.stream_position().expect("initial position"), 0);
+
+        let mut header = [0_u8; 4];
+        source.read_exact(&mut header).expect("read audio start");
+        assert_eq!(&header, &untagged[..4]);
+        assert_eq!(source.stream_position().expect("after read"), 4);
+
+        assert_eq!(source.seek(SeekFrom::Start(0)).expect("rewind to 0"), 0);
+        assert_eq!(
+            source.seek(SeekFrom::End(-4)).expect("seek from end"),
+            (untagged.len() - 4) as u64
+        );
+        let mut tail = [0_u8; 4];
+        source.read_exact(&mut tail).expect("read audio end");
+        assert_eq!(&tail, &untagged[untagged.len() - 4..]);
+
+        let len_i64 = i64::try_from(untagged.len()).expect("small fixture");
+        let before_start = source.seek(SeekFrom::Current(-len_i64 - 1));
+        assert!(
+            before_start.is_err(),
+            "seeking into the hidden ID3 tag must be rejected"
+        );
     }
 }

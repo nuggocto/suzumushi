@@ -55,12 +55,21 @@ check_installed() {
   [[ "$("$bin/suzu" --version)" == "suzumushi $VERSION" ]] || fail 'suzu does not launch suzumushi'
 }
 
-# Truncated downloads must run nothing: half the script, and all but the last line.
+# Truncated downloads must run nothing: half the script, right before the final
+# invocation, and every cut inside the final line before its closing brace.
 size="$(wc -c <"$qa_dir/install.sh")"
-last="$(grep -bo '^main "\$@"' "$qa_dir/install.sh" | cut -d: -f1)"
-for cut in $((size / 2)) "$last"; do
-  head -c "$cut" "$qa_dir/install.sh" | HOME="$qa_dir/home" TMPDIR="$qa_dir" sh -s -- --bin-dir "$bin" || true
-  [[ ! -e "$bin" ]] || fail "a script truncated at byte $cut installed files"
+last="$(grep -bo '^{ main "\$@"; }' "$qa_dir/install.sh" | cut -d: -f1)"
+[[ -n "$last" ]] || fail 'installer does not end with a grouped main invocation'
+final_line="$(tail -n 1 "$qa_dir/install.sh")"
+final_len="$(printf '%s' "$final_line" | wc -c)"
+cuts=("$((size / 2))" "$last")
+for ((offset = 1; offset < final_len; offset++)); do
+  cuts+=("$((last + offset))")
+done
+for cut in "${cuts[@]}"; do
+  head -c "$cut" "$qa_dir/install.sh" | HOME="$qa_dir/home" TMPDIR="$qa_dir" sh -s -- --bin-dir "$bin" 2>/dev/null || true
+  [[ ! -e "$bin" ]] || fail "a script truncated at byte $cut installed files into --bin-dir"
+  [[ ! -e "$qa_dir/home/.local/bin" ]] || fail "a script truncated at byte $cut installed files into the default directory"
 done
 
 # A complete piped install, then a reinstall over it.

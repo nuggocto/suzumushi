@@ -1006,3 +1006,61 @@ fn symlink_parser_metadata_warning_and_mount_counters_are_bounded() {
             .any(|warning| warning.code == ScanWarningCode::CrossMountSkipped)
     );
 }
+
+#[test]
+fn nested_and_partial_scans_preserve_natural_path_order() {
+    let (_temp, root) = root();
+    for relative in [
+        "audio/library/a-/2.mp3",
+        "audio/library/a-/10.mp3",
+        "audio/library/a/10.mp3",
+        "audio/library/a/2.mp3",
+        "audio/library/a.mp3",
+        "audio/library/2/track10.mp3",
+        "audio/library/2/track2.mp3",
+        "audio/library/10/track1.mp3",
+        "audio/playlists/p10/2.mp3",
+        "audio/playlists/p2/10.mp3",
+        "audio/playlists/p2/2.mp3",
+    ] {
+        let path = root.join(relative);
+        fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+        fs::write(path, b"media").expect("write media");
+    }
+
+    let mut reader = FakeMetadata::default();
+    let full = scan(&root, &Config::default(), &mut reader);
+    assert!(full.complete);
+    let paths: Vec<_> = full
+        .entries
+        .iter()
+        .map(|entry| entry.display_path.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        paths,
+        vec![
+            "library/2/track2.mp3",
+            "library/2/track10.mp3",
+            "library/10/track1.mp3",
+            "library/a/2.mp3",
+            "library/a/10.mp3",
+            "library/a-/2.mp3",
+            "library/a-/10.mp3",
+            "library/a.mp3",
+            "playlists/p2/2.mp3",
+            "playlists/p2/10.mp3",
+            "playlists/p10/2.mp3",
+        ]
+    );
+
+    let mut partial_config = Config::default();
+    partial_config.scan.max_files = 5;
+    let partial = scan(&root, &partial_config, &mut reader);
+    assert!(!partial.complete);
+    let partial_paths: Vec<_> = partial
+        .entries
+        .iter()
+        .map(|entry| entry.display_path.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(partial_paths, paths[..5]);
+}

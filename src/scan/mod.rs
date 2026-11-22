@@ -954,8 +954,13 @@ impl<'a> Scanner<'a> {
     }
 
     fn finish(self) -> ScanIndex {
-        let mut entries = self.entries;
-        entries.sort_by(|left, right| natural_path_cmp(&left.display_path, &right.display_path));
+        let entries = self.entries;
+        debug_assert!(
+            entries.is_sorted_by(|left, right| {
+                natural_path_cmp(&left.display_path, &right.display_path).is_le()
+            }),
+            "depth-first natural traversal produces natural path order"
+        );
         let mut playlists: Vec<_> = self.playlists.into_values().collect();
         playlists.sort_by(|left, right| natural_path_cmp(&left.path, &right.path));
         ScanIndex {

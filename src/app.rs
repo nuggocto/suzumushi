@@ -158,6 +158,14 @@ pub(crate) struct SessionIdentity {
     current_instance_id: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SessionRestore {
+    /// Every saved queue entry matched the current library index.
+    Exact,
+    /// Some or all saved entries were missing or collapsed as duplicates.
+    Inconclusive,
+}
+
 /// State owned exclusively by the event loop.
 #[derive(Debug)]
 pub struct AppState {
@@ -261,6 +269,10 @@ impl AppState {
 
     pub(crate) const fn queue_selection(&self) -> usize {
         self.queue.selection
+    }
+
+    pub(crate) const fn queue_generation(&self) -> u64 {
+        self.queue.generation()
     }
 
     #[must_use]
@@ -559,10 +571,10 @@ impl AppState {
     pub(crate) fn restore_session(
         &mut self,
         snapshot: &crate::state::SessionSnapshot,
-    ) -> AppResult<()> {
+    ) -> AppResult<SessionRestore> {
         let Some(restored) = self.queue.restore(&self.index, snapshot)? else {
             self.set_warning("Saved session has no tracks in the current library");
-            return Ok(());
+            return Ok(SessionRestore::Inconclusive);
         };
         let current_index = restored.current_index;
         let current = self.queue.items()[current_index];
@@ -571,13 +583,14 @@ impl AppState {
         let skipped = restored.skipped;
         if skipped == 0 {
             self.set_persistent_status("Session restored; Space resumes");
+            Ok(SessionRestore::Exact)
         } else {
             let track_label = if skipped == 1 { "track" } else { "tracks" };
             self.set_warning(&format!(
                 "Session restored; {skipped} unavailable or duplicate {track_label} skipped; Space resumes"
             ));
+            Ok(SessionRestore::Inconclusive)
         }
-        Ok(())
     }
 
     pub(crate) fn session_ignored(&mut self, reason: &str) {

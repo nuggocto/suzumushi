@@ -5,8 +5,8 @@
 use std::io::{self, Stdout, Write};
 use std::os::fd::BorrowedFd;
 use std::path::Path;
-use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Once, OnceLock};
 use std::time::Duration;
 
 use crossterm::cursor::{Hide, Show};
@@ -16,8 +16,9 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
 
-use crate::app::{AppState, ColorMode, PlaybackIntent};
+use crate::app::{AppState, ColorMode, PlaybackIntent, SessionIdentity, SessionRestore};
 use crate::audio::{AudioCommand, AudioDiagnostics, AudioRuntime};
 use crate::config::{Background, Config};
 use crate::errors::{AppError, AppResult};
@@ -43,13 +44,17 @@ pub fn run(
     let mut app = AppState::new(config, index);
     let mut state_store = crate::state::StateStore::open(root, root_path)?;
     state_store.remove_retired()?;
-    match state_store.read_session(&config.queue)? {
-        crate::state::SessionLoad::Missing => {}
-        crate::state::SessionLoad::Loaded(snapshot) => app.restore_session(&snapshot)?,
-        crate::state::SessionLoad::Ignored(reason) => app.session_ignored(&reason),
-    }
-    let mut state_sync = StateSynchronizer::default();
-    state_sync.sync(&app, &mut state_store, Duration::ZERO)?;
+    let mut state_sync = match state_store.read_session(&config.queue)? {
+        crate::state::SessionLoad::Missing => StateSynchronizer::active(&app),
+        crate::state::SessionLoad::Loaded(snapshot) => match app.restore_session(&snapshot)? {
+            SessionRestore::Exact => StateSynchronizer::active(&app),
+            SessionRestore::Inconclusive => StateSynchronizer::preserved(&app),
+        },
+        crate::state::SessionLoad::Ignored(reason) => {
+            app.session_ignored(&reason);
+            StateSynchronizer::preserved(&app)
+        }
+    };
     let audio = AudioRuntime::start()?;
     let mut mpris = match MprisRuntime::start(MprisProjection::from_app(&app)) {
         Ok(runtime) => Some(runtime),
@@ -77,6 +82,7 @@ pub fn run(
     finish_session(
         &mut app,
         &mut state_store,
+        &mut state_sync,
         session_result,
         combine_results(audio_result, mpris_result),
     )
@@ -85,11 +91,12 @@ pub fn run(
 fn finish_session(
     app: &mut AppState,
     state_store: &mut crate::state::StateStore,
+    state_sync: &mut StateSynchronizer,
     session_result: AppResult<()>,
     audio_result: AppResult<()>,
 ) -> AppResult<()> {
     app.session_stopped();
-    let state_result = write_session(app, state_store);
+    let state_result = state_sync.flush(app, state_store);
     combine_results(combine_results(session_result, audio_result), state_result)
 }
 
@@ -102,6 +109,7 @@ fn run_terminal_session(
     state_store: &mut crate::state::StateStore,
     state_sync: &mut StateSynchronizer,
 ) -> AppResult<()> {
+    let termination = TerminationGuard::install()?;
     let stdout = io::stdout();
     install_panic_restore();
     enable_raw_mode().map_err(|error| AppError::io("enable raw mode", "terminal", error))?;
@@ -124,6 +132,10 @@ fn run_terminal_session(
     let mut audio_diagnostics = AudioDiagnosticsReporter::default();
 
     while !app.should_quit {
+        if termination.requested() {
+            app.should_quit = true;
+            break;
+        }
         drain_audio_events(app, root, audio)?;
         for line in audio_diagnostics.report(audio.diagnostics(), event_time) {
             crate::logging::warn(format_args!("{line}"));
@@ -137,12 +149,14 @@ fn run_terminal_session(
             .draw(|frame| crate::ui::render(frame, app, &mut stage, event_time))
             .map_err(|error| AppError::io("draw terminal", "terminal", error))?;
         let event = events.next(stage.frame_interval())?;
+        if termination.requested() {
+            app.should_quit = true;
+            break;
+        }
         event_time = event_time_for(event);
         if let Some(intent) = apply_event(app, event) {
             dispatch_playback(app, root, audio, intent)?;
         }
-        publish_mpris(app, mpris.as_deref_mut());
-        state_sync.sync(app, state_store, event_time)?;
     }
 
     terminal
@@ -198,18 +212,47 @@ fn publish_mpris(app: &AppState, mpris: Option<&mut MprisRuntime>) {
     }
 }
 
+enum CheckpointMode {
+    /// The on-disk checkpoint matches `written`; persist any queue, track, or
+    /// position change.
+    Active {
+        written: (Option<SessionIdentity>, Duration),
+        last_write: Duration,
+    },
+    /// Startup restore was inconclusive (ignored, empty match, or skipped
+    /// entries). Leave the original on-disk checkpoint untouched until the
+    /// user deliberately changes the queue.
+    Preserved { initial_queue_generation: u64 },
+}
+
 /// Writes the resume checkpoint when it changes.
 ///
 /// A different queue or current track is written at once. A moving position is
 /// written at most every [`SESSION_POSITION_INTERVAL`]. A stopped or paused
-/// session writes nothing.
-#[derive(Default)]
+/// session writes nothing. When restore was inconclusive, the existing file is
+/// preserved until the user changes the queue.
 struct StateSynchronizer {
-    written: Option<(Option<crate::app::SessionIdentity>, Duration)>,
-    last_write: Duration,
+    mode: CheckpointMode,
 }
 
 impl StateSynchronizer {
+    fn active(app: &AppState) -> Self {
+        Self {
+            mode: CheckpointMode::Active {
+                written: (app.session_identity(), app.session_position()),
+                last_write: Duration::ZERO,
+            },
+        }
+    }
+
+    const fn preserved(app: &AppState) -> Self {
+        Self {
+            mode: CheckpointMode::Preserved {
+                initial_queue_generation: app.queue_generation(),
+            },
+        }
+    }
+
     fn sync(
         &mut self,
         app: &AppState,
@@ -217,20 +260,89 @@ impl StateSynchronizer {
         now: Duration,
     ) -> AppResult<()> {
         let checkpoint = (app.session_identity(), app.session_position());
-        let due = match self.written {
-            None => true,
-            Some((identity, _)) if identity != checkpoint.0 => true,
-            Some(written) => {
-                written != checkpoint
-                    && now.saturating_sub(self.last_write) >= SESSION_POSITION_INTERVAL
+        let due = match self.mode {
+            CheckpointMode::Preserved {
+                initial_queue_generation,
+            } => app.queue_generation() != initial_queue_generation,
+            CheckpointMode::Active { written, .. } if written.0 != checkpoint.0 => true,
+            CheckpointMode::Active {
+                written,
+                last_write,
+            } => {
+                written != checkpoint && now.saturating_sub(last_write) >= SESSION_POSITION_INTERVAL
             }
         };
         if due {
             write_session(app, store)?;
-            self.written = Some(checkpoint);
-            self.last_write = now;
+            self.mode = CheckpointMode::Active {
+                written: checkpoint,
+                last_write: now,
+            };
         }
         Ok(())
+    }
+
+    fn flush(&mut self, app: &AppState, store: &mut crate::state::StateStore) -> AppResult<()> {
+        let checkpoint = (app.session_identity(), app.session_position());
+        let due = match self.mode {
+            CheckpointMode::Preserved {
+                initial_queue_generation,
+            } => app.queue_generation() != initial_queue_generation,
+            CheckpointMode::Active { written, .. } => written != checkpoint,
+        };
+        if due {
+            write_session(app, store)?;
+            self.mode = CheckpointMode::Active {
+                written: checkpoint,
+                last_write: Duration::ZERO,
+            };
+        }
+        Ok(())
+    }
+}
+
+/// Routes termination signals into the event loop so raw mode is restored and
+/// the final checkpoint is flushed.
+///
+/// `signal-hook-registry` keeps its C handler installed even after actions are
+/// unregistered, so unregistering would silently ignore later signals. Instead,
+/// dropping this guard arms the flag so any signal during teardown (audio/MPRIS
+/// shutdown, final checkpoint flush, or cooked-mode Ctrl+C) immediately
+/// emulates the default handler.
+struct TerminationGuard(&'static AtomicBool);
+
+impl TerminationGuard {
+    fn install() -> AppResult<Self> {
+        static FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+        if let Some(flag) = FLAG.get() {
+            flag.store(false, Ordering::SeqCst);
+            return Ok(Self(flag));
+        }
+        let flag = Arc::new(AtomicBool::new(false));
+        for signal in [SIGTERM, SIGHUP, SIGINT] {
+            // Once the flag is set (by a first signal or on leaving the
+            // terminal loop), any further signal emulates the default handler
+            // so a stuck shutdown can still be terminated immediately.
+            if let Err(error) =
+                signal_hook::flag::register_conditional_default(signal, Arc::clone(&flag))
+                    .and_then(|_| signal_hook::flag::register(signal, Arc::clone(&flag)))
+            {
+                flag.store(true, Ordering::SeqCst);
+                return Err(AppError::io("install signal handler", "terminal", error));
+            }
+        }
+        let flag = FLAG.get_or_init(|| flag);
+        Ok(Self(flag))
+    }
+
+    fn requested(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for TerminationGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
     }
 }
 
@@ -767,7 +879,7 @@ mod tests {
         let (root, _root_file, mut writer) = state_writer();
         let session = root.path().join("state/session.json");
         let mut app = AppState::new(&Config::default(), one_track_index());
-        let mut sync = StateSynchronizer::default();
+        let mut sync = StateSynchronizer::active(&app);
 
         sync.sync(&app, &mut writer, Duration::ZERO)
             .expect("first sync");
@@ -795,11 +907,13 @@ mod tests {
     fn event_loop_errors_still_write_the_final_checkpoint() {
         let (root, _root_file, mut writer) = state_writer();
         let mut app = AppState::new(&Config::default(), one_track_index());
+        let mut sync = StateSynchronizer::active(&app);
         app.apply(AppAction::Activate)
             .expect("queue and start the track");
         let error = finish_session(
             &mut app,
             &mut writer,
+            &mut sync,
             Err(AppError::Resource("event loop fixture".into())),
             Ok(()),
         )
@@ -811,6 +925,44 @@ mod tests {
         )
         .expect("valid final checkpoint");
         assert_eq!(saved["current_index"], 0);
+    }
+
+    #[test]
+    fn inconclusive_restore_preserves_checkpoint_until_queue_changes() {
+        let (root, _root_file, mut writer) = state_writer();
+        let session = root.path().join("state/session.json");
+        let original =
+            br#"{"version":99,"queue_entry_ids":[7,99],"current_index":0,"position_ms":1000}"#;
+        fs::write(&session, original).expect("seed preserved session");
+        fs::set_permissions(&session, fs::Permissions::from_mode(0o600))
+            .expect("private session permissions");
+
+        let mut app = AppState::new(&Config::default(), one_track_index());
+        let mut sync = StateSynchronizer::preserved(&app);
+        sync.sync(&app, &mut writer, SESSION_POSITION_INTERVAL * 2)
+            .expect("idle sync preserves checkpoint");
+        finish_session(
+            &mut app,
+            &mut writer,
+            &mut sync,
+            Err(AppError::Resource("startup failed".into())),
+            Ok(()),
+        )
+        .expect_err("startup error surfaces");
+        assert_eq!(
+            fs::read(&session).expect("preserved checkpoint"),
+            original,
+            "failed startup and unchanged queue must not erase an inconclusive checkpoint"
+        );
+
+        app.apply(AppAction::Activate)
+            .expect("deliberate queue edit replaces the preserved checkpoint");
+        sync.sync(&app, &mut writer, Duration::from_secs(1))
+            .expect("write replacement checkpoint");
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(&session).expect("replacement checkpoint"))
+                .expect("JSON");
+        assert_eq!(saved["queue_entry_ids"], serde_json::json!([7]));
     }
 
     #[test]

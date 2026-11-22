@@ -344,13 +344,19 @@ impl QueueState {
             return None;
         }
         if self.shuffle {
-            let current = current.map(|item| item.instance_id);
-            let position = current.and_then(|id| {
-                self.shuffle_order
+            let position = match (current, self.shuffle_cursor) {
+                (Some(item), Some(cursor))
+                    if self.shuffle_order.get(cursor) == Some(&item.instance_id) =>
+                {
+                    Some(cursor)
+                }
+                (Some(item), _) => self
+                    .shuffle_order
                     .iter()
-                    .position(|candidate| *candidate == id)
-            });
-            let position = position.or(self.shuffle_cursor);
+                    .position(|candidate| *candidate == item.instance_id)
+                    .or(self.shuffle_cursor),
+                (None, cursor) => cursor,
+            };
             let next = position.map_or(0, |position| position.saturating_add(1));
             let order_index = if next < self.shuffle_order.len() {
                 next
