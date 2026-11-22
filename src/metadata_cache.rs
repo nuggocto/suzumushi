@@ -232,13 +232,11 @@ impl CachedMetadataReader {
         let mut store = StateStore::open(root, path)?;
         let existing = store.open_file(CACHE_FILE, "metadata cache")?;
         let mut bytes = Vec::new();
-        let estimated = HEADER
-            .len()
-            .saturating_add(self.entries.len().saturating_mul(256))
-            .min(MAX_CACHE_BYTES);
-        bytes.try_reserve_exact(estimated).map_err(|error| {
-            crate::errors::AppError::Resource(format!("cannot reserve metadata cache: {error}"))
-        })?;
+        bytes
+            .try_reserve_exact(self.estimated_cache_bytes())
+            .map_err(|error| {
+                crate::errors::AppError::Resource(format!("cannot reserve metadata cache: {error}"))
+            })?;
         bytes.extend_from_slice(HEADER.as_bytes());
         for (identity, cached) in &self.entries {
             if !cached.retained {
@@ -270,6 +268,15 @@ impl CachedMetadataReader {
             return Ok(());
         }
         store.write_bytes(CACHE_FILE, "metadata", &bytes)
+    }
+
+    /// Estimates the encoded size of the retained records to write.
+    fn estimated_cache_bytes(&self) -> usize {
+        HEADER
+            .len()
+            .saturating_add(self.retained.tag_bytes)
+            .saturating_add(self.retained.entries.saturating_mul(256))
+            .min(MAX_CACHE_BYTES)
     }
 }
 
@@ -453,6 +460,10 @@ mod tests {
         cache
             .read_with(&file, &mut parser)
             .expect("parse the real track");
+        assert!(
+            cache.estimated_cache_bytes() < 4_096,
+            "write buffer estimate follows retained entries, not stale loaded ones"
+        );
         cache
             .save_inner(root.as_fd(), temp.path())
             .expect("save the next cache");

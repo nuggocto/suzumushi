@@ -1195,27 +1195,34 @@ impl Fixture {
 /// Starts `command` on a fresh pseudoterminal and returns its master side.
 fn spawn_in_pty(command: &mut Command, width: u16, height: u16) -> (File, Child) {
     let (master, slave) = open_test_pty(width, height);
-    let mut detached;
-    // crossterm queries `/dev/tty` before `stdout` for terminal size, so an
-    // inherited controlling terminal hides test PTY resizes. Start the child in
-    // a new session when the test runner itself has `/dev/tty`.
-    let launch = if File::open("/dev/tty").is_ok() {
-        detached = Command::new("setsid");
-        detached.arg("--").arg(command.get_program());
-        detached.args(command.get_args());
-        if let Some(dir) = command.get_current_dir() {
-            detached.current_dir(dir);
-        }
-        for (key, value) in command.get_envs() {
-            match value {
-                Some(value) => detached.env(key, value),
-                None => detached.env_remove(key),
-            };
-        }
-        &mut detached
+    // Reset `SIGHUP` to its default action so hangup tests stay independent of
+    // a test runner that ignores it (for example under `nohup` or a background
+    // supervisor). When the runner has `/dev/tty`, also start a new session
+    // because crossterm queries `/dev/tty` before `stdout` for terminal size,
+    // which would hide test PTY resizes.
+    let mut launch = if File::open("/dev/tty").is_ok() {
+        let mut detached = Command::new("setsid");
+        detached
+            .args(["--", "env", "--default-signal=HUP", "--"])
+            .arg(command.get_program());
+        detached
     } else {
-        command
+        let mut reset = Command::new("env");
+        reset
+            .args(["--default-signal=HUP", "--"])
+            .arg(command.get_program());
+        reset
     };
+    launch.args(command.get_args());
+    if let Some(dir) = command.get_current_dir() {
+        launch.current_dir(dir);
+    }
+    for (key, value) in command.get_envs() {
+        match value {
+            Some(value) => launch.env(key, value),
+            None => launch.env_remove(key),
+        };
+    }
     let child = launch
         .stdin(Stdio::from(duplicate_file(&slave)))
         .stdout(Stdio::from(duplicate_file(&slave)))

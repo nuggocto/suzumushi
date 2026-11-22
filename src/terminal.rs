@@ -213,7 +213,7 @@ fn run_event_loop<W: Write>(
             Err(error) if is_terminal_gone(&error) => presence.mark_gone(),
             Err(error) => return Err(AppError::io("draw terminal", "terminal", error)),
         }
-        if presence.is_gone() {
+        if termination.requested() || presence.is_gone() {
             break;
         }
         let event = events.next(stage.frame_interval())?;
