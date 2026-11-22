@@ -89,10 +89,53 @@ impl MprisProjection {
     }
 }
 
+/// Every app value that [`MprisProjection::from_app`] reads, as plain copies.
+///
+/// The terminal loop turns up to 60 times a second, while these change a few
+/// times a second at most (the position moves every 250 ms). Comparing them
+/// first skips rebuilding the title and creator strings and rescanning the
+/// queue for `CanGoNext` on every frame. Title and creator follow the track
+/// token, because the scan index is immutable during a session; navigation
+/// follows the queue generation, track token, repeat mode, and shuffle order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProjectionInputs {
+    playback_status: PlaybackStatus,
+    repeat: RepeatMode,
+    shuffle: bool,
+    volume_percent: u8,
+    muted: bool,
+    track_token: Option<(u64, u64)>,
+    position: Duration,
+    duration: Option<Duration>,
+    seek_revision: u64,
+    queue_generation: u64,
+    shuffle_revision: u64,
+}
+
+impl ProjectionInputs {
+    fn from_app(app: &AppState) -> Self {
+        Self {
+            playback_status: app.playback_status(),
+            repeat: app.repeat,
+            shuffle: app.shuffle_enabled(),
+            volume_percent: app.volume_percent,
+            muted: app.muted,
+            track_token: app.current_track_token(),
+            position: app.playback_position(),
+            duration: app.playback_duration(),
+            seek_revision: app.seek_revision(),
+            queue_generation: app.queue_generation(),
+            shuffle_revision: app.shuffle_revision(),
+        }
+    }
+}
+
 pub(crate) struct MprisRuntime {
     actions: Receiver<AppAction>,
     latest: Arc<Mutex<Option<MprisProjection>>>,
     published: Option<MprisProjection>,
+    /// The inputs behind `published`, when it came from [`Self::publish_app`].
+    published_inputs: Option<ProjectionInputs>,
     /// Wakes the worker after `latest` changes. Dropping it stops the worker.
     wake: Option<SyncSender<()>>,
     worker: Option<JoinHandle<()>>,
@@ -148,6 +191,7 @@ impl MprisRuntime {
                 actions,
                 latest,
                 published: None,
+                published_inputs: None,
                 wake: Some(wake),
                 worker: Some(worker),
             }),
@@ -162,8 +206,25 @@ impl MprisRuntime {
         }
     }
 
+    /// Publishes the app's current projection, rebuilding it only when one of
+    /// its inputs changed.
+    pub(crate) fn publish_app(&mut self, app: &AppState) {
+        let inputs = ProjectionInputs::from_app(app);
+        if self.published_inputs == Some(inputs) {
+            debug_assert_eq!(
+                self.published.as_ref(),
+                Some(&MprisProjection::from_app(app)),
+                "ProjectionInputs must cover every value the projection reads"
+            );
+            return;
+        }
+        self.publish(MprisProjection::from_app(app));
+        self.published_inputs = Some(inputs);
+    }
+
     /// Hands the worker a new projection. An unchanged projection does nothing.
     pub(crate) fn publish(&mut self, projection: MprisProjection) {
+        self.published_inputs = None;
         if self.published.as_ref() == Some(&projection) {
             return;
         }
@@ -787,6 +848,67 @@ mod tests {
             capabilities: CAN_GO_NEXT | CAN_GO_PREVIOUS | CAN_PLAY | CAN_PAUSE | CAN_SEEK,
             seek_revision: 0,
         }
+    }
+
+    #[test]
+    fn desktop_next_updates_when_two_shuffle_actions_share_a_turn() {
+        use crate::app::AppState;
+        use crate::config::Config;
+        use crate::scan::{ScanObserver, ScanOptions, scan_with_components};
+
+        struct Observer;
+        impl ScanObserver for Observer {}
+
+        let root = tempfile::tempdir().expect("temporary library");
+        let library = root.path().join("audio/library");
+        std::fs::create_dir_all(&library).expect("create library");
+        for file in ["first.mp3", "second.mp3"] {
+            std::fs::write(
+                library.join(file),
+                include_bytes!("../tests/fixtures/audio/tone.mp3"),
+            )
+            .expect("write track");
+        }
+        let config = Config::default();
+        let index = scan_with_components(
+            root.path(),
+            &config,
+            1,
+            ScanOptions {
+                metadata_time_budget: Duration::ZERO,
+                ..ScanOptions::default()
+            },
+            &mut crate::metadata::HelperMetadataReader,
+            &mut Observer,
+        )
+        .expect("scan tracks");
+        let mut app = AppState::new(&config, index);
+        app.apply(AppAction::SetShuffle(true));
+        assert!(app.apply(AppAction::Activate).is_some());
+        app.apply(AppAction::MoveNext);
+        app.apply(AppAction::Activate);
+        assert!(app.apply(AppAction::Next).is_some());
+        assert!(
+            !app.can_go_next(),
+            "at the end of the initial shuffle order"
+        );
+
+        let (_, actions) = mpsc::channel();
+        let mut runtime = super::MprisRuntime {
+            actions,
+            latest: Arc::default(),
+            published: None,
+            published_inputs: None,
+            wake: None,
+            worker: None,
+        };
+        runtime.publish_app(&app);
+        app.apply(AppAction::SetShuffle(false));
+        app.apply(AppAction::SetShuffle(true));
+        runtime.publish_app(&app);
+
+        let published = runtime.published.as_ref().expect("desktop projection");
+        assert!(super::has_capability(published, CAN_GO_NEXT));
     }
 
     #[test]

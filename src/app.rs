@@ -275,6 +275,10 @@ impl AppState {
         self.queue.generation()
     }
 
+    pub(crate) const fn shuffle_revision(&self) -> u64 {
+        self.queue.shuffle_revision
+    }
+
     #[must_use]
     pub const fn shuffle_enabled(&self) -> bool {
         self.queue.shuffle

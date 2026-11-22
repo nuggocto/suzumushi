@@ -37,13 +37,13 @@ code hang.
   progress, on track replacement, on stop, and during shutdown.
 - PCM framing accepts at most 32,768 samples per block and two queued blocks.
   Error text is capped at 1,024 bytes.
-- The current decoder accepts mono or stereo PCM at 8 kHz through 192 kHz. The
-  output device must support the source sample rate. No hidden resampler or
-  second fallback pipeline exists.
+- The current decoder accepts mono or stereo PCM at 8 kHz through 192 kHz.
+  Suzumushi has no resampler and no second fallback pipeline, so the audio
+  backend must accept the source sample rate. PipeWire resamples internally.
 - The output ring is fixed at 262,144 samples. The callback pops samples,
-  glides toward the latest volume, writes silence on underrun, converts sample types,
-  updates the fixed 32-band spectrum analyzer, and publishes atomic state. It
-  does not allocate, block, log, take a lock, or send a message.
+  glides toward the latest volume, writes silence on underrun, converts sample
+  types, updates the fixed 32-band spectrum analyzer, and publishes atomic
+  state. It does not allocate, block, log, take a lock, or send a message.
 - A callback playback gate keeps new and paused streams from consuming PCM,
   even when a backend starts callbacks before `play` is called. After the ring
   empties, the worker keeps output alive for the final buffer duration plus the
@@ -73,9 +73,9 @@ the selected Symphonia adapter at 48 kHz stereo:
 | Ogg | Vorbis |
 
 The fixtures, commands, license, and hashes are recorded in
-`tests/fixtures/audio/SOURCES.md`. Extensions remain scanner hints. AAC, M4A,
-Opus, unusual channel layouts, and unsupported device sample rates are not
-compatibility claims.
+`tests/fixtures/audio/SOURCES.md`. File extensions are only scanner hints.
+AAC, M4A, Opus, unusual channel layouts, and sample rates the device rejects
+are not supported.
 
 ## Verification
 

@@ -675,6 +675,44 @@ fn sigterm_restores_terminal_modes_and_saves_session() {
     assert_eq!(saved["queue_entry_ids"].as_array().map(Vec::len), Some(1));
 }
 
+/// Closing the terminal window closes the pty master: the kernel hangs up the
+/// slave and sends `SIGHUP` to the foreground process group. The test sends
+/// that signal itself, because the pty is not the child's controlling
+/// terminal. `SIGHUP` keeps its default action, so the player ends at once
+/// instead of returning to an input reader that cannot see the hangup, and
+/// what it already checkpointed stays on disk.
+#[test]
+fn closing_the_terminal_ends_the_player_and_keeps_its_session() {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let fixture = Fixture::new();
+    fixture.add_tagged_track("night.mp3");
+
+    let (mut master, mut child) = fixture.spawn_terminal();
+    let mut transcript = read_pty_until(&mut master, &mut child, b"Night Song");
+    master.write_all(b"\r").expect("queue the track");
+    read_pty_into_until(&mut master, &mut child, &mut transcript, FIRST_QUEUE_ITEM);
+
+    let raw_pid = i32::try_from(child.id()).expect("child PID fits i32");
+    let pid = Pid::from_raw(raw_pid).expect("child PID is positive");
+    drop(master);
+    kill_process(pid, Signal::HUP).expect("deliver the terminal hangup");
+    let status = wait_for_exit(&mut child, Duration::from_secs(3));
+
+    assert_eq!(
+        status.signal(),
+        Some(Signal::HUP.as_raw()),
+        "a hangup ends the player at once, got {status}"
+    );
+    let saved: serde_json::Value = serde_json::from_slice(
+        &fs::read(fixture.root.join("state/session.json")).expect("saved session"),
+    )
+    .expect("valid session JSON");
+    assert_eq!(saved["queue_entry_ids"].as_array().map(Vec::len), Some(1));
+    suzumushi::locks::RootWriterLease::acquire(&fixture.root)
+        .expect("the next session can take the root lease");
+}
+
 #[test]
 fn failed_launch_and_inconclusive_restore_preserve_saved_session() {
     let fixture = Fixture::new();
@@ -1307,6 +1345,22 @@ fn read_pty_to_status(master: &mut File, child: &mut Child) -> (Vec<u8>, ExitSta
             }
             Err(error) => panic!("cannot inspect terminal child: {error}"),
         }
+    }
+}
+
+/// Waits for the child without reading its terminal, which may already be closed.
+fn wait_for_exit(child: &mut Child, timeout: Duration) -> ExitStatus {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().expect("inspect terminal child") {
+            return status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().expect("kill timed-out terminal");
+            child.wait().expect("reap timed-out terminal");
+            panic!("terminal process did not exit within {timeout:?}");
+        }
+        wait_readable(&child.exited, deadline);
     }
 }
 

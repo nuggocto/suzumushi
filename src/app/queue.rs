@@ -27,6 +27,8 @@ pub(super) struct QueueState {
     next_item_id: u64,
     max_items: usize,
     pub(super) shuffle: bool,
+    /// Tracks rebuilds. Queue edits that modify the shuffle order bump `generation`.
+    pub(super) shuffle_revision: u64,
     pub(super) shuffle_order: Vec<u64>,
     pub(super) shuffle_cursor: Option<usize>,
     pub(super) shuffle_seed: u64,
@@ -55,6 +57,7 @@ impl QueueState {
             next_item_id: 1,
             max_items: config.queue.max_items,
             shuffle: false,
+            shuffle_revision: 0,
             shuffle_order: Vec::new(),
             shuffle_cursor: None,
             shuffle_seed: random_seed(),
@@ -262,6 +265,7 @@ impl QueueState {
     }
 
     pub(super) fn refresh_shuffle_order(&mut self, current: Option<QueueItem>) {
+        self.shuffle_revision += 1;
         self.shuffle_order.clear();
         self.shuffle_cursor = None;
         if !self.shuffle {

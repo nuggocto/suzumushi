@@ -73,11 +73,15 @@ pub(crate) fn clamp_rlimit(
 /// Parses the process command line and returns a conventional exit status.
 #[must_use]
 pub fn run() -> std::process::ExitCode {
+    use std::io::Write as _;
+
     match cli::run_from(std::env::args_os(), std::env::current_dir) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
             let message = display::terminal_safe(error.to_string().as_bytes(), 16_384);
-            eprintln!("error: {message}");
+            // Not `eprintln!`, which panics when stderr is gone, as it is after
+            // the terminal closes; release builds would then abort.
+            let _ = writeln!(std::io::stderr(), "error: {message}");
             std::process::ExitCode::from(2)
         }
     }

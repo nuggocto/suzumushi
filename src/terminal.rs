@@ -16,7 +16,7 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
+use signal_hook::consts::signal::{SIGINT, SIGTERM};
 
 use crate::app::{AppState, ColorMode, PlaybackIntent, SessionIdentity, SessionRestore};
 use crate::audio::{AudioCommand, AudioDiagnostics, AudioRuntime};
@@ -26,8 +26,7 @@ use crate::event::{AppEvent, EventSource};
 use crate::model::ScanIndex;
 use crate::mpris::{MprisProjection, MprisRuntime, REQUEST_CAPACITY};
 
-/// While the playback position moves, the resume checkpoint is refreshed at
-/// most this often, so a crash loses at most this much of the position.
+/// Minimum interval between checkpoint writes that only update the position.
 const SESSION_POSITION_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Runs one terminal session and restores terminal modes on every unwind path.
@@ -73,21 +72,28 @@ pub fn run(
         &mut state_store,
         &mut state_sync,
     );
+    // Nothing below writes to the terminal, which may already be gone. The
+    // checkpoint is saved before the desktop-controls join, so a slow session
+    // bus cannot keep it from being written.
+    while let Some(position) = audio.try_position() {
+        app.audio_position(position);
+    }
     let audio_result = audio.shutdown();
-    app.session_stopped();
-    let mpris_result = mpris.map_or(Ok(()), |mut runtime| {
-        runtime.publish(MprisProjection::from_app(&app));
-        runtime.shutdown()
-    });
-    finish_session(
+    let session_result = finish_session(
         &mut app,
         &mut state_store,
         &mut state_sync,
         session_result,
-        combine_results(audio_result, mpris_result),
-    )
+        audio_result,
+    );
+    let mpris_result = mpris.map_or(Ok(()), |mut runtime| {
+        runtime.publish(MprisProjection::from_app(&app));
+        runtime.shutdown()
+    });
+    combine_results(session_result, mpris_result)
 }
 
+/// Marks playback stopped and writes the final checkpoint.
 fn finish_session(
     app: &mut AppState,
     state_store: &mut crate::state::StateStore,
@@ -105,15 +111,17 @@ fn run_terminal_session(
     background: Background,
     app: &mut AppState,
     audio: &AudioRuntime,
-    mut mpris: Option<&mut MprisRuntime>,
+    mpris: Option<&mut MprisRuntime>,
     state_store: &mut crate::state::StateStore,
     state_sync: &mut StateSynchronizer,
 ) -> AppResult<()> {
     let termination = TerminationGuard::install()?;
-    let stdout = io::stdout();
+    let presence = TerminalPresence::default();
     install_panic_restore();
     enable_raw_mode().map_err(|error| AppError::io("enable raw mode", "terminal", error))?;
-    let mut guard = TerminalGuard::new(CrosstermControl { stdout });
+    let mut guard = TerminalGuard::new(CrosstermControl {
+        output: presence.output(io::stdout()),
+    });
     guard.enter()?;
 
     // Asked in raw mode and before the first key is read, so the terminal's
@@ -121,19 +129,71 @@ fn run_terminal_session(
     let palette = player_palette(app.color_mode, background);
     // A terminal that misreads the question may print part of it. Not
     // `Terminal::clear`, which waits for a cursor position report.
-    execute!(io::stdout(), Clear(ClearType::All))
+    execute!(presence.output(io::stdout()), Clear(ClearType::All))
         .map_err(|error| AppError::io("clear terminal", "terminal", error))?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))
+    let mut terminal = Terminal::new(CrosstermBackend::new(presence.output(io::stdout())))
         .map_err(|error| AppError::io("create terminal", "terminal", error))?;
 
+    let loop_result = run_event_loop(
+        &mut terminal,
+        &termination,
+        &presence,
+        palette,
+        EventLoopParts {
+            root,
+            app,
+            audio,
+            mpris,
+            state_store,
+            state_sync,
+        },
+    );
+
+    // Once the terminal is gone these writes are discarded, so Ratatui's
+    // destructor finds the cursor shown and never reports a failure.
+    let cursor_result = terminal
+        .show_cursor()
+        .map_err(|error| AppError::io("show terminal cursor", "terminal", error));
+    drop(terminal);
+    let restore_result = guard.restore();
+    combine_results(loop_result, combine_results(cursor_result, restore_result))
+}
+
+/// What the event loop borrows from the session.
+struct EventLoopParts<'session, 'mpris> {
+    root: BorrowedFd<'session>,
+    app: &'session mut AppState,
+    audio: &'session AudioRuntime,
+    mpris: Option<&'mpris mut MprisRuntime>,
+    state_store: &'session mut crate::state::StateStore,
+    state_sync: &'session mut StateSynchronizer,
+}
+
+/// Runs until the user quits, a termination signal arrives, or the terminal
+/// goes away. Each turn handles at most the pending audio, desktop, and input
+/// work, then waits no longer than one frame.
+fn run_event_loop<W: Write>(
+    terminal: &mut Terminal<CrosstermBackend<TerminalOutput<W>>>,
+    termination: &TerminationGuard,
+    presence: &TerminalPresence,
+    palette: crate::ui::Palette,
+    parts: EventLoopParts<'_, '_>,
+) -> AppResult<()> {
+    let EventLoopParts {
+        root,
+        app,
+        audio,
+        mut mpris,
+        state_store,
+        state_sync,
+    } = parts;
     let events = EventSource::new();
     let mut stage = crate::ui::Stage::new(palette);
     let mut event_time = Duration::ZERO;
     let mut audio_diagnostics = AudioDiagnosticsReporter::default();
 
     while !app.should_quit {
-        if termination.requested() {
-            app.should_quit = true;
+        if termination.requested() || presence.is_gone() {
             break;
         }
         drain_audio_events(app, root, audio)?;
@@ -141,16 +201,23 @@ fn run_terminal_session(
             crate::logging::warn(format_args!("{line}"));
         }
         drain_mpris_actions(app, root, audio, mpris.as_deref())?;
-        publish_mpris(app, mpris.as_deref_mut());
+        if let Some(runtime) = mpris.as_deref_mut() {
+            runtime.publish_app(app);
+        }
         state_sync.sync(app, state_store, event_time)?;
         // A fullscreen viewport follows the terminal size: `draw` resizes and
         // clears its buffers whenever the size changed since the last frame.
-        terminal
-            .draw(|frame| crate::ui::render(frame, app, &mut stage, event_time))
-            .map_err(|error| AppError::io("draw terminal", "terminal", error))?;
+        match terminal.draw(|frame| crate::ui::render(frame, app, &mut stage, event_time)) {
+            Ok(_) => {}
+            // The size query is an ioctl, which a hung-up terminal also fails.
+            Err(error) if is_terminal_gone(&error) => presence.mark_gone(),
+            Err(error) => return Err(AppError::io("draw terminal", "terminal", error)),
+        }
+        if presence.is_gone() {
+            break;
+        }
         let event = events.next(stage.frame_interval())?;
         if termination.requested() {
-            app.should_quit = true;
             break;
         }
         event_time = event_time_for(event);
@@ -158,12 +225,11 @@ fn run_terminal_session(
             dispatch_playback(app, root, audio, intent)?;
         }
     }
-
-    terminal
-        .show_cursor()
-        .map_err(|error| AppError::io("show terminal cursor", "terminal", error))?;
-    drop(terminal);
-    guard.restore()
+    app.should_quit = true;
+    if presence.is_gone() {
+        crate::logging::info(format_args!("terminal closed; stopping the session"));
+    }
+    Ok(())
 }
 
 /// The Player's colors for this terminal. Monochrome output asks nothing.
@@ -206,12 +272,6 @@ fn drain_mpris_actions(
     Ok(())
 }
 
-fn publish_mpris(app: &AppState, mpris: Option<&mut MprisRuntime>) {
-    if let Some(runtime) = mpris {
-        runtime.publish(MprisProjection::from_app(app));
-    }
-}
-
 enum CheckpointMode {
     /// The on-disk checkpoint matches `written`; persist any queue, track, or
     /// position change.
@@ -227,10 +287,9 @@ enum CheckpointMode {
 
 /// Writes the resume checkpoint when it changes.
 ///
-/// A different queue or current track is written at once. A moving position is
-/// written at most every [`SESSION_POSITION_INTERVAL`]. A stopped or paused
-/// session writes nothing. When restore was inconclusive, the existing file is
-/// preserved until the user changes the queue.
+/// Saves queue or current track changes on the next turn. Position-only changes
+/// wait at least [`SESSION_POSITION_INTERVAL`] after the last write. When
+/// restore was inconclusive, the file stays as is until the user edits the queue.
 struct StateSynchronizer {
     mode: CheckpointMode,
 }
@@ -306,9 +365,16 @@ impl StateSynchronizer {
 ///
 /// `signal-hook-registry` keeps its C handler installed even after actions are
 /// unregistered, so unregistering would silently ignore later signals. Instead,
-/// dropping this guard arms the flag so any signal during teardown (audio/MPRIS
-/// shutdown, final checkpoint flush, or cooked-mode Ctrl+C) immediately
-/// emulates the default handler.
+/// dropping this guard arms the flag so a `SIGTERM` or `SIGINT` during teardown
+/// (audio/MPRIS shutdown, final checkpoint flush, or cooked-mode Ctrl+C)
+/// immediately emulates the default handler.
+///
+/// `SIGHUP` keeps its default action. When the terminal sends it on close, the
+/// player exits immediately and leaves the last checkpoint on disk. The kernel
+/// releases the root lock, helpers die with their parent, and the audio server
+/// and session bus drop the stream and the MPRIS name. Handling it would send
+/// the event loop back into crossterm 0.29's input reader, which retries a
+/// hung-up terminal forever (crossterm-rs/crossterm#1067).
 struct TerminationGuard(&'static AtomicBool);
 
 impl TerminationGuard {
@@ -319,17 +385,15 @@ impl TerminationGuard {
             return Ok(Self(flag));
         }
         let flag = Arc::new(AtomicBool::new(false));
-        for signal in [SIGTERM, SIGHUP, SIGINT] {
-            // Once the flag is set (by a first signal or on leaving the
-            // terminal loop), any further signal emulates the default handler
-            // so a stuck shutdown can still be terminated immediately.
-            if let Err(error) =
-                signal_hook::flag::register_conditional_default(signal, Arc::clone(&flag))
-                    .and_then(|_| signal_hook::flag::register(signal, Arc::clone(&flag)))
-            {
-                flag.store(true, Ordering::SeqCst);
-                return Err(AppError::io("install signal handler", "terminal", error));
-            }
+        let registered = [SIGTERM, SIGINT].into_iter().try_for_each(|signal| {
+            // Registered first, so it sees the flag as it was before this
+            // signal set it: only a later signal emulates the default.
+            signal_hook::flag::register_conditional_default(signal, Arc::clone(&flag))?;
+            signal_hook::flag::register(signal, Arc::clone(&flag)).map(drop)
+        });
+        if let Err(error) = registered {
+            flag.store(true, Ordering::SeqCst);
+            return Err(AppError::io("install signal handler", "terminal", error));
         }
         let flag = FLAG.get_or_init(|| flag);
         Ok(Self(flag))
@@ -563,18 +627,102 @@ trait TerminalControl {
 }
 
 struct CrosstermControl {
-    stdout: Stdout,
+    output: TerminalOutput<Stdout>,
 }
 
 impl TerminalControl for CrosstermControl {
-    type Output = Stdout;
+    type Output = TerminalOutput<Stdout>;
 
     fn output_mut(&mut self) -> &mut Self::Output {
-        &mut self.stdout
+        &mut self.output
     }
 
+    /// A terminal that is gone has no modes left to restore.
     fn disable_raw(&mut self) -> io::Result<()> {
-        disable_raw_mode()
+        if self.output.presence.is_gone() {
+            return Ok(());
+        }
+        self.output.presence.discard_if_gone(disable_raw_mode(), ())
+    }
+}
+
+/// Whether `error` means the terminal itself is gone rather than one write
+/// failing. After a hangup, writes and terminal ioctls fail with `EIO`;
+/// `ENXIO` is what a terminal device without a remaining driver gives.
+fn is_terminal_gone(error: &io::Error) -> bool {
+    error.raw_os_error().is_some_and(|code| {
+        code == rustix::io::Errno::IO.raw_os_error()
+            || code == rustix::io::Errno::NXIO.raw_os_error()
+    })
+}
+
+/// Whether the session's terminal is still there, shared by every writer.
+///
+/// It starts present and only ever becomes gone: a hung-up terminal never
+/// comes back for this process.
+#[derive(Clone, Debug, Default)]
+struct TerminalPresence(Arc<AtomicBool>);
+
+impl TerminalPresence {
+    fn is_gone(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn mark_gone(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    fn output<W: Write>(&self, inner: W) -> TerminalOutput<W> {
+        TerminalOutput {
+            inner,
+            presence: self.clone(),
+        }
+    }
+
+    /// Turns a terminal-gone failure into `value` and records the hangup;
+    /// passes every other result through.
+    fn discard_if_gone<T>(&self, result: io::Result<T>, value: T) -> io::Result<T> {
+        match result {
+            Err(error) if is_terminal_gone(&error) => {
+                self.mark_gone();
+                Ok(value)
+            }
+            result => result,
+        }
+    }
+}
+
+/// Terminal output that turns silent once the terminal is gone.
+///
+/// A hangup normally ends the process through `SIGHUP`, but the orderly
+/// shutdown can still meet a dead terminal: at system shutdown, systemd sends
+/// `SIGTERM` to the player and its terminal emulator together, and the window
+/// may close while the player draws or restores. After a hangup every write
+/// fails with `EIO`. There is nothing left to draw
+/// or restore, and such a failure must not turn the orderly shutdown into an
+/// error. It must also never reach Ratatui's destructor, which reports a failed
+/// cursor restore with `eprintln!`: stderr is usually the same closed terminal,
+/// so that print panics, and release builds abort on panic.
+struct TerminalOutput<W> {
+    inner: W,
+    presence: TerminalPresence,
+}
+
+impl<W: Write> Write for TerminalOutput<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.presence.is_gone() {
+            return Ok(bytes.len());
+        }
+        let result = self.inner.write(bytes);
+        self.presence.discard_if_gone(result, bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.presence.is_gone() {
+            return Ok(());
+        }
+        let result = self.inner.flush();
+        self.presence.discard_if_gone(result, ())
     }
 }
 
@@ -661,8 +809,8 @@ mod tests {
 
     use super::{
         AudioDiagnostics, AudioDiagnosticsReporter, DIAGNOSTICS_REPORT_INTERVAL,
-        SESSION_POSITION_INTERVAL, StateSynchronizer, TerminalControl, TerminalGuard, apply_event,
-        finish_session,
+        SESSION_POSITION_INTERVAL, StateSynchronizer, TerminalControl, TerminalGuard,
+        TerminalPresence, apply_event, finish_session,
     };
     use crate::app::AppState;
     use crate::config::Config;
@@ -963,6 +1111,130 @@ mod tests {
             serde_json::from_slice(&fs::read(&session).expect("replacement checkpoint"))
                 .expect("JSON");
         assert_eq!(saved["queue_entry_ids"], serde_json::json!([7]));
+    }
+
+    /// Output whose every write fails with one OS error, counting attempts.
+    struct FailingOutput {
+        errno: rustix::io::Errno,
+        attempts: Rc<RefCell<usize>>,
+    }
+
+    impl Write for FailingOutput {
+        fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+            *self.attempts.borrow_mut() += 1;
+            Err(io::Error::from_raw_os_error(self.errno.raw_os_error()))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            *self.attempts.borrow_mut() += 1;
+            Err(io::Error::from_raw_os_error(self.errno.raw_os_error()))
+        }
+    }
+
+    fn failing_output(errno: rustix::io::Errno) -> (FailingOutput, Rc<RefCell<usize>>) {
+        let attempts = Rc::new(RefCell::new(0));
+        let output = FailingOutput {
+            errno,
+            attempts: Rc::clone(&attempts),
+        };
+        (output, attempts)
+    }
+
+    #[test]
+    fn a_hung_up_terminal_turns_output_silent() {
+        let presence = TerminalPresence::default();
+        let (inner, attempts) = failing_output(rustix::io::Errno::IO);
+        let mut output = presence.output(inner);
+
+        output
+            .write_all(b"\x1b[?25h")
+            .expect("a hung-up terminal is not a write failure");
+        assert!(presence.is_gone());
+        output
+            .write_all(b"frame")
+            .expect("later writes are discarded");
+        output.flush().expect("later flushes are discarded");
+        assert_eq!(
+            *attempts.borrow(),
+            1,
+            "nothing reaches a terminal that is gone"
+        );
+    }
+
+    #[test]
+    fn other_output_failures_stay_errors() {
+        let presence = TerminalPresence::default();
+        let (inner, _) = failing_output(rustix::io::Errno::NOSPC);
+        let mut output = presence.output(inner);
+
+        let error = output
+            .write_all(b"frame")
+            .expect_err("a full device is a real failure");
+        assert_eq!(
+            error.raw_os_error(),
+            Some(rustix::io::Errno::NOSPC.raw_os_error())
+        );
+        assert!(!presence.is_gone());
+    }
+
+    /// Ratatui's destructor retries a failed cursor restore and reports it
+    /// with `eprintln!`, which panics when stderr is the closed terminal. A
+    /// cursor restore on a hung-up terminal must therefore succeed.
+    #[test]
+    fn ratatui_cursor_restore_succeeds_after_a_hangup() {
+        use ratatui::backend::CrosstermBackend;
+        use ratatui::layout::Rect;
+        use ratatui::{Terminal, TerminalOptions, Viewport};
+
+        let presence = TerminalPresence::default();
+        let (inner, _) = failing_output(rustix::io::Errno::IO);
+        let mut terminal = Terminal::with_options(
+            CrosstermBackend::new(presence.output(inner)),
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 10, 2)),
+            },
+        )
+        .expect("fixed viewport needs no terminal query");
+        terminal.hide_cursor().expect("hide on a hung-up terminal");
+
+        terminal.show_cursor().expect("show on a hung-up terminal");
+        assert!(presence.is_gone());
+    }
+
+    #[test]
+    fn guard_restore_on_a_hung_up_terminal_is_not_an_error() {
+        struct HungUpControl {
+            output: super::TerminalOutput<FailingOutput>,
+        }
+
+        impl TerminalControl for HungUpControl {
+            type Output = super::TerminalOutput<FailingOutput>;
+
+            fn output_mut(&mut self) -> &mut Self::Output {
+                &mut self.output
+            }
+
+            fn disable_raw(&mut self) -> io::Result<()> {
+                let result = Err(io::Error::from_raw_os_error(
+                    rustix::io::Errno::IO.raw_os_error(),
+                ));
+                self.output.presence.discard_if_gone(result, ())
+            }
+        }
+
+        let presence = TerminalPresence::default();
+        let (inner, _) = failing_output(rustix::io::Errno::IO);
+        let mut guard = TerminalGuard::new(HungUpControl {
+            output: presence.output(inner),
+        });
+        guard
+            .enter()
+            .expect("entering a hung-up terminal is discarded");
+
+        guard
+            .restore()
+            .expect("restoring a hung-up terminal succeeds");
+        assert!(presence.is_gone());
     }
 
     #[test]

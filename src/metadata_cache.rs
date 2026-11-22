@@ -18,10 +18,20 @@ use crate::state::StateStore;
 const CACHE_FILE: &str = "metadata.jsonl";
 // A release may change parser behavior even when the on-disk record shape is unchanged.
 const HEADER: &str = concat!("suzumushi-metadata-v1-", env!("CARGO_PKG_VERSION"), "\n");
-const MAX_CACHE_BYTES: usize = 4 * 1_048_576;
-const MAX_ENTRIES: usize = 10_000;
+/// Matches the scanner's file limit. The tag text and encoded file have
+/// separate byte limits.
+const MAX_ENTRIES: usize = 50_000;
+/// Retained tag text across all records.
+const MAX_TAG_BYTES: usize = 16 * 1_048_576;
+/// The whole file: the tag budget plus each record's identity and JSON framing,
+/// at most 337 bytes with every number at its widest and every tag absent.
+/// JSON escaping can still lengthen tag text, so `save` skips records that
+/// would exceed this limit.
+const MAX_CACHE_BYTES: usize = MAX_TAG_BYTES + MAX_ENTRIES * 384;
 const MAX_RECORD_BYTES: usize = 128 * 1_024;
 const MAX_FIELD_BYTES: usize = 16_384;
+const _: () = assert!(MAX_RECORD_BYTES <= MAX_CACHE_BYTES);
+const _: () = assert!(4 * MAX_FIELD_BYTES < MAX_RECORD_BYTES);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -65,14 +75,42 @@ struct BorrowedRecord<'a> {
 
 struct CachedTags {
     tags: TrackTags,
-    used: bool,
+    /// Seen in this scan and admitted to the next cache file.
+    retained: bool,
 }
 
+/// Entry and tag-text limits for one cache file's worth of records.
+#[derive(Default)]
+struct Budget {
+    entries: usize,
+    tag_bytes: usize,
+}
+
+impl Budget {
+    /// Charges one record of `tag_bytes`, or refuses it when either limit
+    /// would be passed.
+    fn admit(&mut self, tag_bytes: usize) -> bool {
+        if self.entries >= MAX_ENTRIES || tag_bytes > MAX_TAG_BYTES - self.tag_bytes {
+            return false;
+        }
+        self.entries += 1;
+        self.tag_bytes += tag_bytes;
+        true
+    }
+}
+
+/// Loaded records are charged to `loaded`. Records this scan uses, whether
+/// loaded or freshly parsed, are charged to `retained`, the budget of the file
+/// `save` writes. Stale loaded records therefore never crowd out fresh ones,
+/// and memory stays within two files' worth of records.
 #[derive(Default)]
 pub(crate) struct CachedMetadataReader {
     writable: bool,
     entries: BTreeMap<Identity, CachedTags>,
-    tag_bytes: usize,
+    loaded: Budget,
+    retained: Budget,
+    /// Whether parsing or rebuilding added records that may change the file.
+    changed: bool,
 }
 
 impl CachedMetadataReader {
@@ -86,15 +124,23 @@ impl CachedMetadataReader {
                 Ok(cache) => cache,
                 Err(error) => {
                     crate::logging::info(format_args!("ignoring invalid metadata cache: {error}"));
-                    Self::default()
+                    Self::rebuilt()
                 }
             },
-            Ok(None) => Self::default(),
+            Ok(None) => Self::rebuilt(),
             // Do not overwrite a symlink, hard link, special file or exposed cache.
             Err(_) => return Self::default(),
         };
         cache.writable = true;
         cache
+    }
+
+    /// A cache with no usable file behind it, which `save` must write.
+    fn rebuilt() -> Self {
+        Self {
+            changed: true,
+            ..Self::default()
+        }
     }
 
     fn read_records(reader: impl Read) -> io::Result<Self> {
@@ -115,34 +161,40 @@ impl CachedMetadataReader {
                 return Err(io::Error::other("metadata cache limit exceeded"));
             }
             let record: Record = serde_json::from_slice(&line).map_err(io::Error::other)?;
-            if cache.entries.contains_key(&record.identity)
-                || !cache.insert(record.identity, record.tags, false)
-            {
+            let admitted = tag_bytes(&record.tags).is_some_and(|bytes| cache.loaded.admit(bytes));
+            if !admitted || cache.entries.contains_key(&record.identity) {
                 return Err(io::Error::other("invalid metadata cache record"));
             }
+            let cached = CachedTags {
+                tags: record.tags,
+                retained: false,
+            };
+            cache.entries.insert(record.identity, cached);
         }
     }
 
-    fn insert(&mut self, identity: Identity, tags: TrackTags, used: bool) -> bool {
-        let fields = [&tags.artist, &tags.album_artist, &tags.album, &tags.title];
-        if fields
-            .into_iter()
-            .flatten()
-            .any(|text| text.len() > MAX_FIELD_BYTES)
-        {
-            return false;
+    /// Returns the cached tags for `identity`, retaining them for the next
+    /// cache file when its budget allows.
+    fn hit(&mut self, identity: &Identity) -> Option<TrackTags> {
+        let cached = self.entries.get_mut(identity)?;
+        if !cached.retained {
+            let bytes = tag_bytes(&cached.tags).unwrap_or(usize::MAX);
+            cached.retained = self.retained.admit(bytes);
         }
-        let bytes = fields
-            .into_iter()
-            .flatten()
-            .map(String::capacity)
-            .sum::<usize>();
-        if self.entries.len() >= MAX_ENTRIES || bytes > MAX_CACHE_BYTES - self.tag_bytes {
-            return false;
+        Some(cached.tags.clone())
+    }
+
+    /// Remembers freshly parsed tags when the next cache file has room.
+    fn insert_parsed(&mut self, identity: Identity, tags: TrackTags) {
+        let admitted = tag_bytes(&tags).is_some_and(|bytes| self.retained.admit(bytes));
+        if admitted {
+            let cached = CachedTags {
+                tags,
+                retained: true,
+            };
+            self.entries.insert(identity, cached);
+            self.changed = true;
         }
-        self.tag_bytes += bytes;
-        self.entries.insert(identity, CachedTags { tags, used });
-        true
     }
 
     fn read_with(
@@ -151,14 +203,13 @@ impl CachedMetadataReader {
         reader: &mut impl MetadataReader,
     ) -> Result<TrackTags, String> {
         let identity = Identity::read(file).map_err(|error| error.to_string())?;
-        if let Some(cached) = self.entries.get_mut(&identity) {
-            cached.used = true;
-            return Ok(cached.tags.clone());
+        if let Some(tags) = self.hit(&identity) {
+            return Ok(tags);
         }
         let tags = reader.read(file)?;
         // A file edited during parsing must not seed a reusable cache entry.
         if Identity::read(file).is_ok_and(|after| after == identity) {
-            self.insert(identity, tags.clone(), true);
+            self.insert_parsed(identity, tags.clone());
         }
         Ok(tags)
     }
@@ -173,11 +224,13 @@ impl CachedMetadataReader {
     }
 
     fn save_inner(&mut self, root: BorrowedFd<'_>, path: &Path) -> crate::errors::AppResult<()> {
-        if !self.writable {
+        // Records this scan did not retain would be dropped from the file.
+        let dropping = self.entries.values().any(|cached| !cached.retained);
+        if !self.writable || !(self.changed || dropping) {
             return Ok(());
         }
         let mut store = StateStore::open(root, path)?;
-        drop(store.open_file(CACHE_FILE, "metadata cache")?);
+        let existing = store.open_file(CACHE_FILE, "metadata cache")?;
         let mut bytes = Vec::new();
         let estimated = HEADER
             .len()
@@ -188,7 +241,7 @@ impl CachedMetadataReader {
         })?;
         bytes.extend_from_slice(HEADER.as_bytes());
         for (identity, cached) in &self.entries {
-            if !cached.used {
+            if !cached.retained {
                 continue;
             }
             // Borrow the tags so serialization does not clone the retained cache.
@@ -203,21 +256,63 @@ impl CachedMetadataReader {
             bytes.extend_from_slice(&line);
             bytes.push(b'\n');
         }
+        // Some newly parsed records can be too large once JSON-encoded. Check
+        // the actual output before replacing the file.
+        if let Some(file) = existing
+            && cache_matches(BufReader::new(file), &bytes).map_err(|error| {
+                crate::errors::AppError::io(
+                    "compare metadata cache",
+                    path.join("state").join(CACHE_FILE),
+                    error,
+                )
+            })?
+        {
+            return Ok(());
+        }
         store.write_bytes(CACHE_FILE, "metadata", &bytes)
+    }
+}
+
+/// Compares at most one buffer beyond the size of the candidate.
+fn cache_matches(mut existing: impl BufRead, mut candidate: &[u8]) -> io::Result<bool> {
+    loop {
+        let chunk = existing.fill_buf()?;
+        if chunk.is_empty() {
+            return Ok(candidate.is_empty());
+        }
+        let Some(remaining) = candidate.strip_prefix(chunk) else {
+            return Ok(false);
+        };
+        candidate = remaining;
+        let matched = chunk.len();
+        existing.consume(matched);
     }
 }
 
 impl MetadataReader for CachedMetadataReader {
     fn cached(&mut self, file: &File) -> Option<TrackTags> {
         let identity = Identity::read(file).ok()?;
-        let cached = self.entries.get_mut(&identity)?;
-        cached.used = true;
-        Some(cached.tags.clone())
+        self.hit(&identity)
     }
 
     fn read(&mut self, file: &File) -> Result<TrackTags, String> {
         self.read_with(file, &mut HelperMetadataReader)
     }
+}
+
+/// A record's tag text in bytes, or `None` when a field is longer than any
+/// record may hold. Lengths rather than capacities, so a record charges the
+/// same before saving and after loading.
+fn tag_bytes(tags: &TrackTags) -> Option<usize> {
+    let fields = [&tags.artist, &tags.album_artist, &tags.album, &tags.title];
+    let mut total = 0_usize;
+    for text in fields.into_iter().flatten() {
+        if text.len() > MAX_FIELD_BYTES {
+            return None;
+        }
+        total += text.len();
+    }
+    Some(total)
 }
 
 fn read_line(reader: &mut impl BufRead, line: &mut Vec<u8>) -> io::Result<usize> {
@@ -314,6 +409,137 @@ mod tests {
             .save_inner(root.as_fd(), temp.path())
             .expect("discard entries not seen in the new scan");
         assert_eq!(fs::read(path).expect("pruned cache"), HEADER.as_bytes());
+    }
+
+    fn seed_stale_cache(path: &std::path::Path, template: Identity, count: usize) {
+        let mut record = Record {
+            identity: template,
+            tags: TrackTags::default(),
+        };
+        let mut bytes = HEADER.as_bytes().to_vec();
+        for offset in 0..count {
+            // Identities no file in the root has.
+            record.identity.inode = u64::MAX - offset as u64;
+            serde_json::to_writer(&mut bytes, &record).expect("record JSON");
+            bytes.push(b'\n');
+        }
+        fs::write(path, bytes).expect("seed cache");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("private cache");
+    }
+
+    fn saved_identities(path: &std::path::Path) -> Vec<Identity> {
+        let cache = CachedMetadataReader::read_records(File::open(path).expect("cache"))
+            .expect("valid saved cache");
+        cache.entries.into_keys().collect()
+    }
+
+    #[test]
+    fn a_full_cache_of_stale_records_still_admits_fresh_ones() {
+        let (temp, root, file) = root();
+        let path = temp.path().join("state/metadata.jsonl");
+        let identity = Identity::read(&file).expect("identity");
+        seed_stale_cache(&path, identity, MAX_ENTRIES);
+
+        let mut parser = TagsReader {
+            attempts: 0,
+            title: "fresh",
+        };
+        let mut cache = CachedMetadataReader::load(root.as_fd(), temp.path());
+        assert_eq!(
+            cache.entries.len(),
+            MAX_ENTRIES,
+            "the full stale cache loaded"
+        );
+        cache
+            .read_with(&file, &mut parser)
+            .expect("parse the real track");
+        cache
+            .save_inner(root.as_fd(), temp.path())
+            .expect("save the next cache");
+
+        assert_eq!(saved_identities(&path), [identity]);
+        let mut cache = CachedMetadataReader::load(root.as_fd(), temp.path());
+        cache.read_with(&file, &mut parser).expect("cache hit");
+        assert_eq!(
+            parser.attempts, 1,
+            "the second start reuses the fresh record"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_cache_is_not_rewritten() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let (temp, root, file) = root();
+        let path = temp.path().join("state/metadata.jsonl");
+        let mut parser = TagsReader {
+            attempts: 0,
+            title: "steady",
+        };
+        let mut cache = CachedMetadataReader::load(root.as_fd(), temp.path());
+        cache.read_with(&file, &mut parser).expect("first parse");
+        cache
+            .save_inner(root.as_fd(), temp.path())
+            .expect("first save");
+        // Saving replaces the file by rename, which gives it a new inode.
+        let written = fs::metadata(&path).expect("saved cache").ino();
+
+        let mut cache = CachedMetadataReader::load(root.as_fd(), temp.path());
+        cache.read_with(&file, &mut parser).expect("cache hit");
+        cache
+            .save_inner(root.as_fd(), temp.path())
+            .expect("unchanged save");
+
+        assert_eq!(fs::metadata(&path).expect("cache").ino(), written);
+        assert_eq!(parser.attempts, 1);
+    }
+
+    #[test]
+    fn records_that_do_not_fit_on_disk_do_not_trigger_a_rewrite() {
+        let (temp, root, file) = root();
+        let path = temp.path().join("state/metadata.jsonl");
+        let template = Identity::read(&file).expect("identity");
+        let tags = TrackTags {
+            title: Some("\u{0001}".repeat(5_000)),
+            album: Some("\u{0001}".repeat(5_000)),
+            ..TrackTags::default()
+        };
+        // Each record takes 10 KB of tag text and over 60 KB of JSON.
+        let identities = (0..650_u32).map(|inode| Identity {
+            inode: u64::from(inode),
+            ..template
+        });
+        let mut cache = CachedMetadataReader::load(root.as_fd(), temp.path());
+        for identity in identities.clone() {
+            cache.insert_parsed(identity, tags.clone());
+        }
+        cache
+            .save_inner(root.as_fd(), temp.path())
+            .expect("first save");
+        let original = File::open(&path).expect("open original cache");
+        let mut cache = CachedMetadataReader::load(root.as_fd(), temp.path());
+        assert!(!cache.entries.is_empty());
+        assert!(cache.entries.len() < identities.len());
+
+        for identity in identities {
+            if cache.hit(&identity).is_none() {
+                cache.insert_parsed(identity, tags.clone());
+            }
+        }
+        cache
+            .save_inner(root.as_fd(), temp.path())
+            .expect("second save");
+        assert_eq!(
+            fs::metadata(&path).expect("cache").ino(),
+            original.metadata().expect("original cache").ino()
+        );
+    }
+
+    #[test]
+    fn the_cache_entry_limit_matches_the_scanner() {
+        let scan = crate::config::Config::default().scan;
+        assert_eq!(MAX_ENTRIES, scan.max_files);
+        assert!(MAX_TAG_BYTES <= scan.max_total_metadata_bytes);
     }
 
     #[test]
@@ -449,8 +675,10 @@ mod tests {
 
         bytes.clear();
         bytes.extend_from_slice(HEADER.as_bytes());
-        for inode in 0..(MAX_CACHE_BYTES / MAX_RECORD_BYTES) {
-            record.identity.inode = inode as u64;
+        let mut inode = 0_u64;
+        while bytes.len() < MAX_CACHE_BYTES {
+            record.identity.inode = inode;
+            inode += 1;
             let line_size = MAX_RECORD_BYTES.min(MAX_CACHE_BYTES - bytes.len());
             let end = bytes.len() + line_size;
             serde_json::to_writer(&mut bytes, &record).expect("padded record");

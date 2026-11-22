@@ -25,16 +25,17 @@ The scan index is immutable during a session. Queue membership uses one flag
 per canonical asset, and the queue holds at most 10,000 items.
 
 `src/config.rs` parses `config.toml`, which holds only the theme, the terminal
-background, the first focused view, and three scan behaviors. Capacity limits are compiled into
-`Config::default()`; tests lower them through its public fields.
+background, the first focused view, and three scan behaviors. Capacity limits
+are compiled into `Config::default()`; tests lower them through its public
+fields.
 
 `src/state.rs` writes `state/session.json`, the resume checkpoint. The event loop
-writes it when the queue or current track changes, every five seconds at most
-while the position moves, and at exit if the checkpoint changed since the last
-write. A stopped or paused session writes nothing. When startup restore is
-inconclusive (an unsupported or malformed file, no matching tracks, or skipped
-entries), the existing `session.json` is preserved untouched across startup,
-playback, and shutdown until the user deliberately edits the queue.
+saves queue or current track changes on its next turn. It saves a changed
+position once five seconds have elapsed since the last write, and saves any
+remaining changes on orderly exit. When the startup restore is
+inconclusive, because the file is unsupported or malformed, no saved track
+matches, or some entries were skipped, the existing `session.json` stays as it
+is through startup, playback, and shutdown until the user edits the queue.
 
 ## Player stage
 
@@ -43,23 +44,22 @@ frames. Each spectrum band is a stalk whose light is thrown up by the music and
 falls back under gravity; on pause the lights fly as fireflies along
 deterministic paths. On resume each light keeps its flight while an eased pull
 brings it home, in a wave, and its stalk grows to meet it, so nothing stops or
-jumps. Shapes render into a fixed
-dot field, allocated once per session, then into braille cells:
-solid shapes stay solid, glow becomes an ordered stipple, and bare stalk columns
-become hairlines. When the Player has room, the stage extends above the title
-into a sky of fixed-share stars and a moon placed by track progress. The title
-and Suzu are drawn last with silhouette masks. `src/ui/palette.rs` holds the
-night and day color sets and the glow shading that the meadow and the progress
-rail share. A light's brightness is its distance from the background: by night
-it fades toward black, by day into the terminal's own background color.
-`src/background.rs` finds that color once, in raw mode before the first key is
-read: it sends an OSC 11 query followed by a DA1 query, and the DA1 reply ends
-the wait, so a terminal that ignores OSC 11 costs one round trip rather than
-the 300 ms timeout. `src/ui/rail.rs` draws the rail's trail, dew, and light in
-the same braille dots. The stage asks the
-event loop for about 60 frames per second while lights lift off or fly home,
-so they move about a dot per frame, 30 while the meadow moves, 20 while
-fireflies drift, and the ordinary tick once still.
+jumps. Shapes render into a fixed dot field, allocated once per session, then
+into braille cells: solid shapes stay solid, glow becomes an ordered stipple,
+and bare stalk columns become hairlines. When the Player has room, the stage
+extends above the title into a sky of fixed-share stars and a moon placed by
+track progress. The title and Suzu are drawn last with silhouette masks.
+`src/ui/palette.rs` holds the night and day color sets and the glow shading that
+the meadow and the progress rail share. A light's brightness is its distance
+from the background: by night it fades toward black, by day into the terminal's
+own background color. `src/background.rs` finds that color once, in raw mode
+before the first key is read. It sends an OSC 11 query followed by a DA1 query,
+and the DA1 reply ends the wait, so a terminal that ignores OSC 11 costs one
+round trip rather than the 300 ms timeout. `src/ui/rail.rs` draws the rail's
+trail, dew, and light in the same braille dots. The stage asks the event loop
+for about 60 frames per second while lights lift off or fly home, so they move
+about a dot per frame, 30 while the meadow moves, 20 while fireflies drift, and
+the ordinary tick once still.
 
 The audio callback analyzes 32 bands from 50 Hz to 16 kHz and normalizes them
 against a slowly relaxing loudness reference, so loud masters and quiet
@@ -92,9 +92,34 @@ At 1 MiB the file becomes `suzumushi.log.1`, replacing the previous archive.
 Release builds abort on panic. The terminal session installs a panic hook that
 restores the terminal before the message prints, and each helper process
 installs one that exits quietly, so a malformed file never produces a crash
-report. `SIGTERM`, `SIGHUP`, and `SIGINT` route through the event loop to
-restore the terminal and flush the final checkpoint; once teardown starts (or
-if a second signal arrives), signals fall back to their default handler.
+report.
+
+## Signals and shutdown
+
+`SIGTERM` and `SIGINT` set a flag that the running event loop checks on every
+turn. The player restores the terminal, stops audio, and writes the final
+checkpoint as it does on `q`. Desktop controls shut down last,
+so a slow session bus cannot hold up the checkpoint. A second `SIGTERM` or
+`SIGINT`, or one that arrives once teardown has started, gets the default
+action.
+
+`SIGHUP` keeps its default action. When the terminal sends it on close, the
+process exits immediately and leaves the last checkpoint on disk. A seek can
+move the playhead by more than five seconds between writes. The kernel
+releases the root lock, and the helpers die with their parent.
+Handling `SIGHUP` would put the loop back in crossterm 0.29's input reader,
+which retries a hung-up terminal forever (crossterm-rs/crossterm#1067).
+
+A player whose pty is not its controlling terminal receives no `SIGHUP` when
+the window closes and can still get stuck in that reader.
+One `SIGTERM` then only sets the flag, which the stuck loop never reads, so it
+takes a second one.
+
+At system shutdown, systemd may stop the terminal emulator while the player is
+still drawing or restoring the terminal. A write that fails with `EIO` or
+`ENXIO` puts the output in discard mode, including cursor restoration. If the
+terminal closes during setup and no `SIGHUP` arrives, a failed size query can
+still end startup with an error.
 
 ## Verification
 

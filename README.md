@@ -6,12 +6,12 @@ account, database, streaming service, or network access.
 
 The interface has three panels: Library, Player, and Queue. They use the
 terminal's own colors and never paint a background. In the Player, Suzu, the
-small bell-cricket mascot, dances in a night meadow: each frequency band is a
+small bell-cricket mascot, dances in a night meadow. Each frequency band is a
 grass stalk tipped with light that rides the music. When playback pauses, the
 lights lift off as fireflies and drift around Suzu until you resume. When it
 stops, the meadow settles into quiet, dewy grass. In a tall Player, a night sky
-opens above the title: faint stars twinkle, and a crescent moon crosses the sky
-as the track plays.
+opens above the title, with faint twinkling stars and a crescent moon that
+crosses it as the track plays.
 
 ## Install on x86-64 Linux
 
@@ -45,7 +45,7 @@ On x86-64 NixOS with Nix installed, add the repository flake to your user profil
 
 ```sh
 nix --extra-experimental-features 'nix-command flakes' \
-  profile add github:nuggocto/suzumushi/v1.4.2
+  profile add github:nuggocto/suzumushi/v1.4.3
 ```
 
 This installs both `suzumushi` and `suzu`. Nix builds from source with pinned
@@ -66,19 +66,19 @@ and local build checks.
 ## Install the release archive by hand
 
 To check each step yourself, download the archive and `SHA256SUMS` from the
-[`v1.4.2` release](https://github.com/nuggocto/suzumushi/releases/tag/v1.4.2):
+[`v1.4.3` release](https://github.com/nuggocto/suzumushi/releases/tag/v1.4.3):
 
 ```sh
 curl -fLO \
-  'https://github.com/nuggocto/suzumushi/releases/download/v1.4.2/{SHA256SUMS,suzumushi-v1.4.2-x86_64-unknown-linux-gnu.tar.xz}'
+  'https://github.com/nuggocto/suzumushi/releases/download/v1.4.3/{SHA256SUMS,suzumushi-v1.4.3-x86_64-unknown-linux-gnu.tar.xz}'
 ```
 
 Then verify and install the downloaded archive:
 
 ```sh
 sha256sum --check --ignore-missing SHA256SUMS
-tar -xf suzumushi-v1.4.2-x86_64-unknown-linux-gnu.tar.xz
-cd suzumushi-v1.4.2-x86_64-unknown-linux-gnu
+tar -xf suzumushi-v1.4.3-x86_64-unknown-linux-gnu.tar.xz
+cd suzumushi-v1.4.3-x86_64-unknown-linux-gnu
 sudo install -Dm755 suzumushi /usr/local/bin/suzumushi
 sudo ln -s suzumushi /usr/local/bin/suzu
 ```
@@ -133,28 +133,27 @@ Every immediate folder below `audio/playlists/` is a playlist. It may contain
 copied audio files or file symlinks. Suzumushi never scans `~/Music`
 automatically.
 
-Unchanged files reuse metadata saved during the previous terminal startup.
-The disposable cache at `state/metadata.jsonl` holds at most 4 MiB and 10,000
-entries. Delete it while the player is closed to force a fresh metadata read.
-`diagnose` can read the cache but never writes it.
+Unchanged files reuse tags that fit in `state/metadata.jsonl`. The cache holds
+up to 50,000 files and 16 MiB of tag text. The size of the encoded JSON can
+limit it further. Suzumushi replaces the file only when its contents change.
+Delete it while the player is closed to force a fresh read. `diagnose` reads the
+cache but never writes it.
 
-A first start on a large library reads uncached tags for up to one minute per
-startup while showing a running track count, then uses filenames for any
-remaining tracks with a warning. Later starts reuse the cache and pick up
-remaining uncached files.
+On a large library, the scan shows a running track count and spends up to
+about a minute reading uncached tags. Tracks it doesn't reach show their
+filenames, with a warning. Later starts reuse cached tags and try the rest.
 
-Press `Enter` on a Library folder to collapse or expand it. This only changes
-the current terminal view: search still finds tracks inside collapsed folders,
-and the Queue and playback are untouched. Folder visibility resets when
-Suzumushi closes.
+Press `Enter` on a Library folder to collapse or expand it. This changes only
+the current view. Search still finds tracks inside collapsed folders, the Queue
+and playback stay as they are, and every folder opens again the next time
+Suzumushi starts.
 
-The Queue, current track, and playback position are restored when the player
-reopens. Clearing the Queue also forgets the saved session. If a saved session
-cannot be restored cleanly (for example because some tracks are missing from
-the current scan or the file version is unsupported), Suzumushi preserves the
-original `state/session.json` untouched until you edit the Queue. Playback
-remains paused until you press `Space`, or press `Enter` while Player or Queue
-is focused.
+When the player reopens, it restores the Queue, the current track, and the
+playback position. Playback stays paused until you press `Space`, or `Enter`
+while Player or Queue is focused. Clearing the Queue also forgets the saved
+session. If a saved session can't be restored exactly, because some of its
+tracks are missing or the file comes from an unsupported version, Suzumushi
+keeps `state/session.json` as it is until you edit the Queue.
 
 ## Keys
 
@@ -182,8 +181,15 @@ is focused.
 | `q` | Quit outside search |
 | `Ctrl+c` | Quit from anywhere |
 
-`SIGTERM`, `SIGHUP`, and `SIGINT` also restore the terminal and save the
-session cleanly before exiting.
+`SIGTERM` and `SIGINT` quit too. Once the player is running, they restore the
+terminal and save the session as `q` does. Closing the terminal window ends the
+player at once. The next launch uses the last saved Queue, track, and position.
+During playback, the player saves a moving position about every five seconds.
+A recent seek can leave a larger gap between the saved and current positions.
+
+Closing the window works through the terminal's hangup signal. A player started
+without the window as its controlling terminal, for example under `setsid`,
+never receives it, so quit that player with `q` before you close the window.
 
 Search checks metadata, filenames, and paths. Pressing `Enter` queues the
 selected result. Pressing `Enter` on a playlist adds all of its tracks as one
@@ -269,13 +275,14 @@ The verified formats are:
 - WAV with signed 16-bit PCM
 - Ogg with Vorbis
 
-Mono and stereo audio from 8 kHz through 192 kHz is accepted when the default
-audio device supports the source rate. AAC, M4A, Opus, multichannel audio, and
-automatic resampling are not current support claims.
+Suzumushi plays mono and stereo audio from 8 kHz through 192 kHz. It doesn't
+resample, so the default audio device or server has to accept the track's
+sample rate. PipeWire resamples, so it accepts all of these rates. AAC, M4A,
+Opus, and multichannel audio are not supported.
 
 ## Status
 
-Version `1.4.2` is the current stable release. The release workflow builds and
+Version `1.4.3` is the current stable release. The release workflow builds and
 verifies its Linux archive from the tag before GitHub publishes it. Arch users
 can install the matching `suzumushi-bin` package from AUR.
 

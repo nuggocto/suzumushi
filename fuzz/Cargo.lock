@@ -1669,7 +1669,7 @@ dependencies = [
 
 [[package]]
 name = "suzumushi"
-version = "1.4.2"
+version = "1.4.3"
 dependencies = [
  "clap",
  "cpal",

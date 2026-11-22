@@ -7,10 +7,10 @@ binary, the relative `suzu -> suzumushi` symlink, the README, changelog, and
 Apache 2.0 license.
 
 The binary dynamically uses glibc, libgcc, ALSA, PipeWire, and D-Bus. It has no
-network runtime. The release target is verified on the GitHub runner and current
-Arch Linux; it is not a musl, ARM, macOS, or Windows compatibility claim.
+network runtime. The release target is verified on the GitHub runner and on
+current Arch Linux. musl, ARM, macOS, and Windows builds are not verified.
 
-PipeWire and D-Bus are linked unconditionally, not loaded on demand: the dynamic
+PipeWire and D-Bus are linked unconditionally, not loaded on demand. The dynamic
 linker resolves `libpipewire-0.3.so.0` and `libdbus-1.so.3` before any backend
 selection happens, so the ALSA fallback does not make them optional at runtime.
 Releases before 1.1.0 linked only ALSA.
@@ -45,20 +45,22 @@ repository permission and performs these operations:
 A separate job receives only those verified files and the permission needed to
 create the GitHub release with the archive, `SHA256SUMS`, and `install.sh`. A
 final job pipes the published `install.sh` into `sh` on a clean runner and
-checks that both commands report the release version.
+checks that both commands report the release version. Prerelease versions are
+marked as prereleases and are never selected as the latest stable release. The
+workflow refuses to overwrite existing archive or checksum files.
 
 suzumushi.org serves a byte-for-byte copy of the latest release's `install.sh`.
-After each release, copy it into the website's `public/install.sh` and record
-its SHA-256 there; the website build refuses a copy whose hash differs. Prerelease versions are marked as prereleases and
-are never selected as the latest stable release. The workflow refuses to
-overwrite existing archive or checksum files.
+After each release, copy it into the website's `public/install.sh`, then update
+the version, release links, and both checksums in its `src/data/site.ts`. The
+website build refuses an `install.sh` whose SHA-256, version, or archive
+checksum differs from `site.ts`.
 
 If only publication fails after the build job succeeds, download that run's
 named artifact, verify it locally, and publish those exact files from a clean
 checkout containing the annotated tag. Never rebuild the recovery artifact or
 move the tag.
 
-After publication, download both assets into a new temporary directory, run
+After publication, download both assets into a new temporary directory and run
 `scripts/verify-release-archive.sh` from a checkout containing the audio fixture
 in `tests/fixtures/audio/tone.mp3`. The verifier exercises the extracted binary
 and relative symlink using a temporary library, and requires a complete scan

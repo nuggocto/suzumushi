@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.3] - 2026-11-22
+
+### Fixed
+
+- Closing the terminal window ends the player at once again, as it did before
+  1.4.2. In 1.4.2 the player could keep running at full CPU on one core with
+  its root lock held, so the next launch failed with "root writer lease is
+  already held". The 1.4.2 `SIGHUP` handler sent the player back into
+  crossterm 0.29's input reader, which retries a hung-up terminal forever.
+  `SIGHUP` now keeps its default action again. The next launch uses the last
+  saved Queue, track, and position. During playback, a moving position is
+  saved about every five seconds.
+- Drawing and restoring the terminal now discard output once a write reports
+  that the terminal is gone. This can happen when the player and terminal
+  emulator both shut down. Error messages no longer panic when stderr is closed.
+- The final checkpoint is written before desktop controls shut down, so a slow
+  session bus cannot keep it from being saved.
+- A metadata cache full of records for deleted or changed files no longer
+  blocks new records. Before, such a start read fresh tags and then saved an
+  empty cache.
+
+### Changed
+
+- The metadata cache holds up to 50,000 files, up from 10,000. It also limits
+  tag text to 16 MiB and caps the size of the encoded JSON.
+- The metadata cache is no longer rewritten when nothing in it changed.
+- Desktop controls rebuild their published state when the player changes,
+  including when shuffle rebuilds the play order.
+- The 1.4.2 notes overstated the shuffle change. Advancing reuses the tracked
+  shuffle position, but finding that track in the Queue is still a linear scan
+  of at most 10,000 items.
+
 ## [1.4.2] - 2026-11-22
 
 ### Fixed

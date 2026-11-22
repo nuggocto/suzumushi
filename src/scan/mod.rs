@@ -5,6 +5,7 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
+use std::io::Write as _;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -103,7 +104,9 @@ impl ScanObserver for ProgressLine {
             return;
         }
         self.last_shown = Some(now);
-        eprint!("\rScanning audio: {tracks} tracks");
+        // Progress is decoration: a closed or full stderr must not stop the scan,
+        // and `eprint!` would panic on it.
+        let _ = write!(std::io::stderr(), "\rScanning audio: {tracks} tracks");
     }
 }
 
@@ -111,7 +114,7 @@ impl Drop for ProgressLine {
     fn drop(&mut self) {
         if self.last_shown.is_some() {
             // Erase the line so the terminal session or report starts clean.
-            eprint!("\r\x1b[2K");
+            let _ = write!(std::io::stderr(), "\r\x1b[2K");
         }
     }
 }
